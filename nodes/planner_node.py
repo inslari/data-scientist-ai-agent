@@ -33,7 +33,12 @@ class AnalysisPlan(BaseModel):
 SYSTEM_PROMPT = """Sen özerk bir veri bilimi ajanının Analiz Planlayıcısısın.
  
 Görevin: Kullanıcının sorusuna, tespit edilen intent'e ve veritabanı zekâ modeline dayanarak adım adım bir yürütme planı üretmek.
- 
+
+## Önemli Kurallar:
+- Churn tahmini için MUTLAKA 'customers' tablosunu dahil et
+- Müşteri davranışı analizinde customers + orders + order_items birlikte kullanılmalı
+- Tablo seçiminde db_intelligence'daki relationships'ı dikkate al 
+
 ## Kullanılabilir adımlar (araçlar):
 - sql_query           : Veritabanından SQL ile veri çekme
 - profiling           : Çekilen verinin istatistiksel profilini çıkarma
@@ -66,7 +71,7 @@ def planner_node(state: AgentState) -> AgentState:
 
     tables_summary = _summarize_db_intelligence(db_intelligence, relevant_tables)
 
-    essages = [
+    messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(
             content=f"""

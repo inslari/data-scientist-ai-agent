@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+
 from langgraph.graph import END, START, StateGraph
 
 from state import AgentState
 from nodes.intent_node import intent_node
 from nodes.db_context_node import db_context_node
 from nodes.planner_node import planner_node
+from nodes.execution_node import execution_node
 
 # --- Sonraki adımlarda eklenecek node'lar ---
-# from nodes.execution_node import execution_node
 # from nodes.feature_engineering_node import feature_engineering_node
 # from nodes.automl_node import automl_node
 # from nodes.evaluation_node import evaluation_node
@@ -17,36 +20,37 @@ from nodes.planner_node import planner_node
 
 def build_graph() -> StateGraph:
     """
-    Builds the Data Scientist Agent graph and compiles it.
+    Data Scientist Agent graph'ını oluşturur ve derler.
     
-    Currently active nodes:
+    Şu an aktif olan node'lar:
         START → intent_node → db_context_node → planner_node → END
     
-    Nodes to be added in the future:
+    Sonraki adımlarda eklenecek:
         planner_node → tool_router → execution_node → feature_engineering_node
         → automl_node → evaluation_node → report_node → END
     """
     graph = StateGraph(AgentState)
 
-    # --- Add nodes ---
+    # --- Node'ları ekle ---
     graph.add_node("intent_node", intent_node)
     graph.add_node("db_context_node", db_context_node)
     graph.add_node("planner_node", planner_node)
+    graph.add_node("execution_node", execution_node)
 
-    # Nodes to be added in the future:
-    # graph.add_node("execution_node", execution_node)
+    # Sonraki adımlarda aktif edilecek:
     # graph.add_node("feature_engineering_node", feature_engineering_node)
     # graph.add_node("automl_node", automl_node)
     # graph.add_node("evaluation_node", evaluation_node)
     # graph.add_node("report_node", report_node)
 
-    # --- Add edges ---
+    # --- Edge'leri bağla ---
     graph.add_edge(START, "intent_node")
     graph.add_edge("intent_node", "db_context_node")
     graph.add_edge("db_context_node", "planner_node")
-    graph.add_edge("planner_node", END)
+    graph.add_edge("planner_node", "execution_node")
+    graph.add_edge("execution_node", END)
 
-    # Nodes to be added in the future:
+    # Sonraki adımlarda:
     # graph.add_edge("planner_node", "execution_node")
     # graph.add_conditional_edges(
     #     "execution_node",
@@ -64,6 +68,7 @@ def build_graph() -> StateGraph:
     return graph.compile()
 
 
+# --- Conditional edge fonksiyonu (sonraki adım için hazır) ---
 def route_after_execution(state: AgentState) -> str:
     """
     Execution node sonrasında intent'e göre yönlendirir.
@@ -76,16 +81,16 @@ def route_after_execution(state: AgentState) -> str:
     return "stats_only"
 
 
-
+# --- Çalıştırma ---
 if __name__ == "__main__":
     import json
 
     app = build_graph()
 
     initial_state: AgentState = {
-    "user_query": "Müşterilerin satın alma davranışlarını analiz et ve hangi müşterilerin churn olabileceğini tahmin et.",
-    "messages": [],
-}
+        "user_query": "Can you analyze customer purchasing behavior and predict which customers are likely to churn?",
+        "messages": [],
+    }
 
     print("=== Data Scientist Agent ===\n")
     result = app.invoke(initial_state)
@@ -95,5 +100,20 @@ if __name__ == "__main__":
     print(f"\nAnalysis Plan:")
     for step in result.get("analysis_plan", []):
         print(f"  {step['order']}. [{step['step']}] {step['description']}")
-        if step.get("config"):
-            print(f"     config: {json.dumps(step['config'], indent=6)}")
+
+    print(f"\nExecution:")
+    sql = result.get("sql_results", [])
+    print(f"  SQL sonucu  : {len(sql)} satir cekildi")
+
+    profiling = result.get("profiling_report", {})
+    if profiling:
+        shape = profiling.get("shape", {})
+        print(f"  Profiling   : {shape.get('rows')} satir x {shape.get('columns')} kolon")
+        recs = profiling.get("recommendations", [])
+        if recs:
+            print(f"  Oneriler    :")
+            for r in recs:
+                print(f"    - {r}")
+
+    if result.get("error"):
+        print(f"\nHata: {result['error']}")

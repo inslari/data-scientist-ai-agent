@@ -6,7 +6,7 @@ load_dotenv(override=True)
 
 class Settings:
     # API & MCP Configuration
-    API_BASE_URL: str = os.getenv("API_BASE_URL", "http://localhost:8000")
+    API_BASE_URL: str = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
     MCP_SERVER_HOST: str = os.getenv("MCP_SERVER_HOST", "127.0.0.1")
     MCP_SERVER_PORT: int = int(os.getenv("MCP_SERVER_PORT", "9001"))
     MCP_SERVER_PATH: str = os.getenv("MCP_SERVER_PATH", "/mcp")

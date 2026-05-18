@@ -11,7 +11,7 @@ from langgraph.prebuilt import create_react_agent
 from langchain_core.tools import tool
 
 load_dotenv()
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = "http://127.0.0.1:8000"
 
 @tool
 def get_schema() -> str:
@@ -70,7 +70,7 @@ def run_single_agent():
     print(f"! Veri Mühendisi Ajan Aktif !    ")
     print(f"=================================\n")
     
-    user_input = "Veritabanındaki tabloları incele, 'customers' tablosundan 3 kişinin yaşını getir."
+    user_input = "order_items tablosunda kaç satır var?"
     print(f"Kullanıcı: {user_input}\n")
     
 

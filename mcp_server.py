@@ -62,11 +62,13 @@ def run_sql_query(query: str) -> str:
 
         output = f"Columns: {', '.join(column_names)}\n"
         output += f"Returned {len(results)} rows.\nResults:\n"
-        for row in results[:50]:  # Limit
+
+        MAX_DISPLAY_ROWS = 10_000
+        for row in results[:MAX_DISPLAY_ROWS]:
             output += str(row) + "\n"
 
-        if len(results) > 50:
-            output += "... (Showing only first 50 rows)"
+        if len(results) > MAX_DISPLAY_ROWS:
+            output += f"... (Showing only first {MAX_DISPLAY_ROWS} rows)"
 
         return output
     except Exception as e:
