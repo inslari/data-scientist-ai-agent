@@ -41,4 +41,10 @@ curl -X POST http://127.0.0.1:8000/mcp/query \
   -d '{"query": "SELECT * FROM customers LIMIT 3"}'
 ```
 
+- Run the intent discovery integration test and save results to the DB:
+
+```bash
+python -m unittest tests.test_intent_discovery_agent
+```
+
 `mcp_server.py` and `main.py` work independently; FastAPI only connects to the MCP server over HTTP.
