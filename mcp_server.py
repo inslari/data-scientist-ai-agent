@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv(override=True)
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DB_PATH = PROJECT_DIR / "data" / "ecommerce.db"
+DB_PATH = PROJECT_DIR / "data" / "adult_income.db"
 
 MCP_SERVER_HOST = os.getenv("MCP_SERVER_HOST", "127.0.0.1")
 MCP_SERVER_PORT = int(os.getenv("MCP_SERVER_PORT", "9001"))
