@@ -47,6 +47,55 @@ class IntentDiscoveryAgentIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertIn("Customer Churn Prediction", row[0])
 
+    @unittest.skipIf(not (Path(__file__).resolve().parent.parent / "data" / "meta.db").exists(), "Gerçek veri tabanı (meta.db) bulunamadı.")
+    def test_intent_discovery_agent_node_real_data(self):
+        """
+        Gerçek veritabanı (meta.db) üzerinden tabloları okur ve mock kullanmadan
+        gerçek ajanı çalıştırır. Sonuçları test veritabanına kaydeder.
+        """
+        meta_db_path = Path(__file__).resolve().parent.parent / "data" / "meta.db"
+        
+        conn = sqlite3.connect(meta_db_path)
+        cursor = conn.cursor()
+        
+        # Tabloları çek
+        try:
+            cursor.execute("SELECT table_name FROM table_schemas")
+            tables = [row[0] for row in cursor.fetchall()]
+        except sqlite3.OperationalError:
+            tables = []
+
+        # Yetenekleri çek
+        try:
+            cursor.execute("SELECT capability FROM database_capabilities")
+            capabilities = [row[0] for row in cursor.fetchall()]
+        except sqlite3.OperationalError:
+            capabilities = []
+            
+        conn.close()
+
+        if not tables:
+            self.skipTest("meta.db içinde tablo bulunamadı.")
+
+        # Gerçek meta.db verilerine dayalı state oluştur
+        state = {
+            "schema_graph": {"tables": tables},
+            "db_intelligence": {"capabilities": capabilities},
+            "signals": {"core_entities": [t.capitalize() for t in tables]},
+            "domain": "Unknown", # Domain dinamik olarak LLM ile de bulunabilir
+            "intents": []
+        }
+
+        # Mock olmadan gerçek LLM çağrısı
+        result = intent_discovery_agent.intent_discovery_agent_node(state)
+        
+        # Sonucu veritabanına kaydet
+        save_intent_discovery_result(TEST_DB_PATH, state, result)
+
+        # Hata vermeden çalışması ve intents dönmesi yeterlidir
+        self.assertIn("intents", result)
+        self.assertIsNotNone(result["intents"])
+
 
 if __name__ == "__main__":
     unittest.main()

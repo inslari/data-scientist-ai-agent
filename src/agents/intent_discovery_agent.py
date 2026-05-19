@@ -107,7 +107,28 @@ def intent_discovery_agent_node(state: IntentState) -> dict:
         ]
     })
 
+    intents = None
+
+    # Gerçek LLM kullanımında ajan aracı çağırır, argümanları oradan alırız.
+    for msg in reversed(result["messages"]):
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tool_call in msg.tool_calls:
+                if tool_call["name"] == "save_discovered_intents_tool":
+                    intents = tool_call["args"].get("intents")
+                    break
+        if intents is not None:
+            break
+
+    if intents is not None:
+        # JSON string'e çeviriyoruz çünkü testler bu formatı bekliyor
+        if not isinstance(intents, str):
+            intents = json.dumps(intents)
+    else:
+        # Mock durumu veya araç çağrılmadıysa son mesajın içeriğini al
+        last_message = result["messages"][-1]
+        intents = last_message.content if hasattr(last_message, 'content') else last_message.get("content")
+
     return {
-        "intents": result["messages"][-1]["content"]
+        "intents": intents
     }
 
