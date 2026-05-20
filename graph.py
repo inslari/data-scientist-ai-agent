@@ -79,41 +79,33 @@ if __name__ == "__main__":
     print("=== Data Scientist Agent ===\n")
     result = app.invoke(initial_state)
 
-    print(f"Intent     : {result.get('intent')} (confidence: {result.get('intent_confidence')})")
+    print("\n" + "=" * 60)
+    print("PIPELINE ÖZET")
+    print("=" * 60)
+
+    print(f"\nIntent     : {result.get('intent')} (confidence: {result.get('intent_confidence')})")
     print(f"Tables     : {result.get('relevant_tables')}")
+
     print(f"\nAnalysis Plan:")
     for step in result.get("analysis_plan", []):
         print(f"  {step['order']}. [{step['step']}] {step['description']}")
 
     print(f"\nExecution:")
     sql = result.get("sql_results", [])
-    print(f"  SQL sonucu  : {len(sql)} satir cekildi")
-
+    print(f"  SQL sonucu  : {len(sql)} satır çekildi")
     profiling = result.get("profiling_report", {})
     if profiling:
         shape = profiling.get("shape", {})
-        print(f"  Profiling   : {shape.get('rows')} satir x {shape.get('columns')} kolon")
+        print(f"  Profiling   : {shape.get('rows')} satır x {shape.get('columns')} kolon")
         recs = profiling.get("recommendations", [])
         if recs:
-            print(f"  Oneriler    :")
+            print(f"  Öneriler    :")
             for r in recs:
                 print(f"    - {r}")
 
     if result.get("error"):
         print(f"\nHata: {result['error']}")
     else:
-        metrics = result.get("metrics", {})
-        if metrics:
-            print(f"\nModel Sonuçları ({result.get('model_name')}):")
-            for k, v in metrics.items():
-                if k not in ("per_class_report", "feature_importance", "task"):
-                    print(f"  {k}: {v}")
-            fi = metrics.get("feature_importance", {})
-            if fi:
-                print(f"\n  Top 5 Feature Importance:")
-                for feat, imp in list(fi.items())[:5]:
-                    print(f"    {feat}: {imp:.4f}")
-
         feature_report = result.get("feature_report", {})
         if feature_report:
             print(f"\nFeature Engineering:")
@@ -123,4 +115,20 @@ if __name__ == "__main__":
             print(f"  Test seti            : {feature_report.get('n_test')} satır")
             dist = feature_report.get("target_distribution_train", {})
             print(f"  Hedef dağılımı       : {dist}")
-            print(f"  Özellikler           : {feature_report.get('final_features')}")
+
+        metrics = result.get("metrics", {})
+        if metrics:
+            print(f"\nModel Sonuçları ({result.get('model_name')}):")
+            for k, v in metrics.items():
+                if k not in ("per_class_report", "feature_importance", "task", "all_model_scores"):
+                    print(f"  {k}: {v}")
+            fi = metrics.get("feature_importance", {})
+            if fi:
+                print(f"\n  Top 5 Feature Importance:")
+                for feat, imp in list(fi.items())[:5]:
+                    print(f"    {feat}: {imp:.4f}")
+            all_scores = metrics.get("all_model_scores", {})
+            if all_scores:
+                print(f"\n  Tüm Model Skorları:")
+                for model, score in sorted(all_scores.items(), key=lambda x: x[1], reverse=True):
+                    print(f"    {model:25s}: {score:.4f}")

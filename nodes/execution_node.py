@@ -22,11 +22,6 @@ MCP_CONFIG = {
 MAX_ROWS = 10_000
 
 
-# RELATIONSHIP GRAPH TRAVERSAL
-# Relationships are sourced from db_intelligence — no hardcode.
-# Starts from planner-selected tables and discovers all connected tables.
-
-
 def _resolve_all_related_tables(
     selected_tables: list[str],
     relationships: list[dict],
@@ -456,10 +451,6 @@ def _generate_recommendations(profile: dict) -> list[str]:
                     f"'{col}' düşük kardinaliteli ({unique_count} unique) — one-hot encoding önerilir"
                 )
 
-    # General ML recommendations
-    recs.append(
-        "Churn label oluşturulmalı — son 90 günde sipariş vermemiş müşteriler = churn=1"
-    )
 
     return recs
 
