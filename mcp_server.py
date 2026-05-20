@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv(override=True)
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DB_PATH = PROJECT_DIR / "data" / "ecommerce.db"
+DB_PATH = PROJECT_DIR / "data" / "adult_income.db"
 
 MCP_SERVER_HOST = os.getenv("MCP_SERVER_HOST", "127.0.0.1")
 MCP_SERVER_PORT = int(os.getenv("MCP_SERVER_PORT", "9001"))
@@ -62,11 +62,13 @@ def run_sql_query(query: str) -> str:
 
         output = f"Columns: {', '.join(column_names)}\n"
         output += f"Returned {len(results)} rows.\nResults:\n"
-        for row in results[:50]:  # Limit
+
+        MAX_DISPLAY_ROWS = 10_000
+        for row in results[:MAX_DISPLAY_ROWS]:
             output += str(row) + "\n"
 
-        if len(results) > 50:
-            output += "... (Showing only first 50 rows)"
+        if len(results) > MAX_DISPLAY_ROWS:
+            output += f"... (Showing only first {MAX_DISPLAY_ROWS} rows)"
 
         return output
     except Exception as e:

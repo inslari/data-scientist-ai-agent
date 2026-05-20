@@ -12,12 +12,9 @@ from pydantic import BaseModel
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-load_dotenv(override=True)
+from src.core.config import settings
 
-MCP_SERVER_HOST = os.getenv("MCP_SERVER_HOST", "127.0.0.1")
-MCP_SERVER_PORT = int(os.getenv("MCP_SERVER_PORT", "9001"))
-MCP_SERVER_PATH = os.getenv("MCP_SERVER_PATH", "/mcp")
-MCP_SERVER_URL = f"http://{MCP_SERVER_HOST}:{MCP_SERVER_PORT}{MCP_SERVER_PATH}"
+MCP_SERVER_URL = settings.MCP_SERVER_URL
 
 from meta_db import init_db, parse_and_save_schema
 
