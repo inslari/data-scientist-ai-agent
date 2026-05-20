@@ -4,7 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from state import AgentState
+from src.state import AgentState
 
 
 class IntentResult(BaseModel):

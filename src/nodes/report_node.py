@@ -3,24 +3,24 @@ from __future__ import annotations
 """
 Report Node
 -----------
-Pipeline'ın son node'u. Tüm önceki node'ların çıktılarını alarak
-LLM aracılığıyla kapsamlı, insan okunabilir bir Markdown raporu üretir.
+The final node of the pipeline. Synthesizes outputs from all previous nodes
+to generate a comprehensive, human-readable Markdown report via LLM.
 
-Kullandığı state alanları:
-    user_query          → Kullanıcının orijinal sorusu
-    intent              → Analiz tipi
-    relevant_tables     → Kullanılan tablolar
-    analysis_plan       → Planner'ın belirlediği adımlar
-    profiling_report    → Veri kalitesi ve istatistikleri
-    feature_plan        → LLM'in feature engineering planı
-    feature_report      → Uygulanan dönüşümlerin özeti
-    model_name          → Seçilen model
-    metrics             → AutoML metrikleri
-    evaluation_report   → Kapsamlı evaluation sonuçları
-    optimal_threshold   → Youden's J ile bulunan optimal karar eşiği
+Utilized state fields:
+    user_query          → The user's original question
+    intent              → Analysis type
+    relevant_tables     → Used database tables
+    analysis_plan       → Steps defined by the planner
+    profiling_report    → Data quality and statistics
+    feature_plan        → LLM's feature engineering plan
+    feature_report      → Summary of applied transformations
+    model_name          → Selected model
+    metrics             → AutoML metrics
+    evaluation_report   → Comprehensive evaluation results
+    optimal_threshold   → Optimal decision threshold found via Youden's J
 
-Çıktı:
-    report              → Markdown formatında final rapor
+Output:
+    report              → Final report in Markdown format
     current_step        → "report_node"
 """
 
@@ -31,33 +31,25 @@ from typing import Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from state import AgentState
+from src.state import AgentState
 
 
-# ─────────────────────────────────────────────────────────────────
-# LLM
-# ─────────────────────────────────────────────────────────────────
+# LLM Setup
 
 def _get_llm() -> ChatOpenAI:
     from dotenv import load_dotenv
     load_dotenv()
     
-    # Projenin geri kalanında OpenAI kullanıldığı için burayı da uyumlu yaptık
     return ChatOpenAI(
-        model="gpt-4o-mini", # Raporlama için gpt-4o-mini yeterince iyi ve çok daha ucuz
+        model="gpt-4o-mini",
         temperature=0.3
     )
 
 
-# ─────────────────────────────────────────────────────────────────
-# CONTEXT BUILDER
-# ─────────────────────────────────────────────────────────────────
+# Context Builder
 
 def _build_context(state: AgentState) -> str:
-    """
-    State'teki tüm node çıktılarını LLM'e göndermek için
-    yapılandırılmış bir metin bloğuna dönüştürür.
-    """
+    """Formats all state outputs into a structured text block for the LLM."""
     lines: list[str] = []
 
     # ── Kullanıcı Sorusu ─────────────────────────────────────────
@@ -205,10 +197,7 @@ def _build_context(state: AgentState) -> str:
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────
-# SYSTEM PROMPT
-# ─────────────────────────────────────────────────────────────────
-
+# System Prompt
 SYSTEM_PROMPT = """You are an expert Data Scientist. You will be provided with the complete outputs of an ML pipeline.
 Your task is to analyze these outputs and write a comprehensive, clear, and professional analysis report.
 
@@ -266,11 +255,7 @@ RULES:
 - Preserve the exact Markdown formatting (headers, bullet points, bold text).
 """
 
-
-# ─────────────────────────────────────────────────────────────────
-# MAIN NODE
-# ─────────────────────────────────────────────────────────────────
-
+# Main Node
 def report_node(state: AgentState) -> AgentState:
     """
     Node 9: Pipeline'ın tüm çıktılarını LLM ile yorumlayarak
@@ -287,7 +272,7 @@ def report_node(state: AgentState) -> AgentState:
     """
     print("\n[report] Başlıyor...")
 
-    # Hata kontrolü — evaluation gelmediyse rapor üretemeyiz
+    # control evaluation report
     ev = state.get("evaluation_report", {})
     if not ev:
         error_msg = "Evaluation raporu bulunamadı, report_node atlanıyor."
@@ -298,11 +283,11 @@ def report_node(state: AgentState) -> AgentState:
             "current_step": "report_node",
         }
 
-    # Context oluştur
+    # build context
     context = _build_context(state)
     print(f"[report] Context hazırlandı ({len(context)} karakter)")
 
-    # LLM'e gönder
+    # llm
     llm = _get_llm()
     user_query = state.get("user_query", "")
     intent = state.get("intent", "classification")
@@ -323,14 +308,14 @@ def report_node(state: AgentState) -> AgentState:
         ])
         report_text = response.content
 
-        # Başlık satırını güzelleştir — modeli ve tarihi ekle
+        # create header note with model name and date 
         timestamp = datetime.now().strftime("%d.%m.%Y %H:%M")
         header_note = (
             f"\n> **Model:** {model_name} | "
             f"**Intent:** {intent} | "
             f"**Tarih:** {timestamp}\n"
         )
-        # İlk başlığın hemen altına ekle
+        # add note under first header
         if "# " in report_text:
             first_newline = report_text.find("\n")
             if first_newline != -1:
@@ -342,7 +327,7 @@ def report_node(state: AgentState) -> AgentState:
 
     except Exception as e:
         print(f"[report] LLM hatası: {e}")
-        # LLM başarısız olursa yapılandırılmış fallback rapor üret
+        # create fallback report if llm fails 
         report_text = _generate_fallback_report(state)
 
     print(f"[report] Rapor tamamlandı ({len(report_text)} karakter)")
@@ -358,10 +343,7 @@ def report_node(state: AgentState) -> AgentState:
     }
 
 
-# ─────────────────────────────────────────────────────────────────
-# FALLBACK RAPOR (LLM başarısız olursa)
-# ─────────────────────────────────────────────────────────────────
-
+# fallback report (llm failes)
 def _generate_fallback_report(state: AgentState) -> str:
     """LLM çağrısı başarısız olursa state verilerinden doğrudan rapor üretir."""
     ev = state.get("evaluation_report", {})

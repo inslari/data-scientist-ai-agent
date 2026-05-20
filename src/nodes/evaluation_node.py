@@ -3,26 +3,26 @@ from __future__ import annotations
 """
 Evaluation Node
 ---------------
-AutoML node'unun ürettiği modeli kapsamlı olarak değerlendirir.
+Comprehensively evaluates the model produced by the AutoML node.
 
-Desteklenen analiz tiplerine göre dinamik metrik hesaplama:
+Dynamic metric calculation based on supported analysis types:
     - Binary classification → confusion matrix, ROC-AUC, precision-recall, F1 per class
-    - Multiclass classification → aynı metrikler, macro/weighted averages
-    - Regression → RMSE, MAE, R², residual analizi
+    - Multiclass classification → same metrics, macro/weighted averages
+    - Regression → RMSE, MAE, R², residual analysis
 
-Ek analizler:
-    - Overfitting kontrolü (train vs test performans farkı)
-    - Model kalibrasyonu (expected vs predicted probability)
-    - Feature importance analizi ve gruplandırma
-    - Sınıf bazlı performans analizi
-    - MCC (Matthews Correlation Coefficient) — dengesiz sınıflar için
-    - Bootstrap Confidence Intervals — metrik güvenilirliği
-    - SHAP değerleri — açıklanabilir AI (shap paketi varsa)
-    - Error Analysis — yanlış tahminlerin derinlemesine incelenmesi
-    - Model güvenilirlik skoru
+Additional analyses:
+    - Overfitting check (train vs test performance gap)
+    - Model calibration (expected vs predicted probability)
+    - Feature importance analysis and grouping
+    - Class-based performance analysis
+    - MCC (Matthews Correlation Coefficient) — for imbalanced classes
+    - Bootstrap Confidence Intervals — metric reliability
+    - SHAP values — explainable AI (if shap package is installed)
+    - Error Analysis — in-depth review of incorrect predictions
+    - Model reliability score
 
-Hiçbir domain veya kolon ismi hardcode edilmemiştir.
-Tüm kararlar state'teki metrics, feature_report ve feature_plan'dan gelir.
+No domains or column names are hardcoded.
+All decisions are derived from metrics, feature_report, and feature_plan in the state.
 """
 
 import warnings
@@ -48,16 +48,14 @@ from sklearn.metrics import (
 )
 from sklearn.calibration import calibration_curve
 
-from state import AgentState
+from src.state import AgentState
 
 warnings.filterwarnings("ignore")
 
 OVERFITTING_THRESHOLD = 0.05  # Train-test farkı bu kadardan fazlaysa uyar
 
 
-# ─────────────────────────────────────────────────────────────────
-# CLASSIFICATION EVALUATION
-# ─────────────────────────────────────────────────────────────────
+# Classification Evaluation
 
 def _evaluate_classification(
     model: Any,
@@ -67,9 +65,7 @@ def _evaluate_classification(
     y_test: np.ndarray,
     feature_names: list[str],
 ) -> dict:
-    """
-    Binary ve multiclass classification için kapsamlı değerlendirme.
-    """
+    """Comprehensive evaluation for binary and multiclass classification."""
     is_binary = len(np.unique(y_test)) == 2
 
     # ── Tahminler ────────────────────────────────────────────────
@@ -247,9 +243,7 @@ def _evaluate_classification(
     return evaluation
 
 
-# ─────────────────────────────────────────────────────────────────
-# REGRESSION EVALUATION
-# ─────────────────────────────────────────────────────────────────
+# Regression Evaluation
 
 def _evaluate_regression(
     model: Any,
@@ -332,9 +326,7 @@ def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
 
 
-# ─────────────────────────────────────────────────────────────────
-# OVERFITTING ANALYSIS
-# ─────────────────────────────────────────────────────────────────
+# Overfitting Analysis
 
 def _analyze_overfitting(train_metrics: dict, test_metrics: dict) -> dict:
     """Train vs test metrik farkını analiz eder."""
@@ -401,9 +393,7 @@ def _overfitting_description(status: str, gap: float) -> str:
     return descriptions.get(status, "Bilinmeyen durum.")
 
 
-# ─────────────────────────────────────────────────────────────────
-# FEATURE IMPORTANCE
-# ─────────────────────────────────────────────────────────────────
+# Feature Importance
 
 def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
     """Model'den feature importance çıkarır — model tipine göre adaptif."""
@@ -460,9 +450,7 @@ def _summarize_feature_importance(fi: dict) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────
-# BOOTSTRAP CONFIDENCE INTERVALS
-# ─────────────────────────────────────────────────────────────────
+# Bootstrap Confidence Intervals
 
 def _bootstrap_ci_classification(
     model: Any,
@@ -554,9 +542,7 @@ def _bootstrap_ci_regression(
     return result
 
 
-# ─────────────────────────────────────────────────────────────────
-# SHAP VALUES
-# ─────────────────────────────────────────────────────────────────
+# SHAP Values
 
 def _compute_shap_values(
     model: Any,
@@ -607,9 +593,7 @@ def _compute_shap_values(
         return {}
 
 
-# ─────────────────────────────────────────────────────────────────
-# ERROR ANALYSIS
-# ─────────────────────────────────────────────────────────────────
+# Error Analysis
 
 def _analyze_errors(
     y_true: np.ndarray,
@@ -693,9 +677,7 @@ def _analyze_errors(
     return result
 
 
-# ─────────────────────────────────────────────────────────────────
-# RELIABILITY SCORE
-# ─────────────────────────────────────────────────────────────────
+# Reliability Score
 
 def _compute_reliability_score(evaluation: dict) -> dict:
     """

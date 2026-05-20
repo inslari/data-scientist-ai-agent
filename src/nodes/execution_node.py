@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from state import AgentState
+from src.state import AgentState
 from src.core.config import settings
 
 MCP_CONFIG = {

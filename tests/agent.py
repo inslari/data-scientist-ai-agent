@@ -1,3 +1,5 @@
+"Bu bir prompt deneme scriptidir."
+
 import asyncio
 import os
 import sys

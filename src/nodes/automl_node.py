@@ -16,7 +16,7 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from state import AgentState
+from src.state import AgentState
 
 warnings.filterwarnings("ignore")
 RANDOM_STATE = 42

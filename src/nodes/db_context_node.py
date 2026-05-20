@@ -4,8 +4,8 @@ import asyncio
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from intelligence_engine import DatabaseIntelligenceEngine
-from state import AgentState
+from src.intelligence_engine import DatabaseIntelligenceEngine
+from src.state import AgentState
 
 MCP_CONFIG = {
     "sqlite": {
