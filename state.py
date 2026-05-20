@@ -39,9 +39,11 @@ class AgentState(TypedDict, total=False):
     model_params: dict               # Hiperparametreler
     model_artifact: Any              # Eğitilmiş model objesi (pickle edilebilir)
 
-    # --- Evaluation + Insight çıktısı ---
+    # --- Evaluation çıktısı ---
     metrics: dict                    # {"accuracy": 0.91, "f1": 0.88, ...}
     insights: list[str]              # LLM'in ürettiği yorumlar
+    evaluation_report: dict          # Kapsamlı evaluation raporu (evaluation_node)
+    optimal_threshold: float         # Youden's J ile hesaplanan optimal karar eşiği
 
     # --- Report çıktısı ---
     report: str                      # Markdown formatında final rapor

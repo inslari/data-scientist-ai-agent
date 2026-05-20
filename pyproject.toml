@@ -24,4 +24,5 @@ dependencies = [
     "tabpfn>=8.0.3",
     "ucimlrepo>=0.0.7",
     "kagglehub>=1.0.1",
+    "shap>=0.51.0",
 ]

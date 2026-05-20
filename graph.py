@@ -3,13 +3,15 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 
 from state import AgentState
-from nodes.intent_node import intent_node
-from nodes.db_context_node import db_context_node
-from nodes.planner_node import planner_node
-from nodes.execution_node import execution_node
-from nodes.feature_plan_node import feature_plan_node
-from nodes.feature_engineering_node import feature_engineering_node
-from nodes.automl_node import automl_node
+from src.nodes.intent_node import intent_node
+from src.nodes.db_context_node import db_context_node
+from src.nodes.planner_node import planner_node
+from src.nodes.execution_node import execution_node
+from src.nodes.feature_plan_node import feature_plan_node
+from src.nodes.feature_engineering_node import feature_engineering_node
+from src.nodes.automl_node import automl_node
+from src.nodes.evaluation_node import evaluation_node
+from src.nodes.report_node import report_node
 
 def build_graph() -> StateGraph:
     """
@@ -18,10 +20,7 @@ def build_graph() -> StateGraph:
     Aktif pipeline:
         START → intent_node → db_context_node → planner_node
         → execution_node → feature_plan_node → feature_engineering_node
-        → automl_node → END
-
-    Sonraki adımlar:
-        → evaluation_node → report_node → END
+        → automl_node → evaluation_node → report_node → END
     """
     graph = StateGraph(AgentState)
 
@@ -32,6 +31,8 @@ def build_graph() -> StateGraph:
     graph.add_node("feature_plan_node", feature_plan_node)
     graph.add_node("feature_engineering_node", feature_engineering_node)
     graph.add_node("automl_node", automl_node)
+    graph.add_node("evaluation_node", evaluation_node)
+    graph.add_node("report_node", report_node)
 
     graph.add_edge(START, "intent_node")
     graph.add_edge("intent_node", "db_context_node")
@@ -40,14 +41,9 @@ def build_graph() -> StateGraph:
     graph.add_edge("execution_node", "feature_plan_node")
     graph.add_edge("feature_plan_node", "feature_engineering_node")
     graph.add_edge("feature_engineering_node", "automl_node")
-    graph.add_edge("automl_node", END)
-
-    # Sonraki adımlarda eklenecek:
-    # graph.add_node("evaluation_node", evaluation_node)
-    # graph.add_node("report_node", report_node)
-    # graph.add_edge("automl_node", "evaluation_node")
-    # graph.add_edge("evaluation_node", "report_node")
-    # graph.add_edge("report_node", END)
+    graph.add_edge("automl_node", "evaluation_node")
+    graph.add_edge("evaluation_node", "report_node")
+    graph.add_edge("report_node", END)
 
     return graph.compile()
 
@@ -68,6 +64,9 @@ def route_after_execution(state: AgentState) -> str:
 # --- Çalıştırma ---
 if __name__ == "__main__":
     import json
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
 
     app = build_graph()
 
@@ -132,3 +131,22 @@ if __name__ == "__main__":
                 print(f"\n  Tüm Model Skorları:")
                 for model, score in sorted(all_scores.items(), key=lambda x: x[1], reverse=True):
                     print(f"    {model:25s}: {score:.4f}")
+
+        eval_report = result.get("evaluation_report", {})
+        if eval_report:
+            reliability = eval_report.get("reliability_score", {})
+            overfitting = eval_report.get("overfitting", {})
+            test_m = eval_report.get("test_metrics", {})
+            print(f"\nEvaluation ({eval_report.get('model_name')}):")
+            print(f"  Task      : {eval_report.get('task')}")
+            for k, v in test_m.items():
+                print(f"  {k}: {v}")
+            print(f"  Overfitting: {overfitting.get('status')} (gap: {overfitting.get('gap')})")
+            print(f"  Güvenilirlik: {reliability.get('score')}/100 — Grade: {reliability.get('grade')}")
+
+    report = result.get("report", "")
+    if report:
+        print("\n" + "=" * 60)
+        print("FINAL RAPOR")
+        print("=" * 60)
+        print(report)
