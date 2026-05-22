@@ -51,12 +51,12 @@ def _get_llm() -> ChatOpenAI:
 def _build_context(state: AgentState) -> str:
     """Formats all state outputs into a structured text block for the LLM."""
     lines: list[str] = []
+    intent = state.get("intent", "unknown")
 
-    # ── Kullanıcı Sorusu ─────────────────────────────────────────
+    # ── Kullanıcı Sorusu ─────────────────────────────────────────────
     lines.append(f"## Kullanıcı Sorusu\n{state.get('user_query', 'Belirtilmemiş')}\n")
 
-    # ── Intent ───────────────────────────────────────────────────
-    intent = state.get("intent", "unknown")
+    # ── Intent ──────────────────────────────────────────────
     confidence = state.get("intent_confidence", 0)
     tables = state.get("relevant_tables", [])
     lines.append(
@@ -98,7 +98,7 @@ def _build_context(state: AgentState) -> str:
             f"- Feature grupları: {', '.join(fp.get('feature_groups', []))}\n"
         )
 
-    # ── Feature Engineering Sonucu ────────────────────────────────
+    # ── Feature Engineering Sonucu ─────────────────────────────────
     fr = state.get("feature_report", {})
     if fr:
         lines.append(
@@ -106,98 +106,165 @@ def _build_context(state: AgentState) -> str:
             f"- Final feature sayısı: {fr.get('n_features')}\n"
             f"- Eğitim seti: {fr.get('n_train')} satır\n"
             f"- Test seti: {fr.get('n_test')} satır\n"
-            f"- Hedef dağılımı (train): {fr.get('target_distribution_train')}\n"
         )
 
-    # ── AutoML Sonuçları ──────────────────────────────────────────
+    # ── Task-specific Evaluation Context ────────────────────────────
+    ev = state.get("evaluation_report", {})
     metrics = state.get("metrics", {})
     model_name = state.get("model_name", "unknown")
-    if metrics:
-        lines.append(f"## AutoML Sonuçları\n- Seçilen model: {model_name}")
-        for k, v in metrics.items():
-            if k not in ("per_class_report", "feature_importance", "task", "all_model_scores"):
-                lines.append(f"  - {k}: {v}")
-        all_scores = metrics.get("all_model_scores", {})
-        if all_scores:
-            lines.append("- Tüm model skorları:")
-            for m, s in sorted(all_scores.items(), key=lambda x: x[1], reverse=True):
-                lines.append(f"    {m}: {s:.4f}")
+
+    if intent == "clustering":
+        # ── Clustering Specific ──────────────────────────────────────
+        cluster_dist = ev.get("cluster_distribution", {})
+        algo_scores = ev.get("all_algorithm_scores", {})
+        lines.append("## Kümeleme Sonuçları")
+        lines.append(f"- Seçilen algoritma: {ev.get('best_algorithm', model_name).upper()}")
+        lines.append(f"- Küme sayısı: {ev.get('n_clusters', '?')}")
+        sil = ev.get('silhouette_score')
+        if sil is not None:
+            qual = 'Mükemmel' if sil > 0.7 else 'İyi' if sil > 0.5 else 'Orta' if sil > 0.25 else 'Zayıf'
+            lines.append(f"- Silhouette Score: {sil:.4f} ({qual} — -1 ile 1 arasında, 1'e yakın = mükemmel ayrışma)")
+        db = ev.get("davies_bouldin")
+        ch = ev.get("calinski_harabasz")
+        if db is not None:
+            lines.append(f"- Davies-Bouldin Index: {db:.4f} (0'a yakın = daha iyi küme ayrışması)")
+        if ch is not None:
+            lines.append(f"- Calinski-Harabasz Score: {ch:.0f} (yüksek = daha kompakt ve ayrı kümeler)")
         lines.append("")
+        if cluster_dist:
+            lines.append("### Küme Dağılımı (Profil Verileri)")
+            for cname, cinfo in cluster_dist.items():
+                if cname != "noise":
+                    cnt = cinfo.get('count', '?')
+                    pct = cinfo.get('pct', 0)
+                    lines.append(f"  - {cname}: {cnt:,} örnek (%{pct:.1f} oranında)")
+            lines.append("")
+        if algo_scores:
+            lines.append("### Algoritma Karşılaştırması (Silhouette)")
+            for algo, sc in sorted(algo_scores.items(), key=lambda x: x[1], reverse=True):
+                marker = " ← SEÇİLEN" if algo == ev.get("best_algorithm") else ""
+                lines.append(f"  - {algo.upper()}: {sc:.4f}{marker}")
+            lines.append("")
 
-    # ── Evaluation Raporu ─────────────────────────────────────────
-    ev = state.get("evaluation_report", {})
-    if ev:
-        test_m = ev.get("test_metrics", {})
-        ovf = ev.get("overfitting", {})
-        cal = ev.get("calibration", {})
-        ci = ev.get("confidence_intervals", {})
-        rel = ev.get("reliability_score", {})
-        shap = ev.get("shap_importance", {})
-        err = ev.get("error_analysis", {})
-        fi_sum = ev.get("feature_importance_summary", {})
-        opt_thresh = ev.get("optimal_threshold")
+    elif intent == "anomaly_detection":
+        # ── Anomaly Detection Specific ──────────────────────────────
+        cont_scan = ev.get("contamination_scan", {})
+        fi_anom = ev.get("feature_importance", {})
+        n_anom = ev.get("n_anomalies", 0)
+        n_norm = ev.get("n_normal", 0)
+        total = n_anom + n_norm
+        lines.append("## Anomaly Detection Sonuçları")
+        lines.append(f"- Algoritma: IsolationForest")
+        lines.append(f"- Tespit edilen anomali: {n_anom:,} kayıt (%{ev.get('anomaly_pct', 0):.2f} oranında)")
+        lines.append(f"- Normal kayıt: {n_norm:,}")
+        lines.append(f"- Toplam: {total:,} kayıt")
+        best_cont = ev.get("best_contamination")
+        score_thr = ev.get("score_threshold")
+        if best_cont:
+            lines.append(f"- Seçilen contamination parametresi: {best_cont} (toplam verinin tahmini anomali oranı)")
+        if score_thr:
+            lines.append(f"- Anomali karar eşiği (score): {score_thr:.4f}")
+        lines.append("")
+        if cont_scan:
+            lines.append("### Contamination Taraması (Farklı eşikler)")
+            for cont, info in cont_scan.items():
+                marker = " ← SEÇİLEN" if str(cont) == str(best_cont) else ""
+                lines.append(f"  - contamination={cont}: {info.get('n_anomalies')} anomali (%{info.get('anomaly_pct', 0):.1f}){marker}")
+            lines.append("")
+        if fi_anom:
+            lines.append("### En Etkili Özellikler (Anomali Sürücleri)")
+            total_imp = sum(fi_anom.values()) or 1
+            for feat, imp in list(fi_anom.items())[:8]:
+                lines.append(f"  - {feat}: %{imp/total_imp*100:.1f}")
+            lines.append("")
 
-        lines.append(f"## Evaluation Sonuçları\n### Test Metrikleri")
-        for k, v in test_m.items():
-            lines.append(f"  - {k}: {v}")
+    else:
+        # ── Supervised (classification / regression) ──────────────────
+        if metrics:
+            lines.append(f"## AutoML Sonuçları\n- Seçilen model: {model_name}")
+            for k, v in metrics.items():
+                if k not in ("per_class_report", "feature_importance", "task", "all_model_scores"):
+                    lines.append(f"  - {k}: {v}")
+            all_scores = metrics.get("all_model_scores", {})
+            if all_scores:
+                lines.append("- Tüm model skorları:")
+                for m, s in sorted(all_scores.items(), key=lambda x: x[1], reverse=True):
+                    lines.append(f"    {m}: {s:.4f}")
+            lines.append("")
 
-        if ci:
-            lines.append("\n### Bootstrap Güven Aralıkları (%95)")
-            for metric, vals in ci.items():
-                lines.append(f"  - {metric}: {vals['mean']} [{vals['lower']} — {vals['upper']}]")
+        if ev:
+            test_m = ev.get("test_metrics", {})
+            ovf = ev.get("overfitting", {})
+            cal = ev.get("calibration", {})
+            ci = ev.get("confidence_intervals", {})
+            rel = ev.get("reliability_score", {})
+            shap = ev.get("shap_importance", {})
+            err = ev.get("error_analysis", {})
+            fi_sum = ev.get("feature_importance_summary", {})
+            opt_thresh = ev.get("optimal_threshold")
 
-        lines.append(
-            f"\n### Overfitting\n"
-            f"  - Train: {ovf.get('train_score')} | Test: {ovf.get('test_score')}\n"
-            f"  - Fark: {ovf.get('gap')} | Durum: {ovf.get('status')}\n"
-            f"  - {ovf.get('description')}"
-        )
+            lines.append("## Evaluation Sonuçları\n### Test Metrikleri")
+            for k, v in test_m.items():
+                lines.append(f"  - {k}: {v}")
 
-        if cal:
+            if ci:
+                lines.append("\n### Bootstrap Güven Aralıkları (%95)")
+                for metric, vals in ci.items():
+                    lines.append(f"  - {metric}: {vals['mean']} [{vals['lower']} — {vals['upper']}]")
+
             lines.append(
-                f"\n### Kalibrasyon\n"
-                f"  - Brier Score: {cal.get('brier_score')}\n"
-                f"  - İyi kalibre: {cal.get('is_well_calibrated')}"
+                f"\n### Overfitting\n"
+                f"  - Train: {ovf.get('train_score')} | Test: {ovf.get('test_score')}\n"
+                f"  - Fark: {ovf.get('gap')} | Durum: {ovf.get('status')}\n"
+                f"  - {ovf.get('description')}"
             )
 
-        if err:
-            conf = err.get("confidence_analysis", {})
+            if cal:
+                lines.append(
+                    f"\n### Kalibrasyon\n"
+                    f"  - Brier Score: {cal.get('brier_score')}\n"
+                    f"  - İyi kalibre: {cal.get('is_well_calibrated')}"
+                )
+
+            if err:
+                conf = err.get("confidence_analysis", {})
+                lines.append(
+                    f"\n### Hata Analizi\n"
+                    f"  - Hatalı tahmin: {err.get('n_errors')}/{err.get('n_total')} ({err.get('error_rate', 0)*100:.2f}%)\n"
+                    f"  - Yüksek güven hatası: {conf.get('high_confidence_errors', 0)} adet ({conf.get('high_confidence_errors_pct', 0)}%)"
+                )
+                feat_diff = err.get("feature_distribution_diff", {})
+                if feat_diff:
+                    lines.append("  - En farklı feature'lar (Cohen's d):")
+                    for feat, info in list(feat_diff.items())[:3]:
+                        lines.append(f"      {feat}: d={info['cohens_d']} ({info['effect_magnitude']})")
+
+            if shap:
+                lines.append("\n### SHAP (Açıklanabilir AI)")
+                for feat, pct in list(shap.get("top5_shap_features", {}).items())[:5]:
+                    lines.append(f"  - {feat}: %{pct}")
+
+            if fi_sum:
+                lines.append(
+                    f"\n### Feature Importance\n"
+                    f"  - Top 5 toplam katkı: %{fi_sum.get('top5_total_contribution_pct')}\n"
+                    f"  - Önemsiz feature: {fi_sum.get('insignificant_features_count', 0)} adet"
+                )
+
+            if opt_thresh:
+                lines.append(f"\n- Optimal Threshold (Youden's J): {opt_thresh}")
+
             lines.append(
-                f"\n### Hata Analizi\n"
-                f"  - Hatalı tahmin: {err.get('n_errors')}/{err.get('n_total')} ({err.get('error_rate', 0)*100:.2f}%)\n"
-                f"  - Yüksek güven hatası: {conf.get('high_confidence_errors', 0)} adet ({conf.get('high_confidence_errors_pct', 0)}%)"
+                f"\n### Güvenilirlik\n"
+                f"  - Skor: {rel.get('score')}/100 | Grade: {rel.get('grade')}\n"
+                f"  - Faktörler: {', '.join(rel.get('factors', []))}"
             )
-            feat_diff = err.get("feature_distribution_diff", {})
-            if feat_diff:
-                lines.append("  - En farklı feature'lar (Cohen's d):")
-                for feat, info in list(feat_diff.items())[:3]:
-                    lines.append(f"      {feat}: d={info['cohens_d']} ({info['effect_magnitude']})")
-
-        if shap:
-            lines.append("\n### SHAP (Açıklanabilir AI)")
-            for feat, pct in list(shap.get("top5_shap_features", {}).items())[:5]:
-                lines.append(f"  - {feat}: %{pct}")
-
-        if fi_sum:
-            lines.append(
-                f"\n### Feature Importance\n"
-                f"  - Top 5 toplam katkı: %{fi_sum.get('top5_total_contribution_pct')}\n"
-                f"  - Önemsiz feature: {fi_sum.get('insignificant_features_count', 0)} adet"
-            )
-
-        if opt_thresh:
-            lines.append(f"\n- Optimal Threshold (Youden's J): {opt_thresh}")
-
-        lines.append(
-            f"\n### Güvenilirlik\n"
-            f"  - Skor: {rel.get('score')}/100 | Grade: {rel.get('grade')}\n"
-            f"  - Faktörler: {', '.join(rel.get('factors', []))}"
-        )
 
     return "\n".join(lines)
 
 
-# System Prompt
+# System Prompts — task-specific
+
 SYSTEM_PROMPT = """You are an expert Data Scientist. You will be provided with the complete outputs of an ML pipeline.
 Your task is to analyze these outputs and write a comprehensive, clear, and professional analysis report.
 
@@ -255,6 +322,113 @@ RULES:
 - Preserve the exact Markdown formatting (headers, bullet points, bold text).
 """
 
+SYSTEM_PROMPT_CLUSTERING = """You are an expert Data Scientist specializing in unsupervised learning and customer segmentation.
+
+CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
+
+Write the report strictly using the following Markdown structure:
+
+# 📊 Kümeleme Analizi Raporu — [Başlık]
+
+## 1. Yönetici Özeti (Executive Summary)
+Provide a 3-4 sentence summary: how many segments were found, how well-separated they are (Silhouette Score), and what it means for the business.
+
+## 2. Veri Kalitesi (Data Quality)
+- Evaluate the overall state of the dataset.
+- Summarize any cleaning operations applied and their impact.
+- Highlight outliers or quality issues that could affect cluster quality.
+
+## 3. Küme Kalitesi (Cluster Quality)
+- Interpret the Silhouette Score in plain language (what does the number mean, is it good?).
+- Discuss Davies-Bouldin Index and Calinski-Harabasz Score if available.
+- Compare KMeans vs DBSCAN performance from the algorithm comparison table.
+- Explain WHY the selected algorithm outperformed the alternatives.
+
+## 4. Küme Profilleri (Cluster Profiles)
+- For each cluster, describe its relative size and infer likely characteristics.
+- Use domain knowledge to interpret what each segment likely represents.
+- Example: "Küme 0, toplam verinin %X'ini oluşturmaktadır — muhtemelen..."
+
+## 5. Güçlü Yönler (Strengths)
+- Where the segmentation model excels.
+- Explain why the Silhouette score indicates good/excellent cluster separation.
+
+## 6. Zayıf Yönler ve Riskler (Weaknesses & Risks)
+- Potential issues: do the clusters make business sense?
+- Risks of over-interpreting cluster boundaries without domain validation.
+- Limitations of the chosen algorithm (e.g., KMeans assumes spherical clusters).
+
+## 7. Operasyonel Öneriler (Operational Recommendations)
+- How to use these segments in real business decisions.
+- What domain experts should validate before acting on results.
+- Whether additional features or data collection could improve segmentation.
+
+## 8. Sonraki Adımlar (Next Steps)
+Propose 3-5 concrete, prioritized actionable steps.
+
+---
+RULES:
+- OUTPUT LANGUAGE MUST BE TURKISH.
+- NEVER mention: Brier Score, ROC-AUC, confusion matrix, F1, precision, recall, SHAP, accuracy, overfitting, high confidence errors.
+  These concepts do NOT apply to unsupervised clustering.
+- Focus on cluster interpretability, business value, and actionable insights.
+- Use technical terms but briefly explain them.
+- Do not repeat yourself.
+"""
+
+SYSTEM_PROMPT_ANOMALY = """You are an expert Data Scientist specializing in anomaly detection and fraud/outlier analysis.
+
+CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
+
+Write the report strictly using the following Markdown structure:
+
+# 📊 Anomali Tespiti Raporu — [Başlık]
+
+## 1. Yönetici Özeti (Executive Summary)
+Provide a 3-4 sentence summary: how many anomalies were found, at what rate, and what business risk this signals.
+
+## 2. Veri Kalitesi (Data Quality)
+- Evaluate the overall state of the dataset.
+- Summarize any cleaning operations and their impact on detection quality.
+
+## 3. Anomali Tespiti Performansı (Detection Performance)
+- Interpret the contamination parameter and why it was chosen.
+- Explain the anomaly rate in business terms (is X% normal for this domain?).
+- Compare the contamination scan results to justify the selected threshold.
+
+## 4. Anomali Profili (Anomaly Profile)
+- Interpret the feature importance: which features most drive anomaly scores?
+- Use domain knowledge to explain WHY these features signal anomalies.
+- Example: "Yüksek 'capital.gain' değerleri anomali skorunu artırıyor — bu, ortalama dışı finansal hareketlere işaret edebilir."
+
+## 5. Güçlü Yönler (Strengths)
+- Where the model excels at detecting outliers.
+- Why IsolationForest is appropriate for this dataset.
+
+## 6. Zayıf Yönler ve Riskler (Weaknesses & Risks)
+- False positive risks (normal records flagged as anomalies).
+- False negative risks (real anomalies missed) — especially critical for fraud detection.
+- No ground-truth labels available — results need human validation.
+- Limitations of IsolationForest.
+
+## 7. Operasyonel Öneriler (Operational Recommendations)
+- How to operationalize anomaly flags in a business workflow.
+- Manual review strategy for flagged records.
+- When to adjust the contamination parameter.
+
+## 8. Sonraki Adımlar (Next Steps)
+Propose 3-5 concrete, prioritized actionable steps.
+
+---
+RULES:
+- OUTPUT LANGUAGE MUST BE TURKISH.
+- NEVER mention: ROC-AUC, confusion matrix, F1, precision, recall, Brier Score, SHAP, accuracy, calibration.
+  These require ground-truth labels which anomaly detection does NOT have.
+- Focus on anomaly interpretation, business risk, feature drivers, and recommended actions.
+- Use technical terms but briefly explain them.
+- Do not repeat yourself.
+"""
+
 # Main Node
 def report_node(state: AgentState) -> AgentState:
     """
@@ -287,10 +461,18 @@ def report_node(state: AgentState) -> AgentState:
     context = _build_context(state)
     print(f"[report] Context hazırlandı ({len(context)} karakter)")
 
+    # select system prompt based on intent
+    intent = state.get("intent", "classification")
+    if intent == "clustering":
+        system_prompt = SYSTEM_PROMPT_CLUSTERING
+    elif intent == "anomaly_detection":
+        system_prompt = SYSTEM_PROMPT_ANOMALY
+    else:
+        system_prompt = SYSTEM_PROMPT
+
     # llm
     llm = _get_llm()
     user_query = state.get("user_query", "")
-    intent = state.get("intent", "classification")
     model_name = state.get("model_name", "unknown")
 
     prompt = (
@@ -303,7 +485,7 @@ def report_node(state: AgentState) -> AgentState:
     print("[report] LLM'den rapor üretiliyor...")
     try:
         response = llm.invoke([
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=prompt),
         ])
         report_text = response.content

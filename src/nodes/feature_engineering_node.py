@@ -389,7 +389,7 @@ def _drop_non_feature_cols(df: pd.DataFrame, meta: ColumnMetadata) -> pd.DataFra
     for col in df.columns:
         info = meta.columns.get(col, {})
         sem = info.get("semantic_type", "")
-        if sem in ("identifier", "timestamp"):
+        if sem in ("identifier", "timestamp","target"):
             drop_cols.append(col)
 
     if drop_cols:
@@ -510,6 +510,7 @@ def feature_engineering_node(state: AgentState) -> AgentState:
         X_train, X_test  : Eğitim ve test feature'ları
         y_train, y_test  : Eğitim ve test label'ları
     """
+    intent = state.get("intent", "")
     sql_results = state.get("sql_results", [])
     profiling_report = state.get("profiling_report", {})
     db_intelligence = state.get("db_intelligence", {})
@@ -542,9 +543,29 @@ def feature_engineering_node(state: AgentState) -> AgentState:
     # 3. Aggregation (plan gerekli diyorsa)
     df, y = _aggregate_if_needed(df, y, feature_plan, meta)
 
-    # 4. Identifier ve timestamp kolonlarını drop et
-    df = _drop_non_feature_cols(df, meta)
+    # 4. Identifier, timestamp ve diğer target kolonları drop et
+    target_col = feature_plan.get("target", {}).get("column_name", "")
+    cols_to_drop = set()
 
+    # intelligence_engine'in semantic_type'ına göre drop edilecekler
+    for col, info in meta.columns.items():
+        if col not in df.columns:
+            continue
+        sem = info.get("semantic_type", "")
+        if sem in ("identifier", "timestamp"):
+            cols_to_drop.add(col)
+        elif sem == "target" and col != target_col:
+            cols_to_drop.add(col)
+
+    # Hedefin türevlerini de drop et (income → income_binary gibi)
+    related = _find_related_target_cols(df, target_col)
+    cols_to_drop.update([c for c in related if c in df.columns and c != target_col])
+
+    existing = [c for c in cols_to_drop if c in df.columns]
+    if existing:
+        df = df.drop(columns=existing, errors="ignore")
+        print(f"[feature_eng] Drop (identifier/timestamp/target): {existing}")
+    
     # 5. Encoding
     df = _encode_categorical(df, y)
 
@@ -558,16 +579,23 @@ def feature_engineering_node(state: AgentState) -> AgentState:
     # 8. NaN temizliği (son kontrol)
     df = df.apply(pd.to_numeric, errors="coerce").fillna(0)
 
-    # 9. Train / test split
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            df, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
-        )
-    except ValueError:
-        # Stratify başarısız olursa (çok az sınıf) stratify olmadan split
-        X_train, X_test, y_train, y_test = train_test_split(
-            df, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
-        )
+    # 9. Train / test split — sadece supervised task'lar için
+    if intent in ("clustering", "anomaly_detection"):
+        # Unsupervised — tüm veriyi kullan, split yok
+        X_train = df.copy()
+        X_test = df.copy()
+        y_train = pd.Series([], dtype=int)
+        y_test = pd.Series([], dtype=int)
+        print(f"[feature_eng] Unsupervised task — train/test split atlandı")
+    else:
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                df, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+            )
+        except ValueError:
+            X_train, X_test, y_train, y_test = train_test_split(
+                df, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+            )
 
     y_train_arr = np.array(y_train)
     y_test_arr = np.array(y_test)

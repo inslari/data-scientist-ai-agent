@@ -592,8 +592,44 @@ def _compute_shap_values(
     except Exception:
         return {}
 
+# Helper functions for unsupervised tasks (clustering, anomaly detection)
 
-# Error Analysis
+def _pass_clustering_metrics(state: AgentState) -> dict:
+    """Clustering için automl_node'dan gelen metrikleri doğrudan döndürür."""
+    metrics = state.get("metrics", {})
+    return {
+        "task": "clustering",
+        "silhouette_score": metrics.get("silhouette_score"),
+        "n_clusters": metrics.get("n_clusters"),
+        "best_algorithm": metrics.get("best_algorithm"),
+        "davies_bouldin": metrics.get("davies_bouldin"),
+        "calinski_harabasz": metrics.get("calinski_harabasz"),
+        "cluster_distribution": metrics.get("cluster_distribution", {}),
+        "all_algorithm_scores": metrics.get("all_algorithm_scores", {}),
+        "reliability_score": {"score": 0, "grade": "N/A", "factors": ["Clustering task — no supervised metrics"]},
+        "overfitting": {"status": "N/A", "description": "Clustering is unsupervised — no overfitting concept."},
+        "test_metrics": {},
+        "train_metrics": {},
+    }
+
+
+def _pass_anomaly_metrics(state: AgentState) -> dict:
+    """Anomaly detection için automl_node'dan gelen metrikleri döndürür."""
+    metrics = state.get("metrics", {})
+    return {
+        "task": "anomaly_detection",
+        "n_anomalies": metrics.get("n_anomalies"),
+        "anomaly_pct": metrics.get("anomaly_pct"),
+        "n_normal": metrics.get("n_normal"),
+        "best_contamination": metrics.get("best_contamination"),
+        "score_threshold": metrics.get("score_threshold"),
+        "contamination_scan": metrics.get("contamination_scan", {}),
+        "feature_importance": metrics.get("feature_importance", {}),
+        "reliability_score": {"score": 0, "grade": "N/A", "factors": ["Anomaly detection — unsupervised"]},
+        "overfitting": {"status": "N/A", "description": "Anomaly detection is unsupervised."},
+        "test_metrics": {},
+        "train_metrics": {},
+    }
 
 def _analyze_errors(
     y_true: np.ndarray,
@@ -826,8 +862,14 @@ def evaluation_node(state: AgentState) -> AgentState:
         return {**state, "error": "Evaluation için model bulunamadı.",
                 "current_step": "evaluation_node"}
 
-    if not X_train_raw or not y_train_raw:
-        return {**state, "error": "Evaluation için veri bulunamadı.",
+    # Unsupervised task'lar (clustering, anomaly_detection) için y verisi olmaz — sadece X kontrol et
+    if not X_train_raw:
+        return {**state, "error": "Evaluation için X verisi bulunamadı.",
+                "current_step": "evaluation_node"}
+
+    # Supervised task'lar için y zorunlu
+    if intent not in ("clustering", "anomaly_detection") and not y_train_raw:
+        return {**state, "error": "Evaluation için label (y) verisi bulunamadı.",
                 "current_step": "evaluation_node"}
 
     # DataFrame'e dönüştür
@@ -846,25 +888,18 @@ def evaluation_node(state: AgentState) -> AgentState:
     print(f"  Intent   : {intent}")
 
     # Task tipine göre evaluation
-    if intent in ("classification", "clustering"):
-        evaluation_report = _evaluate_classification(
-            model, X_train, y_train, X_test, y_test, feature_names
-        )
-    elif intent == "regression":
+    if intent == "regression":
         evaluation_report = _evaluate_regression(
             model, X_train, y_train, X_test, y_test, feature_names
         )
+    elif intent == "clustering":
+        evaluation_report = _pass_clustering_metrics(state)
+    elif intent == "anomaly_detection":
+        evaluation_report = _pass_anomaly_metrics(state)
     else:
-        # Fallback: y'nin tipine göre karar ver
-        n_unique = len(np.unique(y_test))
-        if n_unique <= 20:
-            evaluation_report = _evaluate_classification(
-                model, X_train, y_train, X_test, y_test, feature_names
-            )
-        else:
-            evaluation_report = _evaluate_regression(
-                model, X_train, y_train, X_test, y_test, feature_names
-            )
+        evaluation_report = _evaluate_classification(
+            model, X_train, y_train, X_test, y_test, feature_names
+        )
 
     # Model adı ve feature_plan bilgisini ekle
     evaluation_report["model_name"] = state.get("model_name", "unknown")

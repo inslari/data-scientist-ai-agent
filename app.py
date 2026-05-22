@@ -22,7 +22,6 @@ import streamlit as st
 # Path setup
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "src"))
 
 from src.graph import build_graph
 from src.state import AgentState
@@ -35,61 +34,84 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# CSS
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Syne:wght@400;500;600;700;800&display=swap');
+# Theme state
+if "theme" not in st.session_state:
+    st.session_state.theme = "dark"
 
-:root {
+# Global CSS
+DARK_VARS = """
     --bg:        #0a0a0f;
     --bg2:       #111118;
     --bg3:       #16161f;
     --border:    rgba(255,255,255,0.06);
     --border2:   rgba(255,255,255,0.12);
+    --text:      #e8e8f0;
+    --text2:     #8888aa;
+    --text3:     #4a4a6a;
+    --scrollbar: #4a4a6a;
+"""
+
+LIGHT_VARS = """
+    --bg:        #f4f4f8;
+    --bg2:       #ffffff;
+    --bg3:       #ebebf2;
+    --border:    rgba(0,0,0,0.07);
+    --border2:   rgba(0,0,0,0.14);
+    --text:      #1a1a2e;
+    --text2:     #5a5a7a;
+    --text3:     #aaaacc;
+    --scrollbar: #aaaacc;
+"""
+
+theme_vars = DARK_VARS if st.session_state.theme == "dark" else LIGHT_VARS
+
+st.markdown(f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Syne:wght@400;500;600;700;800&display=swap');
+
+:root {{
+    {theme_vars}
     --accent:    #6c63ff;
     --accent2:   #ff6584;
     --accent3:   #43e97b;
     --accent4:   #f7971e;
-    --text:      #e8e8f0;
-    --text2:     #8888aa;
-    --text3:     #4a4a6a;
     --mono:      'DM Mono', monospace;
     --sans:      'Syne', sans-serif;
-}
+}}
 
-html, body, [data-testid="stAppViewContainer"] {
+html, body, [data-testid="stAppViewContainer"] {{
     background: var(--bg) !important;
     color: var(--text) !important;
     font-family: var(--sans) !important;
-}
+}}
 
-[data-testid="stSidebar"] {
+[data-testid="stSidebar"] {{
     background: var(--bg2) !important;
     border-right: 1px solid var(--border) !important;
-}
+}}
 
-[data-testid="stSidebar"] * { color: var(--text) !important; }
+[data-testid="stSidebar"] * {{ color: var(--text) !important; }}
 
 /* Hide default streamlit chrome */
-#MainMenu, footer, header { visibility: hidden; }
-[data-testid="stDecoration"] { display: none; }
+#MainMenu, footer, header {{ visibility: hidden; }}
+[data-testid="stDecoration"] {{ display: none; }}
 
 /* Inputs */
-.stTextArea textarea, .stTextInput input {
+.stTextArea textarea, .stTextInput input {{
     background: var(--bg3) !important;
     border: 1px solid var(--border2) !important;
     border-radius: 8px !important;
     color: var(--text) !important;
     font-family: var(--mono) !important;
     font-size: 0.85rem !important;
-}
-.stTextArea textarea:focus, .stTextInput input:focus {
+}}
+.stTextArea textarea:focus, .stTextInput input:focus {{
     border-color: var(--accent) !important;
     box-shadow: 0 0 0 2px rgba(108,99,255,0.15) !important;
-}
+}}
 
 /* Buttons */
-.stButton > button {
+.stButton > button {{
     background: var(--accent) !important;
     color: white !important;
     border: none !important;
@@ -100,94 +122,115 @@ html, body, [data-testid="stAppViewContainer"] {
     letter-spacing: 0.05em !important;
     padding: 0.6rem 1.8rem !important;
     transition: all 0.2s ease !important;
-}
-.stButton > button:hover {
+}}
+.stButton > button:hover {{
     background: #8075ff !important;
     transform: translateY(-1px) !important;
     box-shadow: 0 4px 20px rgba(108,99,255,0.35) !important;
-}
+}}
 
 /* Metric cards */
-[data-testid="stMetric"] {
+[data-testid="stMetric"] {{
     background: var(--bg3) !important;
     border: 1px solid var(--border) !important;
     border-radius: 10px !important;
     padding: 1rem 1.2rem !important;
-}
-[data-testid="stMetricLabel"] { color: var(--text2) !important; font-family: var(--mono) !important; font-size: 0.75rem !important; }
-[data-testid="stMetricValue"] { color: var(--text) !important; font-family: var(--sans) !important; font-weight: 700 !important; }
-[data-testid="stMetricDelta"] { font-family: var(--mono) !important; }
+}}
+[data-testid="stMetricLabel"] {{ color: var(--text2) !important; font-family: var(--mono) !important; font-size: 0.75rem !important; }}
+[data-testid="stMetricValue"] {{ color: var(--text) !important; font-family: var(--sans) !important; font-weight: 700 !important; }}
+[data-testid="stMetricDelta"] {{ font-family: var(--mono) !important; }}
 
 /* Tabs */
-[data-testid="stTabs"] [role="tablist"] {
+[data-testid="stTabs"] [role="tablist"] {{
     background: var(--bg2) !important;
     border-radius: 10px !important;
     padding: 4px !important;
     border: 1px solid var(--border) !important;
-}
-[data-testid="stTabs"] [role="tab"] {
+}}
+[data-testid="stTabs"] [role="tab"] {{
     color: var(--text2) !important;
     font-family: var(--sans) !important;
     font-size: 0.85rem !important;
     font-weight: 500 !important;
     border-radius: 7px !important;
     transition: all 0.2s !important;
-}
-[data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+}}
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] {{
     background: var(--accent) !important;
     color: white !important;
-}
+}}
 
 /* Expander */
-[data-testid="stExpander"] {
+[data-testid="stExpander"] {{
     background: var(--bg3) !important;
     border: 1px solid var(--border) !important;
     border-radius: 10px !important;
-}
+}}
 
 /* Code blocks */
-code { font-family: var(--mono) !important; }
+code {{ font-family: var(--mono) !important; }}
 
 /* Divider */
-hr { border-color: var(--border) !important; }
+hr {{ border-color: var(--border) !important; }}
 
 /* Custom scrollbar */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: var(--bg); }
-::-webkit-scrollbar-thumb { background: var(--text3); border-radius: 3px; }
+::-webkit-scrollbar {{ width: 6px; height: 6px; }}
+::-webkit-scrollbar-track {{ background: var(--bg); }}
+::-webkit-scrollbar-thumb {{ background: var(--scrollbar); border-radius: 3px; }}
 </style>
 """, unsafe_allow_html=True)
 
-# Plotly dark theme
+# Plotly theme
+is_dark = st.session_state.theme == "dark"
+
 PLOTLY_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
-    font=dict(family="DM Mono, monospace", color="#8888aa", size=11),
+    font=dict(
+        family="DM Mono, monospace",
+        color="#8888aa" if is_dark else "#5a5a7a",
+        size=11,
+    ),
     margin=dict(l=10, r=10, t=30, b=10),
 )
 AXIS_STYLE = dict(
-    gridcolor="rgba(255,255,255,0.04)",
-    zerolinecolor="rgba(255,255,255,0.08)",
+    gridcolor="rgba(255,255,255,0.04)" if is_dark else "rgba(0,0,0,0.06)",
+    zerolinecolor="rgba(255,255,255,0.08)" if is_dark else "rgba(0,0,0,0.10)",
 )
 COLORS = ["#6c63ff", "#ff6584", "#43e97b", "#f7971e", "#38b2f4", "#f093fb"]
 
-# Sidebar
+
+# SIDEBAR
+
 with st.sidebar:
-    st.markdown("""
-    <div style="padding: 1rem 0 1.5rem 0;">
-        <div style="font-family: 'Syne', sans-serif; font-size: 1.4rem; font-weight: 800; 
-                    letter-spacing: -0.02em; color: #e8e8f0;">
-            ⬡ DS Agent
+    # Logo + Theme toggle
+    logo_col, toggle_col = st.columns([3, 1])
+    with logo_col:
+        st.markdown(f"""
+        <div style="padding: 1rem 0 1.5rem 0;">
+            <div style="font-family: 'Syne', sans-serif; font-size: 1.4rem; font-weight: 800; 
+                        letter-spacing: -0.02em; color: {'#e8e8f0' if is_dark else '#1a1a2e'};">
+                ⬡ DS Agent
+            </div>
+            <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; 
+                        color: #6c63ff; margin-top: 2px; letter-spacing: 0.08em;">
+                AI-POWERED ANALYTICS
+            </div>
         </div>
-        <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; 
-                    color: #6c63ff; margin-top: 2px; letter-spacing: 0.08em;">
-            AI-POWERED ANALYTICS
-        </div>
-    </div>
-    <hr style="border-color: rgba(255,255,255,0.06); margin-bottom: 1.5rem;">
+        """, unsafe_allow_html=True)
+    with toggle_col:
+        st.markdown("<div style='padding-top: 1.2rem;'>", unsafe_allow_html=True)
+        theme_icon = "☀️" if is_dark else "🌙"
+        if st.button(theme_icon, key="theme_toggle", help="Toggle light/dark theme"):
+            st.session_state.theme = "light" if is_dark else "dark"
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <hr style="border-color: {'rgba(255,255,255,0.06)' if is_dark else 'rgba(0,0,0,0.07)'}; margin-bottom: 1.5rem;">
     """, unsafe_allow_html=True)
 
-    st.markdown("<p style='font-family: DM Mono; font-size: 0.72rem; color: #8888aa; letter-spacing: 0.08em; margin-bottom: 0.5rem;'>QUERY</p>", unsafe_allow_html=True)
+    st.markdown(f"<p style='font-family: DM Mono; font-size: 0.72rem; color: {'#8888aa' if is_dark else '#5a5a7a'}; letter-spacing: 0.08em; margin-bottom: 0.5rem;'>QUERY</p>", unsafe_allow_html=True)
 
     query = st.text_area(
         label="query",
@@ -202,9 +245,9 @@ with st.sidebar:
     run_btn = st.button("⬡ Run Analysis", use_container_width=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("""
-    <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; color: #4a4a6a; line-height: 1.8;">
-        <div style="color: #8888aa; font-size: 0.65rem; letter-spacing: 0.08em; margin-bottom: 0.5rem;">PIPELINE</div>
+    st.markdown(f"""
+    <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; color: {'#4a4a6a' if is_dark else '#aaaacc'}; line-height: 1.8;">
+        <div style="color: {'#8888aa' if is_dark else '#5a5a7a'}; font-size: 0.65rem; letter-spacing: 0.08em; margin-bottom: 0.5rem;">PIPELINE</div>
         <div>01 · Intent Analyzer</div>
         <div>02 · DB Context Loader</div>
         <div>03 · Analysis Planner</div>
@@ -218,14 +261,15 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
 
-# Header
-st.markdown("""
-<div style="padding: 2rem 0 1rem 0; border-bottom: 1px solid rgba(255,255,255,0.06); margin-bottom: 2rem;">
+# HEADER
+
+st.markdown(f"""
+<div style="padding: 2rem 0 1rem 0; border-bottom: 1px solid {'rgba(255,255,255,0.06)' if is_dark else 'rgba(0,0,0,0.07)'}; margin-bottom: 2rem;">
     <h1 style="font-family: 'Syne', sans-serif; font-size: 2rem; font-weight: 800; 
-               letter-spacing: -0.03em; color: #e8e8f0; margin: 0;">
+               letter-spacing: -0.03em; color: {'#e8e8f0' if is_dark else '#1a1a2e'}; margin: 0;">
         Data Scientist Agent
     </h1>
-    <p style="font-family: 'DM Mono', monospace; font-size: 0.78rem; color: #8888aa; 
+    <p style="font-family: 'DM Mono', monospace; font-size: 0.78rem; color: {'#8888aa' if is_dark else '#5a5a7a'}; 
               margin: 0.4rem 0 0 0;">
         Fully autonomous ML pipeline — from query to insights
     </p>
@@ -233,8 +277,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# PIPELINE RUNNER
 
-# Pipeline Runner
 def run_pipeline(user_query: str) -> AgentState:
     """Runs the full LangGraph pipeline and returns final state."""
     app = build_graph()
@@ -245,7 +289,8 @@ def run_pipeline(user_query: str) -> AgentState:
     return app.invoke(initial_state)
 
 
-# Loading Animation
+# LOADING ANIMATION
+
 def show_loading():
     """Animated node-by-node loading sequence."""
     nodes = [
@@ -311,26 +356,34 @@ def show_loading():
     placeholder.empty()
 
 
-# Dashboard Sections
+# DASHBOARD SECTIONS
+
 def render_metric_card(label: str, value: str, delta: str = "", color: str = "#6c63ff") -> str:
+    text_color = "#1a1a2e" if st.session_state.theme == "light" else "#e8e8f0"
+    label_color = "#5a5a7a" if st.session_state.theme == "light" else "#8888aa"
+    bg_color = "#ebebf2" if st.session_state.theme == "light" else "#16161f"
+    border_color = "rgba(0,0,0,0.07)" if st.session_state.theme == "light" else "rgba(255,255,255,0.06)"
+    
     return f"""
-    <div style="background: #16161f; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px;
+    <div style="background: {bg_color}; border: 1px solid {border_color}; border-radius: 10px;
                 padding: 1rem 1.2rem; border-top: 2px solid {color};">
-        <div style="font-family: 'DM Mono', monospace; font-size: 0.68rem; color: #8888aa; 
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.68rem; color: {label_color}; 
                     letter-spacing: 0.08em; margin-bottom: 0.4rem;">{label.upper()}</div>
         <div style="font-family: 'Syne', sans-serif; font-size: 1.6rem; font-weight: 700; 
-                    color: #e8e8f0;">{value}</div>
+                    color: {text_color};">{value}</div>
         {f'<div style="font-family: DM Mono; font-size: 0.7rem; color: {color}; margin-top: 2px;">{delta}</div>' if delta else ''}
     </div>
     """
 
 
 def section_header(title: str, subtitle: str = ""):
+    text_color = "#1a1a2e" if st.session_state.theme == "light" else "#e8e8f0"
+    sub_color = "#5a5a7a" if st.session_state.theme == "light" else "#8888aa"
     st.markdown(f"""
     <div style="margin: 2rem 0 1rem 0;">
         <div style="font-family: 'Syne', sans-serif; font-size: 1.1rem; font-weight: 700; 
-                    color: #e8e8f0; letter-spacing: -0.01em;">{title}</div>
-        {f'<div style="font-family: DM Mono; font-size: 0.72rem; color: #8888aa; margin-top: 2px;">{subtitle}</div>' if subtitle else ''}
+                    color: {text_color}; letter-spacing: -0.01em;">{title}</div>
+        {f'<div style="font-family: DM Mono; font-size: 0.72rem; color: {sub_color}; margin-top: 2px;">{subtitle}</div>' if subtitle else ''}
     </div>
     """, unsafe_allow_html=True)
 
@@ -358,7 +411,7 @@ def render_results(result: AgentState):
     per_class = ev.get("per_class_metrics", {})
     all_scores = metrics.get("all_model_scores", {})
 
-    # Status Bar
+    # Status bar
     grade = reliability.get("grade", "?")
     score = reliability.get("score", 0)
     grade_color = {"A": "#43e97b", "B": "#6c63ff", "C": "#f7971e", "D": "#ff6584", "F": "#ff6584"}.get(grade, "#8888aa")
@@ -398,7 +451,7 @@ def render_results(result: AgentState):
         "📄 Full Report",
     ])
 
-    # Tab 1 — Overview
+    # TAB 1 — OVERVIEW
     with tab1:
         section_header("Key Metrics", "Core performance indicators from test set")
 
@@ -408,83 +461,220 @@ def render_results(result: AgentState):
         f1 = test_m.get("f1_weighted", 0)
         ll = test_m.get("log_loss", None)
 
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown(render_metric_card("ROC-AUC", f"{auc:.4f}", "↑ Higher is better", "#6c63ff"), unsafe_allow_html=True)
-        with c2:
-            st.markdown(render_metric_card("Accuracy", f"{acc:.2%}", f"{'↑ ' if acc > 0.8 else '↓ '}{acc:.4f}", "#43e97b"), unsafe_allow_html=True)
-        with c3:
-            st.markdown(render_metric_card("F1 Weighted", f"{f1:.4f}", "Precision × Recall balance", "#f7971e"), unsafe_allow_html=True)
-        with c4:
-            if ll:
-                st.markdown(render_metric_card("Log Loss", f"{ll:.4f}", "↓ Lower is better", "#ff6584"), unsafe_allow_html=True)
-            else:
-                st.markdown(render_metric_card("Reliability", f"{score}/100", f"Grade {grade}", grade_color), unsafe_allow_html=True)
+        task = metrics.get("task", ev.get("task", "classification"))
+
+        if task == "clustering":
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown(render_metric_card("Silhouette Score",
+                    f"{ev.get('silhouette_score', 0):.4f}", "↑ Higher is better (-1 to 1)", "#6c63ff"), unsafe_allow_html=True)
+            with c2:
+                st.markdown(render_metric_card("N Clusters",
+                    str(ev.get("n_clusters", "?")), "Optimal clusters found", "#43e97b"), unsafe_allow_html=True)
+            with c3:
+                st.markdown(render_metric_card("Algorithm",
+                    str(ev.get("best_algorithm", "?")).upper(), "Best performing", "#f7971e"), unsafe_allow_html=True)
+            with c4:
+                db = ev.get("davies_bouldin", None)
+                st.markdown(render_metric_card("Davies-Bouldin",
+                    f"{db:.4f}" if db else "N/A", "↓ Lower is better", "#ff6584"), unsafe_allow_html=True)
+
+        elif task == "anomaly_detection":
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown(render_metric_card("Anomalies Found",
+                    str(ev.get("n_anomalies", "?")), "Total anomalies detected", "#ff6584"), unsafe_allow_html=True)
+            with c2:
+                st.markdown(render_metric_card("Anomaly Rate",
+                    f"{ev.get('anomaly_pct', 0):.1f}%", "% of dataset", "#f7971e"), unsafe_allow_html=True)
+            with c3:
+                st.markdown(render_metric_card("Contamination",
+                    str(ev.get("best_contamination", "?")), "Optimal threshold", "#6c63ff"), unsafe_allow_html=True)
+            with c4:
+                st.markdown(render_metric_card("Normal Records",
+                    str(ev.get("n_normal", "?")), "Clean data points", "#43e97b"), unsafe_allow_html=True)
+
+        elif task == "regression":
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown(render_metric_card("R²",
+                    f"{test_m.get('r2', 0):.4f}", "↑ Higher is better", "#6c63ff"), unsafe_allow_html=True)
+            with c2:
+                st.markdown(render_metric_card("RMSE",
+                    f"{test_m.get('rmse', 0):.4f}", "↓ Lower is better", "#ff6584"), unsafe_allow_html=True)
+            with c3:
+                st.markdown(render_metric_card("MAE",
+                    f"{test_m.get('mae', 0):.4f}", "Mean Absolute Error", "#f7971e"), unsafe_allow_html=True)
+            with c4:
+                st.markdown(render_metric_card("CV R²",
+                    f"{metrics.get('cv_r2', 0):.4f}", f"±{metrics.get('cv_r2_std', 0):.4f}", "#43e97b"), unsafe_allow_html=True)
+
+        else:  # classification
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.markdown(render_metric_card("ROC-AUC", f"{auc:.4f}", "↑ Higher is better", "#6c63ff"), unsafe_allow_html=True)
+            with c2:
+                st.markdown(render_metric_card("Accuracy", f"{acc:.2%}", f"{'↑ ' if acc > 0.8 else '↓ '}{acc:.4f}", "#43e97b"), unsafe_allow_html=True)
+            with c3:
+                st.markdown(render_metric_card("F1 Weighted", f"{f1:.4f}", "Precision × Recall balance", "#f7971e"), unsafe_allow_html=True)
+            with c4:
+                if ll:
+                    st.markdown(render_metric_card("Log Loss", f"{ll:.4f}", "↓ Lower is better", "#ff6584"), unsafe_allow_html=True)
+                else:
+                    st.markdown(render_metric_card("Reliability", f"{score}/100", f"Grade {grade}", grade_color), unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
         col_left, col_right = st.columns([1, 1])
 
-        # Overfitting radar / gauge
+        # Left panel — task-aware
         with col_left:
-            section_header("Overfitting Analysis", "Train vs Test performance gap")
-            train_s = ovf.get("train_score", 0)
-            test_s = ovf.get("test_score", 0)
-            gap = ovf.get("gap", 0)
-            status = ovf.get("status", "unknown")
-            status_color = {"normal": "#43e97b", "mild_overfitting": "#f7971e",
-                           "overfitting_detected": "#ff6584", "underfitting": "#38b2f4"}.get(status, "#8888aa")
+            if task == "clustering":
+                section_header("Cluster Distribution", "Sample count and proportion per cluster")
+                cluster_dist = ev.get("cluster_distribution", metrics.get("cluster_distribution", {}))
+                if cluster_dist:
+                    _lc = [k for k in cluster_dist.keys() if k != "noise"]
+                    _cc = [cluster_dist[k]["count"] for k in _lc]
+                    _pc = [cluster_dist[k].get("pct", 0) for k in _lc]
+                    fig_cd = go.Figure()
+                    fig_cd.add_trace(go.Bar(
+                        x=_lc, y=_cc,
+                        marker_color=COLORS[:len(_lc)], marker_line_width=0,
+                        text=[f"{p:.1f}%" for p in _pc], textposition="outside",
+                        textfont=dict(family="DM Mono", size=11, color="#e8e8f0"),
+                    ))
+                    fig_cd.update_layout(**PLOTLY_LAYOUT, height=220,
+                        xaxis=dict(**AXIS_STYLE), yaxis=dict(**AXIS_STYLE), showlegend=False,
+                        title=dict(text=f"Total: {sum(_cc):,} samples", font=dict(size=11, family="DM Mono"), x=0),
+                    )
+                    st.plotly_chart(fig_cd, use_container_width=True)
+                _db = ev.get("davies_bouldin")
+                _ch = ev.get("calinski_harabasz")
+                st.markdown(f"""
+                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:#8888aa;
+                            padding:0.6rem 0.8rem;background:rgba(255,255,255,0.03);border-radius:6px;">
+                    Silhouette: <span style="color:#6c63ff">{ev.get('silhouette_score',0):.4f}</span>
+                    &nbsp;|&nbsp; Davies-Bouldin: <span style="color:#e8e8f0">{f'{_db:.4f}' if _db else 'N/A'}</span>
+                    &nbsp;|&nbsp; Calinski-Harabasz: <span style="color:#e8e8f0">{f'{_ch:.0f}' if _ch else 'N/A'}</span>
+                </div>
+                """, unsafe_allow_html=True)
 
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                x=["Train", "Test"],
-                y=[train_s, test_s],
-                marker_color=["#6c63ff", "#43e97b"],
-                marker_line_width=0,
-                text=[f"{train_s:.4f}", f"{test_s:.4f}"],
-                textposition="outside",
-                textfont=dict(family="DM Mono", size=11, color="#e8e8f0"),
-            ))
-            fig.update_layout(**PLOTLY_LAYOUT,
-                height=220,
-                title=dict(text=f"<span style='color:{status_color}'>{status.replace('_', ' ').title()}</span> · gap: {gap:.4f}",
-                          font=dict(size=11, family="DM Mono"), x=0),
-                xaxis=dict(**AXIS_STYLE),
-                yaxis=dict(**AXIS_STYLE, range=[max(0, min(train_s, test_s) - 0.1), 1.05]),
-                showlegend=False,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            st.markdown(f"""
-            <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #8888aa; 
-                        padding: 0.6rem 0.8rem; background: rgba(255,255,255,0.03); border-radius: 6px;">
-                {ovf.get('description', '')}
-            </div>
-            """, unsafe_allow_html=True)
-
-        # Model comparison
-        with col_right:
-            section_header("Model Comparison", "5-fold cross-validation ROC-AUC")
-            if all_scores:
-                sorted_scores = dict(sorted(all_scores.items(), key=lambda x: float(x[1]), reverse=True))
-                models = list(sorted_scores.keys())
-                scores = [float(v) for v in sorted_scores.values()]
-                bar_colors = [COLORS[0] if m == model_name else "#2a2a3a" for m in models]
-
-                fig2 = go.Figure()
-                fig2.add_trace(go.Bar(
-                    x=scores, y=models, orientation="h",
-                    marker_color=bar_colors, marker_line_width=0,
-                    text=[f"{s:.4f}" for s in scores],
-                    textposition="outside",
-                    textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+            elif task == "anomaly_detection":
+                section_header("Anomaly Distribution", "Normal vs detected anomalies")
+                _na = ev.get("n_anomalies", 0); _nn = ev.get("n_normal", 0)
+                fig_ad = go.Figure(go.Pie(
+                    labels=["Normal", "Anomaly"], values=[_nn, _na],
+                    marker=dict(colors=["#43e97b", "#ff6584"]),
+                    hole=0.55, textfont=dict(family="DM Mono", size=11),
                 ))
-                fig2.update_layout(**PLOTLY_LAYOUT,
-                    height=220,
-                    xaxis=dict(**AXIS_STYLE, range=[min(scores) - 0.02, max(scores) + 0.02]),
-                    yaxis=dict(**AXIS_STYLE),
+                fig_ad.update_layout(**PLOTLY_LAYOUT, height=220, showlegend=True,
+                    legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
+                )
+                st.plotly_chart(fig_ad, use_container_width=True)
+                _st = ev.get("score_threshold", 0)
+                st.markdown(f"""
+                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:#8888aa;
+                            padding:0.6rem 0.8rem;background:rgba(255,255,255,0.03);border-radius:6px;">
+                    Anomaly rate: <span style="color:#ff6584">{ev.get('anomaly_pct',0):.2f}%</span>
+                    &nbsp;|&nbsp; Contamination: <span style="color:#e8e8f0">{ev.get('best_contamination','?')}</span>
+                    &nbsp;|&nbsp; Score threshold: <span style="color:#e8e8f0">{_st:.4f if isinstance(_st, float) else _st}</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+            else:
+                section_header("Overfitting Analysis", "Train vs Test performance gap")
+                train_s = ovf.get("train_score", 0); test_s = ovf.get("test_score", 0)
+                gap = ovf.get("gap", 0); status = ovf.get("status", "unknown")
+                status_color = {"normal": "#43e97b", "mild_overfitting": "#f7971e",
+                               "overfitting_detected": "#ff6584", "underfitting": "#38b2f4"}.get(status, "#8888aa")
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    x=["Train", "Test"], y=[train_s, test_s],
+                    marker_color=["#6c63ff", "#43e97b"], marker_line_width=0,
+                    text=[f"{train_s:.4f}", f"{test_s:.4f}"], textposition="outside",
+                    textfont=dict(family="DM Mono", size=11, color="#e8e8f0"),
+                ))
+                fig.update_layout(**PLOTLY_LAYOUT, height=220,
+                    title=dict(text=f"<span style='color:{status_color}'>{status.replace('_',' ').title()}</span> · gap: {gap:.4f}",
+                              font=dict(size=11, family="DM Mono"), x=0),
+                    xaxis=dict(**AXIS_STYLE),
+                    yaxis=dict(**AXIS_STYLE, range=[max(0, min(train_s, test_s) - 0.1), 1.05]),
                     showlegend=False,
                 )
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown(f"""
+                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:#8888aa;
+                            padding:0.6rem 0.8rem;background:rgba(255,255,255,0.03);border-radius:6px;">
+                    {ovf.get('description', '')}
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Right panel — task-aware
+        with col_right:
+            if task == "clustering":
+                section_header("Algorithm Comparison", "Silhouette score by algorithm")
+                _algo_sc = ev.get("all_algorithm_scores", {})
+                if _algo_sc:
+                    _best_algo = ev.get("best_algorithm", "")
+                    _sa = dict(sorted(_algo_sc.items(), key=lambda x: float(x[1]), reverse=True))
+                    _an = list(_sa.keys()); _av = [float(v) for v in _sa.values()]
+                    _bc_a = [COLORS[0] if a == _best_algo else "#2a2a3a" for a in _an]
+                    fig_algo = go.Figure()
+                    fig_algo.add_trace(go.Bar(
+                        x=_av, y=_an, orientation="h",
+                        marker_color=_bc_a, marker_line_width=0,
+                        text=[f"{v:.4f}" for v in _av], textposition="outside",
+                        textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                    ))
+                    fig_algo.update_layout(**PLOTLY_LAYOUT, height=220,
+                        xaxis=dict(**AXIS_STYLE, range=[max(-1, min(_av) - 0.05), 1.0]),
+                        yaxis=dict(**AXIS_STYLE), showlegend=False,
+                        title=dict(text=f"Best: {_best_algo.upper()}", font=dict(size=11, family="DM Mono"), x=0),
+                    )
+                    st.plotly_chart(fig_algo, use_container_width=True)
+
+            elif task == "anomaly_detection":
+                section_header("Contamination Scan", "Anomaly % at each threshold")
+                _cscan = ev.get("contamination_scan", {})
+                if _cscan:
+                    _bc_s = str(ev.get("best_contamination", ""))
+                    _ck = list(_cscan.keys())
+                    _cp = [_cscan[k]["anomaly_pct"] for k in _ck]
+                    _cn = [_cscan[k]["n_anomalies"] for k in _ck]
+                    _bc_cont = [COLORS[0] if k == _bc_s else "#2a2a3a" for k in _ck]
+                    fig_cont = go.Figure()
+                    fig_cont.add_trace(go.Bar(
+                        x=[f"cont={k}" for k in _ck], y=_cp,
+                        marker_color=_bc_cont, marker_line_width=0,
+                        text=[f"{p:.1f}%" for p in _cp], textposition="outside",
+                        textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                    ))
+                    fig_cont.update_layout(**PLOTLY_LAYOUT, height=220,
+                        xaxis=dict(**AXIS_STYLE), yaxis=dict(**AXIS_STYLE, title="Anomaly %"),
+                        showlegend=False,
+                        title=dict(text=f"Best contamination: {_bc_s}", font=dict(size=11, family="DM Mono"), x=0),
+                    )
+                    st.plotly_chart(fig_cont, use_container_width=True)
+
+            else:
+                section_header("Model Comparison", "5-fold cross-validation ROC-AUC")
+                if all_scores:
+                    sorted_scores = dict(sorted(all_scores.items(), key=lambda x: float(x[1]), reverse=True))
+                    models = list(sorted_scores.keys())
+                    scores = [float(v) for v in sorted_scores.values()]
+                    bar_colors = [COLORS[0] if m == model_name else "#2a2a3a" for m in models]
+                    fig2 = go.Figure()
+                    fig2.add_trace(go.Bar(
+                        x=scores, y=models, orientation="h",
+                        marker_color=bar_colors, marker_line_width=0,
+                        text=[f"{s:.4f}" for s in scores], textposition="outside",
+                        textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                    ))
+                    fig2.update_layout(**PLOTLY_LAYOUT, height=220,
+                        xaxis=dict(**AXIS_STYLE, range=[min(scores) - 0.02, max(scores) + 0.02]),
+                        yaxis=dict(**AXIS_STYLE), showlegend=False,
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
 
         # Reliability factors
         st.markdown("<br>", unsafe_allow_html=True)
@@ -501,120 +691,213 @@ def render_results(result: AgentState):
                     </div>
                     """, unsafe_allow_html=True)
 
-    # Tab 2 — Model Performance
+    # TAB 2 — MODEL PERFORMANCE
     with tab2:
-        col_l, col_r = st.columns(2)
-
-        # Confusion Matrix
-        with col_l:
-            section_header("Confusion Matrix", "Actual vs Predicted")
-            if confusion:
-                cm_matrix = confusion.get("matrix", [])
-                labels = [str(l) for l in confusion.get("labels", [])]
-                if cm_matrix:
-                    fig_cm = px.imshow(
-                        cm_matrix, x=labels, y=labels,
-                        color_continuous_scale=[[0, "#0a0a0f"], [0.5, "#2a1f5a"], [1, "#6c63ff"]],
-                        text_auto=True,
-                    )
-                    fig_cm.update_traces(textfont=dict(family="DM Mono", size=14, color="white"))
-                    fig_cm.update_layout(**PLOTLY_LAYOUT, height=300,
-                        xaxis=dict(**AXIS_STYLE, title="Predicted"),
-                        yaxis=dict(**AXIS_STYLE, title="Actual"),
-                        coloraxis_showscale=False,
-                    )
-                    st.plotly_chart(fig_cm, use_container_width=True)
-
-        # ROC Curve
-        with col_r:
-            section_header("ROC Curve", f"AUC = {auc:.4f}")
-            if roc:
-                fpr_vals = roc.get("fpr", [])
-                tpr_vals = roc.get("tpr", [])
-                opt_fpr = roc.get("optimal_fpr", None)
-                opt_tpr = roc.get("optimal_tpr", None)
-                opt_thresh = roc.get("optimal_threshold", None)
-
-                fig_roc = go.Figure()
-                fig_roc.add_trace(go.Scatter(
-                    x=[0, 1], y=[0, 1],
-                    mode="lines", line=dict(color="rgba(255,255,255,0.15)", dash="dash", width=1),
-                    showlegend=False,
-                ))
-                fig_roc.add_trace(go.Scatter(
-                    x=fpr_vals, y=tpr_vals,
-                    mode="lines", fill="tozeroy",
-                    line=dict(color="#6c63ff", width=2),
-                    fillcolor="rgba(108,99,255,0.1)",
-                    name=f"AUC = {auc:.4f}",
-                ))
-                if opt_fpr and opt_tpr:
-                    fig_roc.add_trace(go.Scatter(
-                        x=[opt_fpr], y=[opt_tpr],
-                        mode="markers",
-                        marker=dict(color="#ff6584", size=10, symbol="star"),
-                        name=f"Optimal threshold = {opt_thresh}",
+        if task == "clustering":
+            col_l2, col_r2 = st.columns(2)
+            with col_l2:
+                section_header("Cluster Size Distribution", "Samples per cluster")
+                _cd2 = ev.get("cluster_distribution", {})
+                if _cd2:
+                    _lc2 = list(_cd2.keys())
+                    _cc2 = [_cd2[k]["count"] for k in _lc2]
+                    _pc2 = [_cd2[k].get("pct", 0) for k in _lc2]
+                    fig_cbar = go.Figure()
+                    fig_cbar.add_trace(go.Bar(
+                        x=_lc2, y=_cc2, marker_color=COLORS[:len(_lc2)], marker_line_width=0,
+                        text=[f"{p:.1f}%" for p in _pc2], textposition="outside",
+                        textfont=dict(family="DM Mono", size=11, color="#e8e8f0"),
                     ))
-                fig_roc.update_layout(**PLOTLY_LAYOUT, height=300,
-                    xaxis=dict(**AXIS_STYLE, title="False Positive Rate"),
-                    yaxis=dict(**AXIS_STYLE, title="True Positive Rate"),
+                    fig_cbar.update_layout(**PLOTLY_LAYOUT, height=300,
+                        xaxis=dict(**AXIS_STYLE), yaxis=dict(**AXIS_STYLE, title="Count"), showlegend=False,
+                    )
+                    st.plotly_chart(fig_cbar, use_container_width=True)
+
+            with col_r2:
+                section_header("Silhouette Score Gauge", "Cluster separation quality")
+                _sil = ev.get("silhouette_score", 0)
+                fig_gauge = go.Figure(go.Indicator(
+                    mode="gauge+number", value=_sil,
+                    domain={"x": [0, 1], "y": [0, 1]},
+                    title={"text": "Silhouette Score", "font": {"family": "DM Mono", "size": 13, "color": "#8888aa"}},
+                    number={"font": {"family": "DM Mono", "size": 30, "color": "#e8e8f0"}, "suffix": ""},
+                    gauge={
+                        "axis": {"range": [-1, 1], "tickfont": {"family": "DM Mono", "size": 10}},
+                        "bar": {"color": "#6c63ff"},
+                        "steps": [
+                            {"range": [-1, 0], "color": "#1a1218"},
+                            {"range": [0, 0.5], "color": "#151525"},
+                            {"range": [0.5, 1], "color": "#151a30"},
+                        ],
+                        "threshold": {"line": {"color": "#43e97b", "width": 2}, "value": 0.5},
+                    },
+                ))
+                fig_gauge.update_layout(**PLOTLY_LAYOUT, height=260)
+                st.plotly_chart(fig_gauge, use_container_width=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            _m3 = st.columns(3)
+            with _m3[0]:
+                st.markdown(render_metric_card("N Clusters", str(ev.get("n_clusters","?")), "Optimal found", "#6c63ff"), unsafe_allow_html=True)
+            with _m3[1]:
+                _db2 = ev.get("davies_bouldin")
+                st.markdown(render_metric_card("Davies-Bouldin", f"{_db2:.4f}" if _db2 else "N/A", "↓ Lower is better", "#f7971e"), unsafe_allow_html=True)
+            with _m3[2]:
+                _ch2 = ev.get("calinski_harabasz")
+                st.markdown(render_metric_card("Calinski-Harabasz", f"{_ch2:.0f}" if _ch2 else "N/A", "↑ Higher is better", "#43e97b"), unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            _as2 = ev.get("all_algorithm_scores", {})
+            if _as2:
+                section_header("Algorithm Comparison", "Silhouette score per algorithm tested")
+                _adf = pd.DataFrame([
+                    {"Algorithm": k.upper(), "Silhouette": round(v, 4),
+                     "Status": "BEST" if k == ev.get("best_algorithm") else ""}
+                    for k, v in sorted(_as2.items(), key=lambda x: x[1], reverse=True)
+                ])
+                st.dataframe(_adf, use_container_width=True, hide_index=True)
+
+        elif task == "anomaly_detection":
+            col_l2, col_r2 = st.columns(2)
+            with col_l2:
+                section_header("Detection Breakdown", "Normal vs anomaly records")
+                _na2 = ev.get("n_anomalies", 0); _nn2 = ev.get("n_normal", 0)
+                fig_pie2 = go.Figure(go.Pie(
+                    labels=["Normal", "Anomaly"], values=[_nn2, _na2],
+                    marker=dict(colors=["#43e97b", "#ff6584"]),
+                    hole=0.55, textfont=dict(family="DM Mono", size=12), textinfo="label+percent+value",
+                ))
+                fig_pie2.update_layout(**PLOTLY_LAYOUT, height=300, showlegend=True,
+                    legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
+                    title=dict(text=f"Total: {_na2+_nn2:,} records", font=dict(size=11, family="DM Mono"), x=0),
+                )
+                st.plotly_chart(fig_pie2, use_container_width=True)
+
+            with col_r2:
+                section_header("Contamination Scan", "Anomaly count at each threshold")
+                _cs2 = ev.get("contamination_scan", {})
+                if _cs2:
+                    _bc2 = str(ev.get("best_contamination", ""))
+                    _ck2 = list(_cs2.keys())
+                    _cp2 = [_cs2[k]["anomaly_pct"] for k in _ck2]
+                    _cn2 = [_cs2[k]["n_anomalies"] for k in _ck2]
+                    fig_scan = go.Figure()
+                    fig_scan.add_trace(go.Bar(
+                        x=[f"cont={k}" for k in _ck2], y=_cp2,
+                        marker_color=[COLORS[0] if k == _bc2 else "#2a2a3a" for k in _ck2],
+                        marker_line_width=0,
+                        text=[f"{p:.1f}%<br>({n} pts)" for p, n in zip(_cp2, _cn2)],
+                        textposition="outside",
+                        textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                    ))
+                    fig_scan.update_layout(**PLOTLY_LAYOUT, height=300,
+                        xaxis=dict(**AXIS_STYLE), yaxis=dict(**AXIS_STYLE, title="Anomaly %"), showlegend=False,
+                        title=dict(text=f"Selected contamination={_bc2} (highlighted)",
+                                  font=dict(size=11, family="DM Mono"), x=0),
+                    )
+                    st.plotly_chart(fig_scan, use_container_width=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            _fi_a = ev.get("feature_importance", {})
+            if _fi_a:
+                section_header("Anomaly Drivers (Feature Importance)", "Features most responsible for anomaly detection")
+                _tot_a = sum(_fi_a.values()) or 1
+                _top_a = dict(list(_fi_a.items())[:15])
+                _fi_ap = {k: round(v / _tot_a * 100, 2) for k, v in _top_a.items()}
+                _feats_a = list(_fi_ap.keys())[::-1]
+                _vals_a = [_fi_ap[f] for f in _feats_a]
+                fig_fi_a = go.Figure()
+                fig_fi_a.add_trace(go.Bar(
+                    x=_vals_a, y=_feats_a, orientation="h",
+                    marker_color=[f"rgba(255,101,132,{0.35 + 0.65 * v / max(_vals_a)})" for v in _vals_a],
+                    marker_line_width=0,
+                    text=[f"{v:.1f}%" for v in _vals_a], textposition="outside",
+                    textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                ))
+                fig_fi_a.update_layout(**PLOTLY_LAYOUT,
+                    height=max(250, len(_feats_a) * 28), showlegend=False,
+                    xaxis=dict(**AXIS_STYLE, title="Relative Importance (%)"),
+                    yaxis=dict(**AXIS_STYLE),
+                )
+                st.plotly_chart(fig_fi_a, use_container_width=True)
+
+        else:
+            # Classification / Regression — existing charts
+            col_l, col_r = st.columns(2)
+            with col_l:
+                section_header("Confusion Matrix", "Actual vs Predicted")
+                if confusion:
+                    cm_matrix = confusion.get("matrix", [])
+                    labels = [str(l) for l in confusion.get("labels", [])]
+                    if cm_matrix:
+                        fig_cm = px.imshow(
+                            cm_matrix, x=labels, y=labels,
+                            color_continuous_scale=[[0, "#0a0a0f"], [0.5, "#2a1f5a"], [1, "#6c63ff"]],
+                            text_auto=True,
+                        )
+                        fig_cm.update_traces(textfont=dict(family="DM Mono", size=14, color="white"))
+                        fig_cm.update_layout(**PLOTLY_LAYOUT, height=300,
+                            xaxis=dict(**AXIS_STYLE, title="Predicted"),
+                            yaxis=dict(**AXIS_STYLE, title="Actual"),
+                            coloraxis_showscale=False,
+                        )
+                        st.plotly_chart(fig_cm, use_container_width=True)
+
+            with col_r:
+                section_header("ROC Curve", f"AUC = {auc:.4f}")
+                if roc:
+                    fpr_vals = roc.get("fpr", []); tpr_vals = roc.get("tpr", [])
+                    opt_fpr = roc.get("optimal_fpr"); opt_tpr = roc.get("optimal_tpr")
+                    opt_thresh = roc.get("optimal_threshold")
+                    fig_roc = go.Figure()
+                    fig_roc.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
+                        line=dict(color="rgba(255,255,255,0.15)", dash="dash", width=1), showlegend=False))
+                    fig_roc.add_trace(go.Scatter(x=fpr_vals, y=tpr_vals, mode="lines", fill="tozeroy",
+                        line=dict(color="#6c63ff", width=2), fillcolor="rgba(108,99,255,0.1)", name=f"AUC = {auc:.4f}"))
+                    if opt_fpr and opt_tpr:
+                        fig_roc.add_trace(go.Scatter(x=[opt_fpr], y=[opt_tpr], mode="markers",
+                            marker=dict(color="#ff6584", size=10, symbol="star"), name=f"Optimal = {opt_thresh}"))
+                    fig_roc.update_layout(**PLOTLY_LAYOUT, height=300,
+                        xaxis=dict(**AXIS_STYLE, title="False Positive Rate"),
+                        yaxis=dict(**AXIS_STYLE, title="True Positive Rate"),
+                        legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
+                    )
+                    st.plotly_chart(fig_roc, use_container_width=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            if per_class:
+                section_header("Per-Class Performance", "Precision, Recall, F1 by class")
+                pc_df = pd.DataFrame(per_class).T.reset_index()
+                pc_df.columns = ["Class", "Precision", "Recall", "F1", "Support"]
+                fig_pc = go.Figure()
+                for metric, color in [("Precision", "#6c63ff"), ("Recall", "#43e97b"), ("F1", "#f7971e")]:
+                    fig_pc.add_trace(go.Bar(name=metric, x=pc_df["Class"].astype(str), y=pc_df[metric],
+                        marker_color=color, marker_line_width=0))
+                fig_pc.update_layout(**PLOTLY_LAYOUT, height=250, barmode="group",
+                    xaxis=dict(**AXIS_STYLE), yaxis=dict(**AXIS_STYLE),
                     legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
                 )
-                st.plotly_chart(fig_roc, use_container_width=True)
+                st.plotly_chart(fig_pc, use_container_width=True)
 
-        st.markdown("<br>", unsafe_allow_html=True)
+            if calibration:
+                section_header("Model Calibration", f"Brier Score: {calibration.get('brier_score')}")
+                prob_true = calibration.get("prob_true", []); prob_pred = calibration.get("prob_pred", [])
+                is_cal = calibration.get("is_well_calibrated", False)
+                fig_cal = go.Figure()
+                fig_cal.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
+                    line=dict(color="rgba(255,255,255,0.2)", dash="dash", width=1), name="Perfect calibration", showlegend=True))
+                fig_cal.add_trace(go.Scatter(x=prob_pred, y=prob_true, mode="lines+markers",
+                    line=dict(color="#f7971e", width=2), marker=dict(size=7, color="#f7971e"), name="Model calibration"))
+                fig_cal.update_layout(**PLOTLY_LAYOUT, height=250,
+                    xaxis=dict(**AXIS_STYLE, title="Mean Predicted Probability"),
+                    yaxis=dict(**AXIS_STYLE, title="Fraction of Positives"),
+                    legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
+                    title=dict(text=f"{'✓ Well calibrated' if is_cal else '⚠ Poorly calibrated'}",
+                        font=dict(size=11, family="DM Mono", color="#43e97b" if is_cal else "#f7971e"), x=0),
+                )
+                st.plotly_chart(fig_cal, use_container_width=True)
 
-        # Per-class metrics
-        if per_class:
-            section_header("Per-Class Performance", "Precision, Recall, F1 by class")
-            pc_df = pd.DataFrame(per_class).T.reset_index()
-            pc_df.columns = ["Class", "Precision", "Recall", "F1", "Support"]
-
-            fig_pc = go.Figure()
-            for metric, color in [("Precision", "#6c63ff"), ("Recall", "#43e97b"), ("F1", "#f7971e")]:
-                fig_pc.add_trace(go.Bar(
-                    name=metric, x=pc_df["Class"].astype(str), y=pc_df[metric],
-                    marker_color=color, marker_line_width=0,
-                ))
-            fig_pc.update_layout(**PLOTLY_LAYOUT, height=250, barmode="group",
-                xaxis=dict(**AXIS_STYLE),
-                yaxis=dict(**AXIS_STYLE),
-                legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
-            )
-            st.plotly_chart(fig_pc, use_container_width=True)
-
-        # Calibration
-        if calibration:
-            section_header("Model Calibration", f"Brier Score: {calibration.get('brier_score')}")
-            prob_true = calibration.get("prob_true", [])
-            prob_pred = calibration.get("prob_pred", [])
-            is_cal = calibration.get("is_well_calibrated", False)
-
-            fig_cal = go.Figure()
-            fig_cal.add_trace(go.Scatter(
-                x=[0, 1], y=[0, 1], mode="lines",
-                line=dict(color="rgba(255,255,255,0.2)", dash="dash", width=1),
-                name="Perfect calibration", showlegend=True,
-            ))
-            fig_cal.add_trace(go.Scatter(
-                x=prob_pred, y=prob_true, mode="lines+markers",
-                line=dict(color="#f7971e", width=2),
-                marker=dict(size=7, color="#f7971e"),
-                name="Model calibration",
-            ))
-            fig_cal.update_layout(**PLOTLY_LAYOUT, height=250,
-                xaxis=dict(**AXIS_STYLE, title="Mean Predicted Probability"),
-                yaxis=dict(**AXIS_STYLE, title="Fraction of Positives"),
-                legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
-                title=dict(
-                    text=f"{'✓ Well calibrated' if is_cal else '⚠ Poorly calibrated'}",
-                    font=dict(size=11, family="DM Mono",
-                             color="#43e97b" if is_cal else "#f7971e"), x=0,
-                ),
-            )
-            st.plotly_chart(fig_cal, use_container_width=True)
-
-    # Tab 3 — Feature Analysis
+    # TAB 3 — FEATURE ANALYSIS
     with tab3:
         if fi:
             section_header("Feature Importance", f"Top features · {fi_summary.get('top5_total_contribution_pct', '?')}% of total impact from top 5")
@@ -657,40 +940,70 @@ def render_results(result: AgentState):
                     </div>
                     """, unsafe_allow_html=True)
         else:
-            st.info("Feature importance data not available.")
+            if task == "clustering":
+                section_header("Cluster Statistics", "Detailed per-cluster breakdown")
+                _cd3 = ev.get("cluster_distribution", {})
+                if _cd3:
+                    _crows = []
+                    for _cname, _cinfo in _cd3.items():
+                        _crows.append({"Cluster": _cname, "Count": _cinfo.get("count", 0),
+                                       "Share %": f"{_cinfo.get('pct', 0):.1f}%"})
+                    st.dataframe(pd.DataFrame(_crows), use_container_width=True, hide_index=True)
+                st.markdown(f"""
+                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:#8888aa;
+                            padding:0.8rem;background:rgba(255,255,255,0.02);border-radius:8px;
+                            border-left:2px solid #6c63ff;margin-top:0.8rem;">
+                    <strong style="color:#e8e8f0;">Note:</strong> Feature importance is not available for
+                    KMeans / DBSCAN clustering algorithms. Use the anomaly_detection intent with
+                    IsolationForest to get feature-level importance scores.
+                </div>
+                """, unsafe_allow_html=True)
+            elif task == "anomaly_detection":
+                st.info("Feature importance will appear here once IsolationForest computes it.")
+            else:
+                st.info("Feature importance data not available.")
 
         # Feature Engineering summary
         if feature_report:
             st.markdown("<br>", unsafe_allow_html=True)
             section_header("Feature Engineering Summary", "Transformations applied by the pipeline")
 
-            fr_cols = st.columns(3)
-            with fr_cols[0]:
-                st.markdown(render_metric_card("Final Features", str(feature_report.get("n_features", "?")), "After selection", "#6c63ff"), unsafe_allow_html=True)
-            with fr_cols[1]:
-                st.markdown(render_metric_card("Train Samples", str(feature_report.get("n_train", "?")), "80% split", "#43e97b"), unsafe_allow_html=True)
-            with fr_cols[2]:
-                st.markdown(render_metric_card("Test Samples", str(feature_report.get("n_test", "?")), "20% split", "#f7971e"), unsafe_allow_html=True)
+            if task in ("clustering", "anomaly_detection"):
+                # Unsupervised — no train/test split, show total samples only
+                _total_samples = feature_report.get("n_train", 0) + feature_report.get("n_test", 0)
+                fr_cols = st.columns(2)
+                with fr_cols[0]:
+                    st.markdown(render_metric_card("Final Features", str(feature_report.get("n_features", "?")), "After selection", "#6c63ff"), unsafe_allow_html=True)
+                with fr_cols[1]:
+                    st.markdown(render_metric_card("Total Samples", str(_total_samples) if _total_samples else str(feature_report.get("n_train", "?")), "Full dataset used", "#43e97b"), unsafe_allow_html=True)
+            else:
+                fr_cols = st.columns(3)
+                with fr_cols[0]:
+                    st.markdown(render_metric_card("Final Features", str(feature_report.get("n_features", "?")), "After selection", "#6c63ff"), unsafe_allow_html=True)
+                with fr_cols[1]:
+                    st.markdown(render_metric_card("Train Samples", str(feature_report.get("n_train", "?")), "80% split", "#43e97b"), unsafe_allow_html=True)
+                with fr_cols[2]:
+                    st.markdown(render_metric_card("Test Samples", str(feature_report.get("n_test", "?")), "20% split", "#f7971e"), unsafe_allow_html=True)
 
-            # Target distribution
-            dist = feature_report.get("target_distribution_train", {})
-            if dist:
-                st.markdown("<br>", unsafe_allow_html=True)
-                section_header("Target Distribution (Train)", "Class balance in training set")
-                labels_d = [str(k) for k in dist.keys()]
-                values_d = list(dist.values())
-                fig_dist = go.Figure(go.Pie(
-                    labels=labels_d, values=values_d,
-                    marker=dict(colors=COLORS[:len(labels_d)]),
-                    hole=0.6,
-                    textfont=dict(family="DM Mono", size=11),
-                ))
-                fig_dist.update_layout(**PLOTLY_LAYOUT, height=250, showlegend=True,
-                    legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
-                )
-                st.plotly_chart(fig_dist, use_container_width=True)
+                # Target distribution (supervised only)
+                dist = feature_report.get("target_distribution_train", {})
+                if dist:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    section_header("Target Distribution (Train)", "Class balance in training set")
+                    labels_d = [str(k) for k in dist.keys()]
+                    values_d = list(dist.values())
+                    fig_dist = go.Figure(go.Pie(
+                        labels=labels_d, values=values_d,
+                        marker=dict(colors=COLORS[:len(labels_d)]),
+                        hole=0.6,
+                        textfont=dict(family="DM Mono", size=11),
+                    ))
+                    fig_dist.update_layout(**PLOTLY_LAYOUT, height=250, showlegend=True,
+                        legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
+                    )
+                    st.plotly_chart(fig_dist, use_container_width=True)
 
-    # Tab 4 - Data & Profiling
+    # TAB 4 — DATA & PROFILING
     with tab4:
         if profiling:
             shape = profiling.get("shape", {})
@@ -769,7 +1082,7 @@ def render_results(result: AgentState):
                     }
                 )
 
-    # Tab 5 — Pipeline Trace
+    # TAB 5 — PIPELINE TRACE
     with tab5:
         section_header("Pipeline Execution Trace", "Step-by-step node outputs")
 
@@ -806,9 +1119,21 @@ def render_results(result: AgentState):
             }),
             ("07 · AutoML", "automl_node", {
                 "Best model": model_name,
-                "CV ROC-AUC": f"{metrics.get('cv_roc_auc', 0):.4f} ± {metrics.get('cv_roc_auc_std', 0):.4f}",
-                "Test accuracy": f"{test_m.get('accuracy', 0):.4f}",
-                "Test ROC-AUC": f"{test_m.get('roc_auc', test_m.get('roc_auc_ovr', 0)):.4f}",
+                **(
+                    {
+                        "Algorithm": str(metrics.get("best_algorithm", "?")),
+                        "Silhouette": f"{metrics.get('silhouette_score', 0):.4f}",
+                        "N Clusters": str(metrics.get("n_clusters", "?")),
+                    } if intent == "clustering" else {
+                        "N Anomalies": str(metrics.get("n_anomalies", "?")),
+                        "Anomaly %": f"{metrics.get('anomaly_pct', 0):.2f}%",
+                        "Contamination": str(metrics.get("best_contamination", "?")),
+                    } if intent == "anomaly_detection" else {
+                        "CV ROC-AUC": f"{metrics.get('cv_roc_auc', 0):.4f} ± {metrics.get('cv_roc_auc_std', 0):.4f}",
+                        "Test accuracy": f"{test_m.get('accuracy', 0):.4f}",
+                        "Test ROC-AUC": f"{test_m.get('roc_auc', test_m.get('roc_auc_ovr', 0)):.4f}",
+                    }
+                ),
             }),
             ("08 · Evaluation", "evaluation_node", {
                 "Reliability score": f"{reliability.get('score', 0)}/100 (Grade {reliability.get('grade', '?')})",
@@ -834,7 +1159,7 @@ def render_results(result: AgentState):
                     </div>
                     """, unsafe_allow_html=True)
 
-    # Full Report
+    # TAB 6 — FULL REPORT
     with tab6:
         if report:
             section_header("Generated Report", "LLM-synthesized analysis in Turkish")
@@ -848,7 +1173,9 @@ def render_results(result: AgentState):
         else:
             st.warning("Report not generated.")
 
-# Main Flow
+
+# MAIN FLOW
+
 if "result" not in st.session_state:
     st.session_state.result = None
 

@@ -7,9 +7,10 @@ from pydantic import BaseModel, Field
 from src.state import AgentState
 
 
+# --- Structured output modeli ---
 class IntentResult(BaseModel):
     intent: str = Field(
-        description="Şunlardan biri: eda, classification, regression, clustering, report"
+        description="Şunlardan biri: eda, classification, regression, clustering, anomaly_detection, report"
     )
     confidence: float = Field(
         description="0 ile 1 arasında güven skoru"
@@ -17,32 +18,37 @@ class IntentResult(BaseModel):
     reasoning: str = Field(
         description="Bu intent'in neden seçildiğini açıklayan tek cümle (Türkçe)"
     )
- 
- 
+
+
 INTENT_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
         """Sen bir veri bilimi ajanının intent sınıflandırıcısısın. Kullanıcı sorularını Türkçe veya İngilizce alabilirsin.
- 
+
 Görevin: Kullanıcının sorgusunu aşağıdaki kategorilerden BİRİNE sınıflandırmak.
- 
-- eda            : Keşifsel veri analizi, istatistik, dağılım inceleme, veri profilleme
-- classification : Kategorik bir hedef değişkeni tahmin etme
-- regression     : Sayısal/sürekli bir hedef değişkeni tahmin etme
-- clustering     : Etiketsiz veriyi gruplara ayırma (segmentasyon)
-- report         : Mevcut veriden özet veya iş raporu üretme
- 
+
+- eda               : Keşifsel veri analizi, istatistik, dağılım inceleme, veri profilleme
+- classification    : Kategorik bir hedef değişkeni tahmin etme (evet/hayır, sınıf tahmini)
+- regression        : Sayısal/sürekli bir hedef değişkeni tahmin etme (fiyat, miktar, skor)
+- clustering        : Etiketsiz veriyi gruplara ayırma (segmentasyon, kümeleme)
+- anomaly_detection : Aykırı değer, sahte işlem, anormal davranış tespiti
+- report            : Mevcut veriden özet veya iş raporu üretme
+
 Kurallar:
 - Yalnızca tek bir intent seç
 - Emin değilsen "eda" seç
+- "Segment", "group", "cluster" → clustering
+- "Anomaly", "fraud", "outlier", "unusual", "aykırı", "sahte" → anomaly_detection
+- "Predict" + sayısal değer → regression
+- "Predict" + kategori/sınıf → classification
 - Yukarıdaki liste dışında intent üretme
-- Muhafazakâr ol, abartma
- 
+
 Yanıtını yapılandırılmış JSON olarak döndür: intent, confidence (0-1), reasoning (Türkçe).
 """,
     ),
     ("human", "Kullanıcı sorusu: {user_query}"),
 ])
+
 
 def intent_node(state: AgentState) -> AgentState:
     """
