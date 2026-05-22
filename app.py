@@ -183,12 +183,21 @@ hr {{ border-color: var(--border) !important; }}
 # Plotly theme
 is_dark = st.session_state.theme == "dark"
 
+# Theme-aware text colors for charts
+CHART_TEXT_COLOR = "#e8e8f0" if is_dark else "#1a1a2e"
+CHART_LABEL_COLOR = "#8888aa" if is_dark else "#5a5a7a"
+CHART_DIM_COLOR  = "#4a4a6a" if is_dark else "#aaaacc"
+INFO_BG = "rgba(255,255,255,0.03)" if is_dark else "rgba(0,0,0,0.04)"
+STATUS_BG = "#111118" if is_dark else "#f0f0f8"
+STATUS_BORDER = "rgba(255,255,255,0.06)" if is_dark else "rgba(0,0,0,0.10)"
+TRACE_BORDER = "rgba(255,255,255,0.03)" if is_dark else "rgba(0,0,0,0.06)"
+
 PLOTLY_LAYOUT = dict(
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(0,0,0,0)",
     font=dict(
         family="DM Mono, monospace",
-        color="#8888aa" if is_dark else "#5a5a7a",
+        color=CHART_LABEL_COLOR,
         size=11,
     ),
     margin=dict(l=10, r=10, t=30, b=10),
@@ -196,6 +205,7 @@ PLOTLY_LAYOUT = dict(
 AXIS_STYLE = dict(
     gridcolor="rgba(255,255,255,0.04)" if is_dark else "rgba(0,0,0,0.06)",
     zerolinecolor="rgba(255,255,255,0.08)" if is_dark else "rgba(0,0,0,0.10)",
+    tickfont=dict(color=CHART_LABEL_COLOR),
 )
 COLORS = ["#6c63ff", "#ff6584", "#43e97b", "#f7971e", "#38b2f4", "#f093fb"]
 
@@ -417,26 +427,26 @@ def render_results(result: AgentState):
     grade_color = {"A": "#43e97b", "B": "#6c63ff", "C": "#f7971e", "D": "#ff6584", "F": "#ff6584"}.get(grade, "#8888aa")
 
     st.markdown(f"""
-    <div style="background: #111118; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px;
+    <div style="background: {STATUS_BG}; border: 1px solid {STATUS_BORDER}; border-radius: 10px;
                 padding: 1rem 1.5rem; display: flex; align-items: center; gap: 2rem; 
                 margin-bottom: 2rem; flex-wrap: wrap;">
         <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #43e97b;">
             ✓ PIPELINE COMPLETE
         </div>
-        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #8888aa;">
-            MODEL: <span style="color: #e8e8f0;">{model_name.upper()}</span>
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">
+            MODEL: <span style="color: {CHART_TEXT_COLOR};">{model_name.upper()}</span>
         </div>
-        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #8888aa;">
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">
             INTENT: <span style="color: #6c63ff;">{intent.upper()}</span>
         </div>
-        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #8888aa;">
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">
             RELIABILITY: <span style="color: {grade_color}; font-weight: 700;">{score}/100 · {grade}</span>
         </div>
-        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #8888aa;">
-            FEATURES: <span style="color: #e8e8f0;">{feature_report.get('n_features', '?')}</span>
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">
+            FEATURES: <span style="color: {CHART_TEXT_COLOR};">{feature_report.get('n_features', '?')}</span>
         </div>
-        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #8888aa;">
-            TARGET: <span style="color: #e8e8f0;">{feature_report.get('target_name', '?').upper()}</span>
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">
+            TARGET: <span style="color: {CHART_TEXT_COLOR};">{feature_report.get('target_name', '?').upper()}</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -541,7 +551,7 @@ def render_results(result: AgentState):
                         x=_lc, y=_cc,
                         marker_color=COLORS[:len(_lc)], marker_line_width=0,
                         text=[f"{p:.1f}%" for p in _pc], textposition="outside",
-                        textfont=dict(family="DM Mono", size=11, color="#e8e8f0"),
+                        textfont=dict(family="DM Mono", size=11, color=CHART_TEXT_COLOR),
                     ))
                     fig_cd.update_layout(**PLOTLY_LAYOUT, height=220,
                         xaxis=dict(**AXIS_STYLE), yaxis=dict(**AXIS_STYLE), showlegend=False,
@@ -551,11 +561,11 @@ def render_results(result: AgentState):
                 _db = ev.get("davies_bouldin")
                 _ch = ev.get("calinski_harabasz")
                 st.markdown(f"""
-                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:#8888aa;
-                            padding:0.6rem 0.8rem;background:rgba(255,255,255,0.03);border-radius:6px;">
+                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:{CHART_LABEL_COLOR};
+                            padding:0.6rem 0.8rem;background:{INFO_BG};border-radius:6px;">
                     Silhouette: <span style="color:#6c63ff">{ev.get('silhouette_score',0):.4f}</span>
-                    &nbsp;|&nbsp; Davies-Bouldin: <span style="color:#e8e8f0">{f'{_db:.4f}' if _db else 'N/A'}</span>
-                    &nbsp;|&nbsp; Calinski-Harabasz: <span style="color:#e8e8f0">{f'{_ch:.0f}' if _ch else 'N/A'}</span>
+                    &nbsp;|&nbsp; Davies-Bouldin: <span style="color:{CHART_TEXT_COLOR}">{f'{_db:.4f}' if _db else 'N/A'}</span>
+                    &nbsp;|&nbsp; Calinski-Harabasz: <span style="color:{CHART_TEXT_COLOR}">{f'{_ch:.0f}' if _ch else 'N/A'}</span>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -573,11 +583,11 @@ def render_results(result: AgentState):
                 st.plotly_chart(fig_ad, use_container_width=True)
                 _st = ev.get("score_threshold", 0)
                 st.markdown(f"""
-                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:#8888aa;
-                            padding:0.6rem 0.8rem;background:rgba(255,255,255,0.03);border-radius:6px;">
+                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:{CHART_LABEL_COLOR};
+                            padding:0.6rem 0.8rem;background:{INFO_BG};border-radius:6px;">
                     Anomaly rate: <span style="color:#ff6584">{ev.get('anomaly_pct',0):.2f}%</span>
-                    &nbsp;|&nbsp; Contamination: <span style="color:#e8e8f0">{ev.get('best_contamination','?')}</span>
-                    &nbsp;|&nbsp; Score threshold: <span style="color:#e8e8f0">{_st:.4f if isinstance(_st, float) else _st}</span>
+                    &nbsp;|&nbsp; Contamination: <span style="color:{CHART_TEXT_COLOR}">{ev.get('best_contamination','?')}</span>
+                    &nbsp;|&nbsp; Score threshold: <span style="color:{CHART_TEXT_COLOR}">{_st:.4f if isinstance(_st, float) else _st}</span>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -592,7 +602,7 @@ def render_results(result: AgentState):
                     x=["Train", "Test"], y=[train_s, test_s],
                     marker_color=["#6c63ff", "#43e97b"], marker_line_width=0,
                     text=[f"{train_s:.4f}", f"{test_s:.4f}"], textposition="outside",
-                    textfont=dict(family="DM Mono", size=11, color="#e8e8f0"),
+                    textfont=dict(family="DM Mono", size=11, color=CHART_TEXT_COLOR),
                 ))
                 fig.update_layout(**PLOTLY_LAYOUT, height=220,
                     title=dict(text=f"<span style='color:{status_color}'>{status.replace('_',' ').title()}</span> · gap: {gap:.4f}",
@@ -603,8 +613,8 @@ def render_results(result: AgentState):
                 )
                 st.plotly_chart(fig, use_container_width=True)
                 st.markdown(f"""
-                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:#8888aa;
-                            padding:0.6rem 0.8rem;background:rgba(255,255,255,0.03);border-radius:6px;">
+                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:{CHART_LABEL_COLOR};
+                            padding:0.6rem 0.8rem;background:{INFO_BG};border-radius:6px;">
                     {ovf.get('description', '')}
                 </div>
                 """, unsafe_allow_html=True)
@@ -624,7 +634,7 @@ def render_results(result: AgentState):
                         x=_av, y=_an, orientation="h",
                         marker_color=_bc_a, marker_line_width=0,
                         text=[f"{v:.4f}" for v in _av], textposition="outside",
-                        textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                        textfont=dict(family="DM Mono", size=10, color=CHART_TEXT_COLOR),
                     ))
                     fig_algo.update_layout(**PLOTLY_LAYOUT, height=220,
                         xaxis=dict(**AXIS_STYLE, range=[max(-1, min(_av) - 0.05), 1.0]),
@@ -647,7 +657,7 @@ def render_results(result: AgentState):
                         x=[f"cont={k}" for k in _ck], y=_cp,
                         marker_color=_bc_cont, marker_line_width=0,
                         text=[f"{p:.1f}%" for p in _cp], textposition="outside",
-                        textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                        textfont=dict(family="DM Mono", size=10, color=CHART_TEXT_COLOR),
                     ))
                     fig_cont.update_layout(**PLOTLY_LAYOUT, height=220,
                         xaxis=dict(**AXIS_STYLE), yaxis=dict(**AXIS_STYLE, title="Anomaly %"),
@@ -662,13 +672,13 @@ def render_results(result: AgentState):
                     sorted_scores = dict(sorted(all_scores.items(), key=lambda x: float(x[1]), reverse=True))
                     models = list(sorted_scores.keys())
                     scores = [float(v) for v in sorted_scores.values()]
-                    bar_colors = [COLORS[0] if m == model_name else "#2a2a3a" for m in models]
+                    bar_colors = [COLORS[0] if m == model_name else ("#2a2a3a" if is_dark else "#d0d0e0") for m in models]
                     fig2 = go.Figure()
                     fig2.add_trace(go.Bar(
                         x=scores, y=models, orientation="h",
                         marker_color=bar_colors, marker_line_width=0,
                         text=[f"{s:.4f}" for s in scores], textposition="outside",
-                        textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                        textfont=dict(family="DM Mono", size=10, color=CHART_TEXT_COLOR),
                     ))
                     fig2.update_layout(**PLOTLY_LAYOUT, height=220,
                         xaxis=dict(**AXIS_STYLE, range=[min(scores) - 0.02, max(scores) + 0.02]),
@@ -706,7 +716,7 @@ def render_results(result: AgentState):
                     fig_cbar.add_trace(go.Bar(
                         x=_lc2, y=_cc2, marker_color=COLORS[:len(_lc2)], marker_line_width=0,
                         text=[f"{p:.1f}%" for p in _pc2], textposition="outside",
-                        textfont=dict(family="DM Mono", size=11, color="#e8e8f0"),
+                        textfont=dict(family="DM Mono", size=11, color=CHART_TEXT_COLOR),
                     ))
                     fig_cbar.update_layout(**PLOTLY_LAYOUT, height=300,
                         xaxis=dict(**AXIS_STYLE), yaxis=dict(**AXIS_STYLE, title="Count"), showlegend=False,
@@ -719,8 +729,8 @@ def render_results(result: AgentState):
                 fig_gauge = go.Figure(go.Indicator(
                     mode="gauge+number", value=_sil,
                     domain={"x": [0, 1], "y": [0, 1]},
-                    title={"text": "Silhouette Score", "font": {"family": "DM Mono", "size": 13, "color": "#8888aa"}},
-                    number={"font": {"family": "DM Mono", "size": 30, "color": "#e8e8f0"}, "suffix": ""},
+                    title={"text": "Silhouette Score", "font": {"family": "DM Mono", "size": 13, "color": CHART_LABEL_COLOR}},
+                    number={"font": {"family": "DM Mono", "size": 30, "color": CHART_TEXT_COLOR}, "suffix": ""},
                     gauge={
                         "axis": {"range": [-1, 1], "tickfont": {"family": "DM Mono", "size": 10}},
                         "bar": {"color": "#6c63ff"},
@@ -784,11 +794,11 @@ def render_results(result: AgentState):
                     fig_scan = go.Figure()
                     fig_scan.add_trace(go.Bar(
                         x=[f"cont={k}" for k in _ck2], y=_cp2,
-                        marker_color=[COLORS[0] if k == _bc2 else "#2a2a3a" for k in _ck2],
+                        marker_color=[COLORS[0] if k == _bc2 else ("#2a2a3a" if is_dark else "#d0d0e0") for k in _ck2],
                         marker_line_width=0,
                         text=[f"{p:.1f}%<br>({n} pts)" for p, n in zip(_cp2, _cn2)],
                         textposition="outside",
-                        textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                        textfont=dict(family="DM Mono", size=10, color=CHART_TEXT_COLOR),
                     ))
                     fig_scan.update_layout(**PLOTLY_LAYOUT, height=300,
                         xaxis=dict(**AXIS_STYLE), yaxis=dict(**AXIS_STYLE, title="Anomaly %"), showlegend=False,
@@ -812,7 +822,7 @@ def render_results(result: AgentState):
                     marker_color=[f"rgba(255,101,132,{0.35 + 0.65 * v / max(_vals_a)})" for v in _vals_a],
                     marker_line_width=0,
                     text=[f"{v:.1f}%" for v in _vals_a], textposition="outside",
-                    textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                    textfont=dict(family="DM Mono", size=10, color=CHART_TEXT_COLOR),
                 ))
                 fig_fi_a.update_layout(**PLOTLY_LAYOUT,
                     height=max(250, len(_feats_a) * 28), showlegend=False,
@@ -919,7 +929,7 @@ def render_results(result: AgentState):
                 marker_color=bar_colors_fi, marker_line_width=0,
                 text=[f"{v:.1f}%" for v in vals],
                 textposition="outside",
-                textfont=dict(family="DM Mono", size=10, color="#e8e8f0"),
+                textfont=dict(family="DM Mono", size=10, color=CHART_TEXT_COLOR),
             ))
             fig_fi.update_layout(**PLOTLY_LAYOUT,
                 height=max(300, len(feats) * 28),
@@ -950,10 +960,10 @@ def render_results(result: AgentState):
                                        "Share %": f"{_cinfo.get('pct', 0):.1f}%"})
                     st.dataframe(pd.DataFrame(_crows), use_container_width=True, hide_index=True)
                 st.markdown(f"""
-                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:#8888aa;
-                            padding:0.8rem;background:rgba(255,255,255,0.02);border-radius:8px;
+                <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:{CHART_LABEL_COLOR};
+                            padding:0.8rem;background:{INFO_BG};border-radius:8px;
                             border-left:2px solid #6c63ff;margin-top:0.8rem;">
-                    <strong style="color:#e8e8f0;">Note:</strong> Feature importance is not available for
+                    <strong style="color:{CHART_TEXT_COLOR};">Note:</strong> Feature importance is not available for
                     KMeans / DBSCAN clustering algorithms. Use the anomaly_detection intent with
                     IsolationForest to get feature-level importance scores.
                 </div>
@@ -1052,10 +1062,10 @@ def render_results(result: AgentState):
                     color = "#f7971e" if icon == "⚠" else "#6c63ff"
                     st.markdown(f"""
                     <div style="display: flex; align-items: flex-start; gap: 0.6rem; margin-bottom: 0.4rem;
-                                padding: 0.5rem 0.8rem; background: rgba(255,255,255,0.02); 
+                                padding: 0.5rem 0.8rem; background: {INFO_BG}; 
                                 border-radius: 6px; border-left: 2px solid {color};">
                         <span style="color: {color}; font-size: 0.7rem; margin-top: 1px;">{icon}</span>
-                        <span style="font-family: DM Mono; font-size: 0.72rem; color: #8888aa;">{rec}</span>
+                        <span style="font-family: DM Mono; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">{rec}</span>
                     </div>
                     """, unsafe_allow_html=True)
 
@@ -1152,10 +1162,10 @@ def render_results(result: AgentState):
                 for k, v in node_info.items():
                     st.markdown(f"""
                     <div style="display: flex; gap: 1rem; padding: 0.3rem 0; 
-                                border-bottom: 1px solid rgba(255,255,255,0.03);">
-                        <div style="font-family: DM Mono; font-size: 0.7rem; color: #8888aa; 
+                                border-bottom: 1px solid {TRACE_BORDER};">
+                        <div style="font-family: DM Mono; font-size: 0.7rem; color: {CHART_LABEL_COLOR}; 
                                     min-width: 140px;">{k}</div>
-                        <div style="font-family: DM Mono; font-size: 0.7rem; color: #e8e8f0;">{v}</div>
+                        <div style="font-family: DM Mono; font-size: 0.7rem; color: {CHART_TEXT_COLOR};">{v}</div>
                     </div>
                     """, unsafe_allow_html=True)
 
@@ -1164,9 +1174,9 @@ def render_results(result: AgentState):
         if report:
             section_header("Generated Report", "LLM-synthesized analysis in Turkish")
             st.markdown(f"""
-            <div style="background: #111118; border: 1px solid rgba(255,255,255,0.06); 
+            <div style="background: {STATUS_BG}; border: 1px solid {STATUS_BORDER}; 
                         border-radius: 12px; padding: 2rem; font-family: 'DM Mono', monospace;
-                        font-size: 0.82rem; line-height: 1.8; color: #c8c8d8;">
+                        font-size: 0.82rem; line-height: 1.8; color: {CHART_TEXT_COLOR};">
             """, unsafe_allow_html=True)
             st.markdown(report)
             st.markdown("</div>", unsafe_allow_html=True)
