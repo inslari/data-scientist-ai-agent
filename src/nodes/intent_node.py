@@ -6,11 +6,10 @@ from pydantic import BaseModel, Field
 
 from src.state import AgentState
 
-
-# --- Structured output modeli ---
+# Structured output model
 class IntentResult(BaseModel):
     intent: str = Field(
-        description="Şunlardan biri: eda, classification, regression, clustering, anomaly_detection, report"
+        description="Şunlardan biri: eda, classification, regression, clustering, anomaly_detection, report, sql_query"
     )
     confidence: float = Field(
         description="0 ile 1 arasında güven skoru"
@@ -33,6 +32,9 @@ Görevin: Kullanıcının sorgusunu aşağıdaki kategorilerden BİRİNE sınıf
 - clustering        : Etiketsiz veriyi gruplara ayırma (segmentasyon, kümeleme)
 - anomaly_detection : Aykırı değer, sahte işlem, anormal davranış tespiti
 - report            : Mevcut veriden özet veya iş raporu üretme
+- sql_query         : Belirli bir veriyi getirme, filtreleme, sayma, gruplama, sıralama gibi
+                      doğrudan sorgu istekleri. Modelleme veya analiz gerektirmeyen,
+                      "şunu getir / kaç tane / en yüksek / listele" tarzı talepler.
 
 Kurallar:
 - Yalnızca tek bir intent seç
@@ -41,6 +43,14 @@ Kurallar:
 - "Anomaly", "fraud", "outlier", "unusual", "aykırı", "sahte" → anomaly_detection
 - "Predict" + sayısal değer → regression
 - "Predict" + kategori/sınıf → classification
+- "Getir", "listele", "göster", "kaç tane", "en yüksek", "filtrele", "sırala",
+  "select", "fetch", "show me", "how many", "top N", "filter by" → sql_query
+- sql_query: model eğitimi veya istatistiksel analiz içermemeli, sadece veri erişimi olmalı
+- Karşılaştırma, gruplama veya basit istatistik içeren sorgular da sql_query'dir:
+  * "X ile Y arasındaki fark", "X'e göre ortalama", "gruba göre sayı/toplam/ortalama"
+  * "erkek vs kadın", "A ile B'yi karşılaştır", "oranı nedir", "dağılımı nedir (basit)"
+  * Bu tür sorgular GROUP BY / AVG / COUNT / SUM ile cevaplanabilir → sql_query
+- Eğer soru bir MODELİN EĞİTİLMESİNİ veya TAHMİN YAPILMASINI gerektiriyorsa → classification/regression
 - Yukarıdaki liste dışında intent üretme
 
 Yanıtını yapılandırılmış JSON olarak döndür: intent, confidence (0-1), reasoning (Türkçe).

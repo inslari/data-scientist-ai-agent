@@ -46,6 +46,97 @@ def get_schema() -> str:
 
 
 @mcp.tool()
+def get_column_stats() -> str:
+    """
+    Get per-column statistics for all tables.
+    Numeric columns: min, max, avg, null count.
+    Text columns: top 10 most frequent distinct values with counts.
+    Use this to understand what each column actually contains before writing SQL.
+    """
+    try:
+        if not DB_PATH.exists():
+            return f"Error: Database not found at {DB_PATH}"
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cursor.fetchall()]
+
+        output = "Column Statistics:\n"
+
+        for table in tables:
+            output += f"\nTable: {table}\n"
+            cursor.execute(f"PRAGMA table_info('{table}')")
+            cols = cursor.fetchall()
+
+            # Total rows 
+            cursor.execute(f'SELECT COUNT(*) FROM "{table}"')
+            total_rows = cursor.fetchone()[0]
+            output += f"  Total rows: {total_rows:,}\n"
+
+            for col in cols:
+                col_name = col[1]
+                col_type = col[2].upper() if col[2] else ""
+                is_numeric = any(t in col_type for t in
+                                 ("INT", "REAL", "FLOAT", "NUMERIC", "DOUBLE", "DECIMAL"))
+                try:
+                    # Null count
+                    cursor.execute(
+                        f'SELECT COUNT(*) FROM "{table}" WHERE "{col_name}" IS NULL'
+                    )
+                    null_count = cursor.fetchone()[0]
+                    null_pct   = round(null_count / total_rows * 100, 1) if total_rows else 0
+
+                    if is_numeric:
+                        cursor.execute(f"""
+                            SELECT
+                                MIN("{col_name}"),
+                                MAX("{col_name}"),
+                                ROUND(AVG("{col_name}"), 4),
+                                COUNT(DISTINCT "{col_name}")
+                            FROM "{table}"
+                        """)
+                        mn, mx, avg, n_distinct = cursor.fetchone()
+                        output += (
+                            f'  "{col_name}" [numeric]: '
+                            f'min={mn}, max={mx}, avg={avg}, '
+                            f'distinct={n_distinct}, nulls={null_count} ({null_pct}%)\n'
+                        )
+                    else:
+                        # Top 10 most frequent values
+                        cursor.execute(f"""
+                            SELECT "{col_name}", COUNT(*) as cnt
+                            FROM "{table}"
+                            WHERE "{col_name}" IS NOT NULL
+                            GROUP BY "{col_name}"
+                            ORDER BY cnt DESC
+                            LIMIT 10
+                        """)
+                        top_vals = cursor.fetchall()
+                        vals_str = ", ".join(
+                            f'"{v}"({c})' for v, c in top_vals
+                        )
+                        cursor.execute(
+                            f'SELECT COUNT(DISTINCT "{col_name}") FROM "{table}"'
+                        )
+                        n_distinct = cursor.fetchone()[0]
+                        output += (
+                            f'  "{col_name}" [text]: '
+                            f'distinct={n_distinct}, nulls={null_count} ({null_pct}%), '
+                            f'top values=[{vals_str}]\n'
+                        )
+                except Exception as col_err:
+                    output += f'  "{col_name}": error — {col_err}\n'
+
+        conn.close()
+        return output
+
+    except Exception as e:
+        return f"Error getting column stats: {e}"
+
+
+@mcp.tool()
 def run_sql_query(query: str) -> str:
     """Execute a SELECT query on the SQLite database and return the results. Only SELECT queries are allowed."""
     try:

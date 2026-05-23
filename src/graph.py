@@ -12,50 +12,98 @@ from src.nodes.feature_engineering_node import feature_engineering_node
 from src.nodes.automl_node import automl_node
 from src.nodes.evaluation_node import evaluation_node
 from src.nodes.report_node import report_node
+from src.nodes.sql_node import sql_node
 
+# Routing functions
+def route_after_db_context(state: AgentState) -> str:
+    """
+    db_context_node'dan sonra intent'e göre split:
+      sql_query  → sql_node   → END
+      diğerleri  → planner_node → ML pipeline
+    """
+    intent = state.get("intent", "eda")
+    if intent == "sql_query":
+        return "sql_node"
+    return "planner_node"
+
+
+def route_after_execution(state: AgentState) -> str:
+    """
+    execution_node'dan sonra:
+      classification / regression / clustering → feature_plan_node
+      eda / anomaly_detection / report         → automl_node
+    """
+    intent = state.get("intent", "eda")
+    if intent in ("classification", "regression", "clustering"):
+        return "feature_plan_node"
+    return "automl_node"
+
+
+# Graph
 def build_graph() -> StateGraph:
     """
     Data Scientist Agent — LangGraph pipeline.
 
-    Active pipeline:
-        START → intent_node → db_context_node → planner_node
-        → execution_node → feature_plan_node → feature_engineering_node
-        → automl_node → evaluation_node → report_node → END
+    Routing:
+        START
+          └─ intent_node
+               └─ db_context_node          (her intent buradan geçer)
+                    ├─ [sql_query] → sql_node → END
+                    └─ [diğerleri] → planner_node
+                                      → execution_node
+                                           ├─ [classification/regression/clustering]
+                                           │    → feature_plan_node → feature_engineering_node
+                                           │         → automl_node → evaluation_node → report_node → END
+                                           └─ [eda/anomaly_detection/report]
+                                                → automl_node → evaluation_node → report_node → END
     """
     graph = StateGraph(AgentState)
 
-    graph.add_node("intent_node", intent_node)
-    graph.add_node("db_context_node", db_context_node)
-    graph.add_node("planner_node", planner_node)
-    graph.add_node("execution_node", execution_node)
-    graph.add_node("feature_plan_node", feature_plan_node)
+    # Register Nodes 
+    graph.add_node("intent_node",              intent_node)
+    graph.add_node("db_context_node",          db_context_node)
+    graph.add_node("sql_node",                 sql_node)
+    graph.add_node("planner_node",             planner_node)
+    graph.add_node("execution_node",           execution_node)
+    graph.add_node("feature_plan_node",        feature_plan_node)
     graph.add_node("feature_engineering_node", feature_engineering_node)
-    graph.add_node("automl_node", automl_node)
-    graph.add_node("evaluation_node", evaluation_node)
-    graph.add_node("report_node", report_node)
+    graph.add_node("automl_node",              automl_node)
+    graph.add_node("evaluation_node",          evaluation_node)
+    graph.add_node("report_node",              report_node)
 
+    # START → intent_node → db_context_node
     graph.add_edge(START, "intent_node")
     graph.add_edge("intent_node", "db_context_node")
-    graph.add_edge("db_context_node", "planner_node")
+
+    # db_context_node → sql_node or planner_node
+    graph.add_conditional_edges(
+        "db_context_node",
+        route_after_db_context,
+        {
+            "sql_node":     "sql_node",
+            "planner_node": "planner_node",
+        },
+    )
+
+    # sql_node → END
+    graph.add_edge("sql_node", END)
+
+    # ML pipeline
     graph.add_edge("planner_node", "execution_node")
-    graph.add_edge("execution_node", "feature_plan_node")
-    graph.add_edge("feature_plan_node", "feature_engineering_node")
+
+    graph.add_conditional_edges(
+        "execution_node",
+        route_after_execution,
+        {
+            "feature_plan_node": "feature_plan_node",
+            "automl_node":       "automl_node",
+        },
+    )
+
+    graph.add_edge("feature_plan_node",        "feature_engineering_node")
     graph.add_edge("feature_engineering_node", "automl_node")
-    graph.add_edge("automl_node", "evaluation_node")
-    graph.add_edge("evaluation_node", "report_node")
-    graph.add_edge("report_node", END)
+    graph.add_edge("automl_node",              "evaluation_node")
+    graph.add_edge("evaluation_node",          "report_node")
+    graph.add_edge("report_node",              END)
 
     return graph.compile()
-
-
-# Conditional routing logic
-def route_after_execution(state: AgentState) -> str:
-    """
-    Routes flow based on intent after execution node.
-    EDA/Report → Direct to evaluation
-    ML intents → feature_engineering
-    """
-    intent = state.get("intent", "eda")
-    if intent in ("classification", "regression", "clustering"):
-        return "feature_engineering"
-    return "stats_only"

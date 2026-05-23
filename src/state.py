@@ -8,7 +8,7 @@ class AgentState(TypedDict, total=False):
     user_query: str                  # Raw user query
 
     # Intent Node output
-    intent: str                      # "eda", "classification", "regression", "clustering", "report"
+    intent: str                      # "eda", "classification", "regression", "clustering", "report", "sql_query"
     intent_confidence: float         # 0-1 confidence score
 
     # DB Context Node output
@@ -47,7 +47,15 @@ class AgentState(TypedDict, total=False):
     # Report Node output
     report: str                      # Final markdown report
 
+    # SQL Query Node output
+    sql_query_raw: str               # SQL Query 
+    sql_query_results: list[dict]    # Raw query results (list of rows)
+    sql_query_columns: list[str]     # Column names
+    sql_query_chart: dict            # Chart data: {type, labels, datasets, title}
+    sql_query_summary: str           # Generated short description
+    sql_query_warning: str           # Warning message if approximate columns were used (empty = exact match)
+
     # Graph Control
     current_step: str                # Current active node
-    error: Optional[str]             # Execution errors
+    error: Optional[str]             # Errors
     messages: list                   # LLM conversation history

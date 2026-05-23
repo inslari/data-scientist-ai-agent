@@ -9,6 +9,7 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import time
@@ -296,24 +297,48 @@ def run_pipeline(user_query: str) -> AgentState:
         "user_query": user_query,
         "messages": [],
     }
-    return app.invoke(initial_state)
+    return asyncio.run(app.ainvoke(initial_state))
 
 
 # LOADING ANIMATION
 
 def show_loading():
     """Animated node-by-node loading sequence."""
-    nodes = [
-        ("01", "Intent Analyzer", "Classifying analysis intent..."),
-        ("02", "DB Context Loader", "Fetching schema & running intelligence engine..."),
-        ("03", "Analysis Planner", "Building execution plan..."),
-        ("04", "Execution Layer", "Fetching data & profiling..."),
-        ("05", "Feature Planner", "LLM designing feature strategy..."),
-        ("06", "Feature Engineering", "Encoding, scaling, selecting features..."),
-        ("07", "AutoML", "Training & comparing 6 models with 5-fold CV..."),
-        ("08", "Evaluation", "Computing metrics & reliability score..."),
-        ("09", "Report Generator", "Synthesizing insights with GPT-4o..."),
-    ]
+
+    raw_query = st.session_state.get("query_input", "").lower()
+    sql_keywords = ["getir", "listele", "göster", "kaç", "filtrele", "sırala",
+                    "select", "fetch", "show", "how many", "top ", "filter"]
+    is_likely_sql = any(kw in raw_query for kw in sql_keywords)
+
+    if is_likely_sql:
+        nodes = [
+            ("01", "Intent Analyzer",  "Classifying as SQL query..."),
+            ("02", "SQL Generator",    "Writing SELECT query with GPT-4o..."),
+            ("03", "MCP Executor",     "Running query on SQLite database..."),
+            ("04", "Chart Planner",    "Deciding best visualization type..."),
+        ]
+    else:
+        nodes = [
+            ("01", "Intent Analyzer",      "Classifying analysis intent..."),
+            ("02", "DB Context Loader",    "Fetching schema & running intelligence engine..."),
+            ("03", "Analysis Planner",     "Building execution plan..."),
+            ("04", "Execution Layer",      "Fetching data & profiling..."),
+            ("05", "Feature Planner",      "LLM designing feature strategy..."),
+            ("06", "Feature Engineering",  "Encoding, scaling, selecting features..."),
+            ("07", "AutoML",               "Training & comparing 6 models with 5-fold CV..."),
+            ("08", "Evaluation",           "Computing metrics & reliability score..."),
+            ("09", "Report Generator",     "Synthesizing insights with GPT-4o..."),
+        ]
+    
+    # Total steps
+    total = len(nodes)
+    
+    placeholder = st.empty()
+    for i, (num, name, desc) in enumerate(nodes):
+        progress = (i + 1) / total
+        completed = nodes[:i]
+        current = (num, name, desc)
+
 
     placeholder = st.empty()
     for i, (num, name, desc) in enumerate(nodes):
@@ -398,8 +423,317 @@ def section_header(title: str, subtitle: str = ""):
     """, unsafe_allow_html=True)
 
 
+def render_sql_results(result: AgentState):
+    """SQL Query intent için özel dashboard."""
+
+    chart    = result.get("sql_query_chart", {})
+    columns  = result.get("sql_query_columns", [])
+    rows     = result.get("sql_query_results", [])
+    sql_raw  = result.get("sql_query_raw", "")
+    summary  = result.get("sql_query_summary", "")
+    query    = result.get("user_query", "")
+
+    chart_type = chart.get("type", "table")
+    title      = chart.get("title", "Sorgu Sonuçları")
+
+    labels   = chart.get("labels", [])
+    datasets = chart.get("datasets", [])
+    n_rows   = len(rows)
+    n_cols   = len(columns)
+
+   
+    tick_angle = -45 if len(labels) > 10 else 0
+
+   
+    chart_height = max(420, min(len(labels) * 18, 700)) if labels else 420
+
+    # Plotly interaktivite config 
+    PLOTLY_CONFIG = {
+        "scrollZoom":           True,
+        "displayModeBar":       True,
+        "displaylogo":          False,
+        "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+        "modeBarButtonsToAdd":  ["zoom2d", "pan2d", "resetScale2d", "toImage"],
+        "toImageButtonOptions": {
+            "format": "png",
+            "filename": "ds_agent_chart",
+            "scale": 2,
+        },
+    }
+
+    # Status bar         
+    st.markdown(f"""
+    <div style="background: {STATUS_BG}; border: 1px solid {STATUS_BORDER}; border-radius: 10px;
+                padding: 1rem 1.5rem; display: flex; align-items: center; gap: 2rem;
+                margin-bottom: 2rem; flex-wrap: wrap;">
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #43e97b;">
+            ✓ QUERY COMPLETE
+        </div>
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">
+            INTENT: <span style="color: #6c63ff;">SQL_QUERY</span>
+        </div>
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">
+            ROWS: <span style="color: {CHART_TEXT_COLOR};">{n_rows:,}</span>
+        </div>
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">
+            COLS: <span style="color: {CHART_TEXT_COLOR};">{n_cols}</span>
+        </div>
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: {CHART_LABEL_COLOR};">
+            CHART: <span style="color: {CHART_TEXT_COLOR};">{chart_type.upper()}</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    warning  = result.get("sql_query_warning", "")
+
+    # Warning for requested data 
+    if warning:
+        st.markdown(f"""
+        <div style="background: rgba(247,151,30,0.08); border: 1px solid rgba(247,151,30,0.35);
+                    border-left: 4px solid #f7971e; border-radius: 10px;
+                    padding: 1rem 1.5rem; margin-bottom: 1.2rem;">
+            <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem;
+                        color: #f7971e; letter-spacing: 0.08em; margin-bottom: 0.5rem;">
+                ⚡ YAKLAŞIK SONUÇ — İSTENEN VERİ DOĞRUDAN MEVCUT DEĞİL
+            </div>
+            <div style="font-family: 'DM Mono', monospace; font-size: 0.8rem;
+                        color: {CHART_TEXT_COLOR}; line-height: 1.7;">
+                {warning}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Summary of query
+    if summary:
+        st.markdown(f"""
+        <div style="background: rgba(108,99,255,0.06); border: 1px solid rgba(108,99,255,0.18);
+                    border-left: 3px solid #6c63ff; border-radius: 8px;
+                    padding: 0.8rem 1.2rem; margin-bottom: 1.5rem;
+                    font-family: 'DM Mono', monospace; font-size: 0.8rem;
+                    color: {CHART_TEXT_COLOR}; line-height: 1.7;">
+            {summary}
+        </div>
+        """, unsafe_allow_html=True)
+
+    # SQL code 
+    with st.expander("🗂 Generated SQL", expanded=False):
+        st.code(sql_raw, language="sql")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Warning for chart type 
+    if chart_type == "warning":
+        warning_msg = chart.get("summary", "Bu sorgu için uygun kolon bulunamadı.")
+        st.markdown(f"""
+        <div style="background: rgba(255,101,132,0.07); border: 1px solid rgba(255,101,132,0.3);
+                    border-left: 4px solid #ff6584; border-radius: 10px;
+                    padding: 1.5rem 2rem; margin-bottom: 1rem;">
+            <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem;
+                        color: #ff6584; letter-spacing: 0.08em; margin-bottom: 0.8rem;">⚠ UYGUN KOLON BULUNAMADI</div>
+            <div style="font-family: 'DM Mono', monospace; font-size: 0.82rem;
+                        color: {CHART_TEXT_COLOR}; line-height: 1.8;">
+                {warning_msg}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    # Chart and Table beside each other  
+    col_chart, col_table = st.columns([1.4, 1], gap="large")
+
+    with col_chart:
+        section_header(title, f"Görselleştirme · {chart_type}")
+
+        # 1x1: Single numeric value -> big metric card 
+        if n_rows == 1 and n_cols == 1:
+            val = list(rows[0].values())[0]
+            col_name = columns[0]
+            try:
+                val_f = float(val)
+                display_val = f"{val_f:,.4f}" if val_f != int(val_f) else f"{int(val_f):,}"
+            except (TypeError, ValueError):
+                display_val = str(val)
+
+            st.markdown(f"""
+            <div style="background: rgba(108,99,255,0.08); border: 1px solid rgba(108,99,255,0.25);
+                        border-radius: 16px; padding: 3rem 2rem; text-align: center; margin-top: 1rem;">
+                <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem;
+                            color: {CHART_LABEL_COLOR}; letter-spacing: 0.1em; margin-bottom: 1rem;">
+                    {col_name.upper().replace('_', ' ')}
+                </div>
+                <div style="font-family: 'Syne', sans-serif; font-size: 3.5rem; font-weight: 800;
+                            color: #6c63ff; letter-spacing: -0.03em; line-height: 1;">
+                    {display_val}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # 1 row, many columns -> horizontal metric cards 
+        elif n_rows == 1 and n_cols > 1:
+            row_data = rows[0]
+            card_cols = st.columns(min(n_cols, 4))
+            for i, (k, v) in enumerate(row_data.items()):
+                try:
+                    v_f = float(v)
+                    display_v = f"{v_f:,.4f}" if v_f != int(v_f) else f"{int(v_f):,}"
+                except (TypeError, ValueError):
+                    display_v = str(v)
+                with card_cols[i % 4]:
+                    st.markdown(render_metric_card(
+                        k.replace("_", " ").upper(),
+                        display_v,
+                        color=COLORS[i % len(COLORS)]
+                    ), unsafe_allow_html=True)
+
+        # Table fallback 
+        if chart_type == "table" or not labels:
+            if rows:
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True, hide_index=True, height=chart_height)
+            else:
+                st.info("Sonuç bulunamadı.")
+
+        # Pie    
+        elif chart_type == "pie":
+            # If there are too many categories in Pie, drop to table — pie >12 categories unreadable
+            if len(labels) > 12:
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True, hide_index=True, height=chart_height)
+            else:
+                values = datasets[0]["data"] if datasets else []
+                fig = go.Figure(go.Pie(
+                    labels=labels,
+                    values=values,
+                    marker=dict(colors=COLORS * (len(labels) // len(COLORS) + 1)),
+                    hole=0.5,
+                    textfont=dict(family="DM Mono", size=11),
+                    textinfo="label+percent+value",
+                    hovertemplate="<b>%{label}</b><br>Değer: %{value}<br>Oran: %{percent}<extra></extra>",
+                ))
+                fig.update_layout(
+                    **PLOTLY_LAYOUT,
+                    height=chart_height,
+                    showlegend=True,
+                    legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
+                )
+                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+
+        # Bar
+        elif chart_type == "bar":
+            fig = go.Figure()
+            for i, ds in enumerate(datasets):
+                y_vals = ds["data"]
+                fig.add_trace(go.Bar(
+                    x=labels,
+                    y=y_vals,
+                    name=ds.get("label", ""),
+                    marker_color=COLORS[i % len(COLORS)],
+                    marker_line_width=0,
+                    text=[
+                        f"{v:,.2f}" if isinstance(v, float) else str(v)
+                        for v in y_vals
+                    ],
+                    textposition="outside",
+                    textfont=dict(family="DM Mono", size=10, color=CHART_TEXT_COLOR),
+                    hovertemplate="<b>%{x}</b><br>%{y:,.4f}<extra></extra>",
+                ))
+            fig.update_layout(
+                **PLOTLY_LAYOUT,
+                height=chart_height,
+                xaxis=dict(
+                    **{k: v for k, v in AXIS_STYLE.items() if k != "tickfont"},
+                    tickangle=tick_angle,
+                    tickfont=dict(
+                        family="DM Mono, monospace",
+                        size=9 if len(labels) > 20 else 11,
+                        color=CHART_LABEL_COLOR,
+                    ),
+                ),
+                yaxis=dict(**AXIS_STYLE),
+                legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
+                showlegend=len(datasets) > 1,
+                bargap=0.15,
+            )
+            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+
+        # Line
+        elif chart_type == "line":
+            fig = go.Figure()
+            for i, ds in enumerate(datasets):
+                fig.add_trace(go.Scatter(
+                    x=labels,
+                    y=ds["data"],
+                    mode="lines+markers",
+                    name=ds.get("label", ""),
+                    line=dict(color=COLORS[i % len(COLORS)], width=2),
+                    marker=dict(size=6),
+                    hovertemplate="<b>%{x}</b><br>%{y:,.4f}<extra></extra>",
+                ))
+            fig.update_layout(
+                **PLOTLY_LAYOUT,
+                height=chart_height,
+                xaxis=dict(
+                    **AXIS_STYLE,
+                    tickangle=tick_angle,
+                    tickfont=dict(
+                        size=9 if len(labels) > 20 else 11,
+                        color=CHART_LABEL_COLOR,
+                    ),
+                ),
+                yaxis=dict(**AXIS_STYLE),
+                legend=dict(font=dict(family="DM Mono", size=10), bgcolor="rgba(0,0,0,0)"),
+                showlegend=len(datasets) > 1,
+            )
+            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+
+        # Scatter
+        elif chart_type == "scatter":
+            y_vals = datasets[0]["data"] if datasets else []
+            fig = go.Figure(go.Scatter(
+                x=labels,
+                y=y_vals,
+                mode="markers",
+                marker=dict(
+                    color=COLORS[0],
+                    size=8,
+                    opacity=0.75,
+                    line=dict(color="rgba(255,255,255,0.1)", width=1),
+                ),
+                hovertemplate="<b>%{x}</b><br>%{y:,.4f}<extra></extra>",
+            ))
+            fig.update_layout(
+                **PLOTLY_LAYOUT,
+                height=chart_height,
+                xaxis=dict(
+                    **AXIS_STYLE,
+                    tickangle=tick_angle,
+                    tickfont=dict(
+                        size=9 if len(labels) > 20 else 11,
+                        color=CHART_LABEL_COLOR,
+                    ),
+                ),
+                yaxis=dict(**AXIS_STYLE),
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+
+    with col_table:
+        section_header("Raw Data", f"{n_rows:,} satır · {n_cols} kolon")
+        if rows:
+            df = pd.DataFrame(rows)
+            for col in df.columns:
+                if pd.api.types.is_float_dtype(df[col]):
+                    df[col] = df[col].map(lambda x: f"{x:,.4f}" if pd.notna(x) else "")
+            st.dataframe(df, use_container_width=True, hide_index=True, height=chart_height)
+        else:
+            st.info("Sonuç bulunamadı.")
+
 def render_results(result: AgentState):
     """Renders the full dashboard from pipeline results."""
+    
+    if result.get("intent") == "sql_query":
+        render_sql_results(result)
+        return
 
     metrics = result.get("metrics", {})
     ev = result.get("evaluation_report", {})
