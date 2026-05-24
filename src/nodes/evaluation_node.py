@@ -49,14 +49,13 @@ from sklearn.metrics import (
 from sklearn.calibration import calibration_curve
 
 from src.state import AgentState
+from src.history_tracker import log_experiment
 
 warnings.filterwarnings("ignore")
 
-OVERFITTING_THRESHOLD = 0.05  # Train-test farkı bu kadardan fazlaysa uyar
-
+OVERFITTING_THRESHOLD = 0.05
 
 # Classification Evaluation
-
 def _evaluate_classification(
     model: Any,
     X_train: pd.DataFrame,
@@ -712,6 +711,67 @@ def _analyze_errors(
 
     return result
 
+# Bias Detection
+
+def _analyze_bias(y_true: np.ndarray, y_pred: np.ndarray, X_test: pd.DataFrame, db_intelligence: dict, intent: str) -> dict:
+    """
+    Demografik feature'lar (cinsiyet, yaş, vb.) üzerinde Disparate Impact ve performans farklarını ölçer.
+    """
+    demographic_keywords = ["age", "sex", "gender", "race", "ethnicity", "marital", "country", "nativity"]
+    demographic_bases = [
+        col["column_name"] for col in db_intelligence.get("columns", [])
+        if col.get("semantic_type") == "demographic" or any(k in col["column_name"].lower() for k in demographic_keywords)
+    ]
+    if not demographic_bases:
+        return {}
+        
+    bias_results = {}
+    for base_col in demographic_bases:
+        # Find all encoded columns related to this base column (e.g. gender_Male, gender_Female)
+        related_cols = [c for c in X_test.columns if c.startswith(base_col)]
+        if not related_cols:
+            continue
+            
+        col_bias = {}
+        for col in related_cols:
+            if X_test[col].nunique() == 2:
+                mask_1 = X_test[col] > 0.5
+                mask_0 = ~mask_1
+                
+                if mask_1.sum() < 5 or mask_0.sum() < 5:
+                    continue
+                    
+                if "classification" in intent:
+                    acc_1 = float(accuracy_score(y_true[mask_1], y_pred[mask_1]))
+                    acc_0 = float(accuracy_score(y_true[mask_0], y_pred[mask_0]))
+                    
+                    # Positive rate (Disparate Impact)
+                    pos_rate_1 = float(np.mean(y_pred[mask_1] == 1)) if len(np.unique(y_true))==2 else None
+                    pos_rate_0 = float(np.mean(y_pred[mask_0] == 1)) if len(np.unique(y_true))==2 else None
+                    
+                    disparate_impact = None
+                    if pos_rate_0 and pos_rate_0 > 0 and pos_rate_1 is not None:
+                        disparate_impact = pos_rate_1 / pos_rate_0
+                        
+                    col_bias[col] = {
+                        "accuracy_group_1": round(acc_1, 4),
+                        "accuracy_group_0": round(acc_0, 4),
+                        "accuracy_diff": round(abs(acc_1 - acc_0), 4),
+                        "disparate_impact": round(disparate_impact, 4) if disparate_impact else None
+                    }
+                elif "regression" in intent:
+                    rmse_1 = float(np.sqrt(mean_squared_error(y_true[mask_1], y_pred[mask_1])))
+                    rmse_0 = float(np.sqrt(mean_squared_error(y_true[mask_0], y_pred[mask_0])))
+                    
+                    col_bias[col] = {
+                        "rmse_group_1": round(rmse_1, 4),
+                        "rmse_group_0": round(rmse_0, 4),
+                        "rmse_diff": round(abs(rmse_1 - rmse_0), 4)
+                    }
+        if col_bias:
+            bias_results[base_col] = col_bias
+            
+    return bias_results
 
 # Reliability Score
 
@@ -729,7 +789,7 @@ def _compute_reliability_score(evaluation: dict) -> dict:
     overfitting = evaluation.get("overfitting", {})
     calibration = evaluation.get("calibration", {})
 
-    # 1. Ana performans metriği (0-35 puan)
+    # Main performance metric (0-35 points)
     max_score += 35
     if "classification" in task:
         auc = test_metrics.get("roc_auc", test_metrics.get("roc_auc_ovr", 0))
@@ -763,7 +823,7 @@ def _compute_reliability_score(evaluation: dict) -> dict:
             score += 5
             factors.append("Düşük R² (<0.50)")
 
-    # 2. Overfitting durumu (0-25 puan)
+    # Overfitting status (0-25 points)
     max_score += 25
     ovf_status = overfitting.get("status", "unknown")
     if ovf_status == "normal":
@@ -779,7 +839,7 @@ def _compute_reliability_score(evaluation: dict) -> dict:
         score += 10
         factors.append("Underfitting")
 
-    # 3. F1 dengesi (precision-recall balance) (0-20 puan)
+    # F1 balance (precision-recall balance) (0-20 points)
     max_score += 20
     f1_w = test_metrics.get("f1_weighted", 0)
     if f1_w >= 0.85:
@@ -795,7 +855,7 @@ def _compute_reliability_score(evaluation: dict) -> dict:
         score += 5
         factors.append("Düşük F1 (<0.60)")
 
-    # 4. Model kalibrasyonu (0-20 puan)
+    # Model calibration (0-20 points)
     max_score += 20
     if calibration:
         if calibration.get("is_well_calibrated", False):
@@ -813,7 +873,7 @@ def _compute_reliability_score(evaluation: dict) -> dict:
         score += 10
         factors.append("Kalibrasyon bilgisi yok")
 
-    # Final skor
+    # Final score
     final_score = round(score / max_score * 100, 1)
 
     grade = "A" if final_score >= 90 else \
@@ -829,18 +889,15 @@ def _compute_reliability_score(evaluation: dict) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────
 # MAIN NODE
-# ─────────────────────────────────────────────────────────────────
-
 def evaluation_node(state: AgentState) -> AgentState:
     """
-    Node 8: AutoML node'unun ürettiği modeli kapsamlı olarak değerlendirir.
+    Evaluates the model produced by the AutoML node.
 
-    Dinamik değerlendirme — task tipine göre otomatik metrik seçimi.
-    Hiçbir domain hardcode edilmemiştir.
+    Dynamic evaluation - automatic metric selection according to task type.
+    No domain is hardcoded.
 
-    State girdileri:
+    State inputs:
         model_artifact   : Eğitilmiş model
         X_train, X_test  : Feature verisi
         y_train, y_test  : Label verisi
@@ -862,17 +919,17 @@ def evaluation_node(state: AgentState) -> AgentState:
         return {**state, "error": "Evaluation için model bulunamadı.",
                 "current_step": "evaluation_node"}
 
-    # Unsupervised task'lar (clustering, anomaly_detection) için y verisi olmaz — sadece X kontrol et
+    # Unsupervised tasks (clustering, anomaly_detection) for y data - only X control
     if not X_train_raw:
         return {**state, "error": "Evaluation için X verisi bulunamadı.",
                 "current_step": "evaluation_node"}
 
-    # Supervised task'lar için y zorunlu
+    # Supervised tasks 
     if intent not in ("clustering", "anomaly_detection") and not y_train_raw:
         return {**state, "error": "Evaluation için label (y) verisi bulunamadı.",
                 "current_step": "evaluation_node"}
 
-    # DataFrame'e dönüştür
+    # Convert to DataFrame
     X_train = pd.DataFrame(X_train_raw).apply(pd.to_numeric, errors="coerce").fillna(0)
     X_test = pd.DataFrame(X_test_raw).apply(pd.to_numeric, errors="coerce").fillna(0)
     X_train.columns = [str(c) for c in X_train.columns]
@@ -887,7 +944,7 @@ def evaluation_node(state: AgentState) -> AgentState:
     print(f"  X_test   : {X_test.shape}")
     print(f"  Intent   : {intent}")
 
-    # Task tipine göre evaluation
+    # Evaluation regarding task type
     if intent == "regression":
         evaluation_report = _evaluate_regression(
             model, X_train, y_train, X_test, y_test, feature_names
@@ -901,17 +958,23 @@ def evaluation_node(state: AgentState) -> AgentState:
             model, X_train, y_train, X_test, y_test, feature_names
         )
 
-    # Model adı ve feature_plan bilgisini ekle
+    # Model name and feature plan
     evaluation_report["model_name"] = state.get("model_name", "unknown")
     evaluation_report["analysis_summary"] = feature_report.get("analysis_summary",
                                             state.get("feature_plan", {}).get("analysis_summary", ""))
 
-    # ── UI için metrik açıklamaları ──────────────────────────────
-    # Arayüz bu dict'i alıp tooltip / info-card olarak gösterebilir.
+    # Bias analysis
+    if intent in ("classification", "regression"):
+        db_intelligence = state.get("db_intelligence", {})
+        bias_report = _analyze_bias(y_test, model.predict(X_test), X_test, db_intelligence, intent)
+        if bias_report:
+            evaluation_report["bias_analysis"] = bias_report
+
+    # Metric explanations for UI
     evaluation_report["metric_descriptions"] = {
-        # ── Test Metrikleri ────────────────────────────────────────
+        # Test Metrics
         "accuracy": {
-            "label": "Doğruluk (Accuracy)",
+            "label": "Accuracy",
             "description": "Modelin tüm tahminler içinde doğru yaptığı tahminlerin oranı.",
             "range": "0–1 (1 mükemmel)",
             "caveat": "Dengesiz sınıf dağılımlarında yanıltıcı olabilir.",
@@ -958,7 +1021,7 @@ def evaluation_node(state: AgentState) -> AgentState:
             "range": "0–1 (1 mükemmel)",
             "caveat": "False Negative'leri azaltmak kritikse (örn. hastalık tespiti) öncelikli metrik.",
         },
-        # ── Regression Metrikleri ──────────────────────────────────
+        # Regression Metrikleri
         "rmse": {
             "label": "RMSE (Root Mean Squared Error)",
             "description": "Tahmin hatalarının kare ortalamasının karekökü. Büyük hatalara daha duyarlı.",
@@ -983,7 +1046,7 @@ def evaluation_node(state: AgentState) -> AgentState:
             "range": "0–100% (0 mükemmel)",
             "caveat": "Hedef değeri 0'a yakın örneklerde hatalı sonuç verebilir.",
         },
-        # ── Bölüm Açıklamaları ─────────────────────────────────────
+        # Additional explanations
         "bootstrap_ci": {
             "label": "Bootstrap Güven Aralıkları (%95)",
             "description": "Test seti üzerinden 300 iterasyonlu bootstrap örnekleme ile hesaplanmış %95 güven aralıkları. Tek test seti sonucundan daha güvenilir bir performans aralığı verir.",
@@ -1040,7 +1103,7 @@ def evaluation_node(state: AgentState) -> AgentState:
         },
     }
 
-    # ── Print sonuçlar ───────────────────────────────────────────
+    # Print results
     reliability = evaluation_report.get("reliability_score", {})
     overfitting = evaluation_report.get("overfitting", {})
     test_m = evaluation_report.get("test_metrics", {})
@@ -1105,6 +1168,29 @@ def evaluation_node(state: AgentState) -> AgentState:
     print(f"\n[evaluation] Güvenilirlik Skoru: {reliability.get('score')}/100 (Grade: {reliability.get('grade')})")
     for factor in reliability.get("factors", []):
         print(f"  ✓ {factor}")
+        
+    bias = evaluation_report.get("bias_analysis", {})
+    if bias:
+        print("\n[evaluation] Bias Tespiti (Demografik):")
+        for base_col, cols in bias.items():
+            for c, info in cols.items():
+                print(f"  {c}: Diff={info.get('accuracy_diff', info.get('rmse_diff'))} | Disparate Impact={info.get('disparate_impact', 'N/A')}")
+
+    # Log to Experiment Tracker
+    try:
+        log_experiment(
+            task=evaluation_report.get("task", intent),
+            intent=intent,
+            model_name=evaluation_report.get("model_name", "unknown"),
+            metrics=evaluation_report.get("test_metrics", {}),
+            hyperparameters=state.get("model_params", {}),
+            feature_names=feature_names,
+            target_name=feature_report.get("target_name", "unknown"),
+            dataset_shape=f"Train: {X_train.shape}, Test: {X_test.shape}"
+        )
+        print("[evaluation] Deney başarıyla SQLite audit_trail'e loglandı.")
+    except Exception as e:
+        print(f"[evaluation] Deney loglanırken hata: {e}")
 
     return {
         **state,

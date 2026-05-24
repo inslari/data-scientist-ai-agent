@@ -28,4 +28,5 @@ dependencies = [
     "streamlit>=1.57.0",
     "plotly>=6.7.0",
     "nest-asyncio>=1.6.0",
+    "optuna>=4.8.0",
 ]

@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.graph import build_graph
 from src.state import AgentState
+from src.history_tracker import get_experiments
 
 # Page config
 st.set_page_config(
@@ -785,14 +786,14 @@ def render_results(result: AgentState):
     </div>
     """, unsafe_allow_html=True)
 
-    # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 Overview",
         "🎯 Model Performance",
         "🔍 Feature Analysis",
+        "⚖️ Fairness & Bias",
         "🧪 Data & Profiling",
         "🗺️ Pipeline Trace",
-        "📄 Full Report",
+        "🗄️ Audit Trail",
     ])
 
     # TAB 1 — OVERVIEW
@@ -1283,6 +1284,39 @@ def render_results(result: AgentState):
                         {' · '.join(insig)}
                     </div>
                     """, unsafe_allow_html=True)
+
+            # SHAP Analysis
+            shap_info = ev.get("shap_importance", {})
+            if shap_info and shap_info.get("all_shap_values"):
+                st.markdown("<br>", unsafe_allow_html=True)
+                section_header("SHAP Explainability", "Global feature impact based on mean |SHAP| values")
+                shap_vals = shap_info.get("all_shap_values", {})
+                
+                # Plot SHAP bar chart
+                top_shap = dict(list(shap_vals.items())[:top_n])
+                total_shap = sum(top_shap.values()) or 1
+                shap_pct = {k: round(v / total_shap * 100, 2) for k, v in top_shap.items()}
+                
+                fig_shap = go.Figure()
+                feats_s = list(shap_pct.keys())[::-1]
+                vals_s = [shap_pct[f] for f in feats_s]
+                bar_colors_shap = [f"rgba(255,101,132,{0.4 + 0.6 * v / max(vals_s)})" for v in vals_s]
+                
+                fig_shap.add_trace(go.Bar(
+                    x=vals_s, y=feats_s, orientation="h",
+                    marker_color=bar_colors_shap, marker_line_width=0,
+                    text=[f"{v:.1f}%" for v in vals_s],
+                    textposition="outside",
+                    textfont=dict(family="DM Mono", size=10, color=CHART_TEXT_COLOR),
+                ))
+                fig_shap.update_layout(**PLOTLY_LAYOUT,
+                    height=max(300, len(feats_s) * 28),
+                    showlegend=False,
+                    xaxis=dict(**AXIS_STYLE, title="Relative SHAP Impact (%)"),
+                    yaxis=dict(**AXIS_STYLE),
+                )
+                st.plotly_chart(fig_shap, use_container_width=True)
+
         else:
             if task == "clustering":
                 section_header("Cluster Statistics", "Detailed per-cluster breakdown")
@@ -1347,8 +1381,31 @@ def render_results(result: AgentState):
                     )
                     st.plotly_chart(fig_dist, use_container_width=True)
 
-    # TAB 4 — DATA & PROFILING
+    # TAB 4 — FAIRNESS & BIAS
     with tab4:
+        bias_info = ev.get("bias_analysis", {})
+        if bias_info:
+            section_header("Demographic Fairness & Bias", "Disparate Impact and Performance Differences")
+            for demographic_col, metrics_dict in bias_info.items():
+                st.markdown(f"#### 🎭 {demographic_col.upper()}")
+                for encoded_col, m in metrics_dict.items():
+                    with st.expander(f"{encoded_col}"):
+                        diff = m.get('accuracy_diff', m.get('rmse_diff', 0))
+                        di = m.get('disparate_impact')
+                        
+                        cols = st.columns(3)
+                        cols[0].metric(label="Group 1 Metric", value=m.get('accuracy_group_1', m.get('rmse_group_1')))
+                        cols[1].metric(label="Group 0 Metric", value=m.get('accuracy_group_0', m.get('rmse_group_0')))
+                        cols[2].metric(label="Difference", value=diff)
+                        
+                        if di is not None:
+                            status = "🟢 Fair" if 0.8 <= di <= 1.25 else "🔴 High Bias"
+                            st.markdown(f"**Disparate Impact Ratio**: {di:.3f} &nbsp;&nbsp;&nbsp; {status}")
+        else:
+            st.info("No demographic bias detected or no demographic features available.")
+
+    # TAB 5 — DATA & PROFILING
+    with tab5:
         if profiling:
             shape = profiling.get("shape", {})
             summary = profiling.get("summary", {})
@@ -1426,8 +1483,8 @@ def render_results(result: AgentState):
                     }
                 )
 
-    # TAB 5 — PIPELINE TRACE
-    with tab5:
+    # TAB 6 — PIPELINE TRACE
+    with tab6:
         section_header("Pipeline Execution Trace", "Step-by-step node outputs")
 
         nodes_trace = [
@@ -1503,8 +1560,8 @@ def render_results(result: AgentState):
                     </div>
                     """, unsafe_allow_html=True)
 
-    # TAB 6 — FULL REPORT
-    with tab6:
+    # TAB 7 — FULL REPORT & EXPERIMENT HISTORY
+    with tab7:
         if report:
             section_header("Generated Report", "LLM-synthesized analysis in Turkish")
             st.markdown(f"""
@@ -1516,6 +1573,21 @@ def render_results(result: AgentState):
             st.markdown("</div>", unsafe_allow_html=True)
         else:
             st.warning("Report not generated.")
+            
+        st.markdown("<br>", unsafe_allow_html=True)
+        section_header("Experiment History", "Log of past runs from history.db")
+        history = get_experiments()
+        if history:
+            df_history = pd.DataFrame(history)
+            # Clean up the dataframe for display
+            if "id" in df_history.columns:
+                df_history = df_history.drop(columns=["id"])
+            if "timestamp" in df_history.columns:
+                df_history["timestamp"] = pd.to_datetime(df_history["timestamp"]).dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+            st.dataframe(df_history, use_container_width=True, hide_index=True)
+        else:
+            st.info("No experiment history found yet.")
 
 
 # MAIN FLOW

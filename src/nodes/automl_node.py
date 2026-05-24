@@ -3,20 +3,22 @@ from __future__ import annotations
 """
 AutoML Node
 -----------
-Intent'e göre otomatik model seçimi ve eğitimi yapar.
+Intelligent automatic model selection and training based on intent.
 
-Desteklenen task'lar:
+Supported tasks:
     - classification    : Binary/multiclass — 6 model, 5-fold CV, ROC-AUC
-    - regression        : Sayısal tahmin — 5 model, 5-fold CV, R²
+    - regression        : Numerical prediction — 5 model, 5-fold CV, R²
     - clustering        : KMeans + DBSCAN — optimal k, silhouette score
     - anomaly_detection : IsolationForest — contamination otomatik
 
-Hiçbir domain veya kolon ismi hardcode edilmemiştir.
+No domain or column names are hardcoded.
 """
 
 import time
 import warnings
 from typing import Any
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 import numpy as np
 import pandas as pd
@@ -149,6 +151,163 @@ def _prep_data(X_train_raw, X_test_raw, y_train_raw, y_test_raw):
 
 
 # ─────────────────────────────────────────────────────────────────
+# OPTUNA TUNING
+# ─────────────────────────────────────────────────────────────────
+
+def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, is_binary: bool) -> Any:
+    """Tunes the selected model using Optuna."""
+    print(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor (15 sn limiti)...")
+    
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+    scoring = "roc_auc" if is_binary else "roc_auc_ovr_weighted"
+
+    def objective(trial):
+        params = {}
+        if model_name == "random_forest":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 3, 20),
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+            }
+            model = RandomForestClassifier(**params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "extra_trees":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 3, 20),
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+            }
+            model = ExtraTreesClassifier(**params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "gradient_boosting":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+            }
+            model = GradientBoostingClassifier(**params, random_state=RANDOM_STATE)
+        elif model_name == "xgboost":
+            from xgboost import XGBClassifier
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+            }
+            model = XGBClassifier(**params, random_state=RANDOM_STATE, eval_metric="logloss", verbosity=0, n_jobs=-1)
+        elif model_name == "lightgbm":
+            from lightgbm import LGBMClassifier
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+            }
+            model = LGBMClassifier(**params, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1)
+        else:
+            raise optuna.exceptions.TrialPruned()
+
+        scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring, n_jobs=-1)
+        return scores.mean()
+
+    study = optuna.create_study(direction="maximize")
+    try:
+        study.optimize(objective, n_trials=20, timeout=15)
+        best_params = study.best_params
+        print(f"[automl] Optuna tamamlandı. En iyi parametreler: {best_params}")
+        
+        # Instantiate the best model
+        if model_name == "random_forest":
+            return RandomForestClassifier(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "extra_trees":
+            return ExtraTreesClassifier(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "gradient_boosting":
+            return GradientBoostingClassifier(**best_params, random_state=RANDOM_STATE)
+        elif model_name == "xgboost":
+            from xgboost import XGBClassifier
+            return XGBClassifier(**best_params, random_state=RANDOM_STATE, eval_metric="logloss", verbosity=0, n_jobs=-1)
+        elif model_name == "lightgbm":
+            from lightgbm import LGBMClassifier
+            return LGBMClassifier(**best_params, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1)
+    except Exception as e:
+        print(f"[automl] Optuna tuning başarısız oldu, default modele dönülüyor: {e}")
+        
+    return None
+
+def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
+    """Tunes the selected regression model using Optuna."""
+    print(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor (15 sn limiti)...")
+    
+    cv = KFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+
+    def objective(trial):
+        params = {}
+        if model_name == "random_forest":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 3, 20),
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+            }
+            model = RandomForestRegressor(**params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "extra_trees":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 3, 20),
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+            }
+            model = ExtraTreesRegressor(**params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "gradient_boosting":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+            }
+            model = GradientBoostingRegressor(**params, random_state=RANDOM_STATE)
+        elif model_name == "xgboost":
+            from xgboost import XGBRegressor
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+            }
+            model = XGBRegressor(**params, random_state=RANDOM_STATE, verbosity=0, n_jobs=-1)
+        elif model_name == "lightgbm":
+            from lightgbm import LGBMRegressor
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+            }
+            model = LGBMRegressor(**params, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1)
+        else:
+            raise optuna.exceptions.TrialPruned()
+
+        scores = cross_val_score(model, X_train, y_train, cv=cv, scoring="r2", n_jobs=-1)
+        return scores.mean()
+
+    study = optuna.create_study(direction="maximize")
+    try:
+        study.optimize(objective, n_trials=20, timeout=15)
+        best_params = study.best_params
+        print(f"[automl] Optuna tamamlandı. En iyi parametreler: {best_params}")
+        
+        if model_name == "random_forest":
+            return RandomForestRegressor(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "extra_trees":
+            return ExtraTreesRegressor(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "gradient_boosting":
+            return GradientBoostingRegressor(**best_params, random_state=RANDOM_STATE)
+        elif model_name == "xgboost":
+            from xgboost import XGBRegressor
+            return XGBRegressor(**best_params, random_state=RANDOM_STATE, verbosity=0, n_jobs=-1)
+        elif model_name == "lightgbm":
+            from lightgbm import LGBMRegressor
+            return LGBMRegressor(**best_params, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1)
+    except Exception as e:
+        print(f"[automl] Optuna tuning başarısız oldu, default modele dönülüyor: {e}")
+        
+    return None
+
+
+
+
+# ─────────────────────────────────────────────────────────────────
 # CLASSIFICATION
 # ─────────────────────────────────────────────────────────────────
 
@@ -176,8 +335,11 @@ def _run_classification(
             print(f"[automl] {name:25s} HATA: {e}")
 
     best_name = max(results, key=lambda k: results[k]["score"])
-    best_model = models[best_name]
-    print(f"\n[automl] En iyi model: {best_name} (ROC-AUC: {results[best_name]['score']:.4f})")
+    print(f"\n[automl] Baseline en iyi model: {best_name} (ROC-AUC: {results[best_name]['score']:.4f})")
+    
+    # Optuna tuning
+    tuned_model = _tune_model_classification(best_name, X_train, y_train, is_binary)
+    best_model = tuned_model if tuned_model is not None else models[best_name]
 
     best_model.fit(X_train, y_train)
     y_pred = best_model.predict(X_test)
@@ -239,8 +401,11 @@ def _run_regression(
             print(f"[automl] {name:25s} HATA: {e}")
 
     best_name = max(results, key=lambda k: results[k]["score"])
-    best_model = models[best_name]
-    print(f"\n[automl] En iyi model: {best_name} (R²: {results[best_name]['score']:.4f})")
+    print(f"\n[automl] Baseline en iyi model: {best_name} (R²: {results[best_name]['score']:.4f})")
+    
+    # Optuna tuning
+    tuned_model = _tune_model_regression(best_name, X_train, y_train)
+    best_model = tuned_model if tuned_model is not None else models[best_name]
 
     best_model.fit(X_train, y_train)
     y_pred = best_model.predict(X_test)
@@ -261,10 +426,8 @@ def _run_regression(
     return best_name, best_model, metrics
 
 
-# ─────────────────────────────────────────────────────────────────
-# CLUSTERING
-# ─────────────────────────────────────────────────────────────────
 
+# CLUSTERING
 def _run_clustering(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
@@ -277,7 +440,7 @@ def _run_clustering(
     X_all = pd.concat([X_train, X_test], ignore_index=True).values
     results = {}
 
-    # ── KMeans — k=2..8 ──────────────────────────────────────────
+    # KMeans — k=2..8
     print("[automl] KMeans deniyor (k=2..8)...")
     best_k = 2
     best_kmeans_score = -1
@@ -307,7 +470,7 @@ def _run_clustering(
     }
     print(f"[automl] KMeans best: k={best_k}, silhouette={best_kmeans_score:.4f}")
 
-    # ── DBSCAN ───────────────────────────────────────────────────
+    # DBSCAN
     print("[automl] DBSCAN deniyor...")
     try:
         db = DBSCAN(eps=0.5, min_samples=5, n_jobs=-1)
@@ -332,7 +495,7 @@ def _run_clustering(
     except Exception as e:
         print(f"[automl] DBSCAN HATA: {e}")
 
-    # ── En iyi algoritma seç ─────────────────────────────────────
+    # Choose the best algorithm
     best_algo = max(results, key=lambda k: results[k]["silhouette"])
     best = results[best_algo]
     best_model = best["model"]
@@ -340,7 +503,7 @@ def _run_clustering(
 
     print(f"\n[automl] En iyi clustering: {best_algo} (silhouette={best['silhouette']:.4f})")
 
-    # ── Cluster istatistikleri ───────────────────────────────────
+    # Cluster statistics
     cluster_stats = {}
     unique_labels = sorted(set(best_labels))
     for lbl in unique_labels:
@@ -353,7 +516,7 @@ def _run_clustering(
             "pct": round(float(mask.mean() * 100), 2),
         }
 
-    # ── Ek metrikler ─────────────────────────────────────────────
+    # Additional metrics
     extra_metrics = {}
     try:
         valid_mask = best_labels != -1
@@ -380,7 +543,7 @@ def _run_clustering(
         **extra_metrics,
     }
 
-    # Train ve test için ayrı label'ları da kaydet
+    # Save separate labels for train and test
     n_train = len(X_train)
     metrics["train_labels"] = best_labels[:n_train].tolist()
     metrics["test_labels"] = best_labels[n_train:].tolist()
@@ -388,10 +551,7 @@ def _run_clustering(
     return best_algo, best_model, metrics
 
 
-# ─────────────────────────────────────────────────────────────────
 # ANOMALY DETECTION
-# ─────────────────────────────────────────────────────────────────
-
 def _run_anomaly_detection(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
@@ -403,7 +563,7 @@ def _run_anomaly_detection(
     """
     X_all = pd.concat([X_train, X_test], ignore_index=True).values
 
-    # Birkaç contamination oranı dene
+    # Test different contamination rates
     contaminations = [0.05, 0.10, 0.15]
     best_contamination = 0.10
     best_score = -np.inf
@@ -419,7 +579,7 @@ def _run_anomaly_detection(
                 n_jobs=-1,
             )
             labels = iso.fit_predict(X_all)
-            # -1 anomali, 1 normal → silhouette için convert
+            # -1 anomaly, 1 normal → convert for silhouette
             labels_bin = (labels == -1).astype(int)
             n_anomalies = (labels == -1).sum()
 
@@ -451,9 +611,9 @@ def _run_anomaly_detection(
     best_labels = best["labels"]
 
     print(f"\n[automl] En iyi contamination: {best_contamination} "
-          f"({best['n_anomalies']} anomali, %{best['anomaly_pct']})")
+          f"({best['n_anomalies']} anomalies, %{best['anomaly_pct']})")
 
-    # Anomali skorları (decision function)
+    # Anomaly scores (decision function)
     anomaly_scores = best_model.decision_function(X_all)
     score_threshold = float(np.percentile(anomaly_scores, best_contamination * 100))
 
@@ -478,7 +638,7 @@ def _run_anomaly_detection(
         "test_labels": best_labels[n_train:].tolist(),
     }
 
-    # Feature importance — IsolationForest için mean_depth tabanlı
+    # Feature importance - IsolationForest using mean depth
     try:
         fi_raw = best_model.feature_importances_
         fi = dict(zip(feature_names, fi_raw.tolist()))
@@ -488,30 +648,26 @@ def _run_anomaly_detection(
 
     return "isolation_forest", best_model, metrics
 
-
-# ─────────────────────────────────────────────────────────────────
 # MAIN NODE
-# ─────────────────────────────────────────────────────────────────
-
 def automl_node(state: AgentState) -> AgentState:
     """
-    Node 7: Intent'e göre otomatik model seçimi ve eğitimi.
+    Intent-based automatic model selection and training.
 
-    Desteklenen task'lar:
+    Supported tasks:
         classification    → 6 model, 5-fold CV, ROC-AUC
         regression        → 6 model, 5-fold CV, R²
         clustering        → KMeans(k=2..8) + DBSCAN, silhouette
         anomaly_detection → IsolationForest, contamination taraması
 
-    State girdileri:
-        X_train, X_test, y_train, y_test : Feature engineering çıktısı
-        intent                            : Task tipini belirler
+    State inputs:
+        X_train, X_test, y_train, y_test : Feature engineering output
+        intent                           : Task type
 
-    State çıktıları:
-        model_name     : Seçilen model/algoritma adı
-        model_params   : Parametreler
-        model_artifact : Eğitilmiş model objesi
-        metrics        : Task'a özgü metrikler
+    State outputs:
+        model_name     : Selected model/algorithm name
+        model_params   : Parameters
+        model_artifact : Trained model object
+        metrics        : Task-specific metrics
     """
     X_train_raw = state.get("X_train", [])
     X_test_raw = state.get("X_test", [])
@@ -533,7 +689,7 @@ def automl_node(state: AgentState) -> AgentState:
     print(f"  X_test  : {X_test.shape}")
     print(f"  Intent  : {intent}")
 
-    # ── Task routing ─────────────────────────────────────────────
+    # Task routing   
     if intent == "regression":
         model_name, model, metrics = _run_regression(
             X_train, y_train, X_test, y_test, feature_names
@@ -558,7 +714,7 @@ def automl_node(state: AgentState) -> AgentState:
             X_train, y_train, X_test, y_test, feature_names
         )
 
-    # ── Print sonuçlar ───────────────────────────────────────────
+    # Print results   
     print(f"\n[automl] Sonuçlar ({model_name}):")
     for k, v in metrics.items():
         if k not in ("feature_importance", "all_model_scores", "all_algorithm_scores",

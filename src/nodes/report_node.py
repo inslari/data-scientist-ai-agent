@@ -251,6 +251,14 @@ def _build_context(state: AgentState) -> str:
                     f"  - Önemsiz feature: {fi_sum.get('insignificant_features_count', 0)} adet"
                 )
 
+            bias = ev.get("bias_analysis", {})
+            if bias:
+                lines.append("\n### Bias & Fairness Analizi")
+                for base_col, cols in bias.items():
+                    lines.append(f"  - Grup: {base_col}")
+                    for col, metrics in cols.items():
+                        lines.append(f"    - {col}: FPR={metrics.get('fpr', 0):.3f}, FNR={metrics.get('fnr', 0):.3f}")
+
             if opt_thresh:
                 lines.append(f"\n- Optimal Threshold (Youden's J): {opt_thresh}")
 
@@ -298,27 +306,34 @@ What problem was solved, how good is the model, and what is the key finding?
 - Evaluate "High Confidence Errors" (cases where the model was certain but wrong).
 - Draw actionable conclusions from the Error Analysis section.
 
-## 6. En Etkili Özellikler (Most Impactful Features)
+## 6. Adalet ve Yanlılık Analizi (Fairness & Bias)
+- Analyze the Bias & Fairness metrics (e.g., FPR, FNR differences across demographic groups) if they exist.
+- Identify if the model systematically disadvantages certain groups.
+- If biases are found, explain the real-world implications (e.g., "The model rejects loan applications from Group X more frequently").
+- If no bias data is present, state that it was not evaluated.
+
+## 7. En Etkili Özellikler (Most Impactful Features)
 - Compare and interpret SHAP values and Feature Importance.
 - Explain the impact of each top feature on the target variable using **real-world domain knowledge**, not just mathematical impact.
 - For example, deduce logical causalities like: "Capital gain strongly impacts the model because it directly represents wealth and investment income."
 - DO NOT use circular, generic, or repetitive statements like "This feature is important because it had the highest contribution score."
 
-## 7. Operasyonel Öneriler (Operational Recommendations)
+## 8. Operasyonel Öneriler (Operational Recommendations)
 - Discuss the Optimal Threshold (if provided) and when it should be used instead of the default 0.5.
 - What needs to be done before putting this model into production?
 - Suggest improvements like regularization or simpler models if applicable.
 
-## 8. Sonraki Adımlar (Next Steps)
+## 9. Sonraki Adımlar (Next Steps)
 Propose 3-5 concrete, prioritized actionable steps.
 
 ---
 RULES:
 - OUTPUT LANGUAGE MUST BE TURKISH.
+- THINK DEEPLY. Extract hidden meanings, logical causalities, and business implications from the numbers. Do not just state the numbers. Be a highly experienced senior consultant.
 - Use technical terms but briefly explain them.
 - Put numbers into context (e.g., "0.96 AUC is excellent because...").
 - Do not repeat yourself.
-- Keep the tone professional and fluent.
+- Keep the tone professional, authoritative, and fluent.
 - Preserve the exact Markdown formatting (headers, bullet points, bold text).
 """
 
@@ -372,8 +387,10 @@ RULES:
 - NEVER mention: Brier Score, ROC-AUC, confusion matrix, F1, precision, recall, SHAP, accuracy, overfitting, high confidence errors.
   These concepts do NOT apply to unsupervised clustering.
 - Focus on cluster interpretability, business value, and actionable insights.
+- THINK DEEPLY. Extract hidden meanings, logical causalities, and business implications from the numbers. Do not just state the numbers. Be a highly experienced senior consultant.
 - Use technical terms but briefly explain them.
 - Do not repeat yourself.
+- Keep the tone professional, authoritative, and fluent.
 """
 
 SYSTEM_PROMPT_ANOMALY = """You are an expert Data Scientist specializing in anomaly detection and fraud/outlier analysis.
@@ -425,8 +442,10 @@ RULES:
 - NEVER mention: ROC-AUC, confusion matrix, F1, precision, recall, Brier Score, SHAP, accuracy, calibration.
   These require ground-truth labels which anomaly detection does NOT have.
 - Focus on anomaly interpretation, business risk, feature drivers, and recommended actions.
+- THINK DEEPLY. Extract hidden meanings, logical causalities, and business implications from the numbers. Do not just state the numbers. Be a highly experienced senior consultant.
 - Use technical terms but briefly explain them.
 - Do not repeat yourself.
+- Keep the tone professional, authoritative, and fluent.
 """
 
 # Main Node
@@ -601,17 +620,25 @@ def _generate_fallback_report(state: AgentState) -> str:
             f"- Yüksek güven hatası: {conf.get('high_confidence_errors', 0)} adet",
         ]
 
+    bias = ev.get("bias_analysis", {})
+    if bias:
+        lines += ["", "## 7. Bias & Fairness Analizi"]
+        for base_col, cols in bias.items():
+            lines.append(f"- **Grup: {base_col}**")
+            for col, metrics in cols.items():
+                lines.append(f"  - {col}: FPR={metrics.get('fpr', 0):.3f}, FNR={metrics.get('fnr', 0):.3f}")
+
     opt_thresh = ev.get("optimal_threshold")
     if opt_thresh:
         lines += [
             "",
-            "## 7. Operasyonel Öneri",
+            "## 8. Operasyonel Öneri",
             f"- Varsayılan 0.5 yerine **{opt_thresh}** threshold'u kullanmak recall'u artırır.",
         ]
 
     lines += [
         "",
-        "## 8. Güvenilirlik",
+        "## 9. Güvenilirlik",
         f"- Skor: **{score}/100** | Grade: **{grade}**",
     ]
     for factor in rel.get("factors", []):

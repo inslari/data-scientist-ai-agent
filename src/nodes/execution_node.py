@@ -411,31 +411,31 @@ def _generate_recommendations(profile: dict) -> list[str]:
         unique_count = info.get("unique_count", 0)
         unique_rate = info.get("unique_rate", 0)
 
-        # 1. ID columns → drop
+        # ID columns → drop
         if is_id:
             recs.append(f"'{col}' ID sütun — model eğitiminden çıkarılmalı")
             continue
 
-        # 2. Constant columns → drop
+        # Constant columns → drop
         if unique_count == 1:
             recs.append(f"'{col}' sabit değerli — model eğitiminden çıkarılmalı")
             continue
 
-        # 3. Date columns → feature extraction
+        # Date columns → feature extraction
         if is_date:
             recs.append(
                 f"'{col}' tarih kolonu — yıl/ay/gün/haftanın_günü özelliklerine dönüştür"
             )
             continue
 
-        # 4. High null rate (column-level)
+        # High null rate
         if null_rate > 0.3:
             recs.append(
                 f"'{col}' çok yüksek null oranı (%{null_rate * 100:.0f}) — drop veya agresif imputation"
             )
             continue
 
-        # 5. Numeric columns
+        # Numeric columns
         if col in numeric_cols:
             parts = []
 
@@ -454,7 +454,7 @@ def _generate_recommendations(profile: dict) -> list[str]:
                 recs.append(f"'{col}': {' | '.join(parts)}")
             continue
 
-        # 6. Categorical columns
+        # Categorical columns
         if dtype == "object":
             if unique_rate > 0.95:
                 recs.append(

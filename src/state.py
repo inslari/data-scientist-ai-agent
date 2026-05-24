@@ -55,6 +55,15 @@ class AgentState(TypedDict, total=False):
     sql_query_summary: str           # Generated short description
     sql_query_warning: str           # Warning message if approximate columns were used (empty = exact match)
 
+    # Critic & Self-Correction
+    retry_count: int                 # Number of retry attempts made
+    max_retries: int                 # Maximum allowed retries
+    critic_feedback: list[str]       # Feedback from the critic node
+    next_retry_node: str             # Node to route to after critic
+    
+    # Audit Trail / Tracking
+    experiment_logs: list[dict]      # Logs of completed ML experiments
+
     # Graph Control
     current_step: str                # Current active node
     error: Optional[str]             # Errors
