@@ -14,10 +14,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Database (Optional: remove the hash at the beginning if you do not want to keep db in git)
-# *.db
-# *.sqlite
-# *.sqlite3
+# Database
+*.sqlite
+*.sqlite3
 
 # OS Generated Files
 .DS_Store

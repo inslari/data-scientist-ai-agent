@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from state import AgentState
+from src.state import AgentState
 from src.core.config import settings
 
 MCP_CONFIG = {
@@ -305,6 +305,7 @@ def _profile_dataframe(df: pd.DataFrame) -> dict:
                 "q75": _safe_float(desc.get("75%")),
                 "skewness": _safe_float(df[col].skew()),
                 "kurtosis": _safe_float(df[col].kurt()),
+                # has_outliers now stores the outlier *rate* (0.0–1.0)
                 "has_outliers": _detect_outliers(df[col]),
             })
 
@@ -343,28 +344,36 @@ def _safe_float(val: Any) -> float | None:
         return None
 
 
-def _detect_outliers(series: pd.Series) -> bool:
+def _detect_outliers(series: pd.Series) -> float:
+    """Returns the fraction of outlier rows (IQR method). 0.0 means no outliers."""
     try:
         q1, q3 = series.quantile(0.25), series.quantile(0.75)
         iqr = q3 - q1
-        return bool(((series < q1 - 1.5 * iqr) | (series > q3 + 1.5 * iqr)).any())
+        if iqr == 0:
+            return 0.0
+        mask = (series < q1 - 1.5 * iqr) | (series > q3 + 1.5 * iqr)
+        return round(float(mask.mean()), 4)
     except Exception:
-        return False
+        return 0.0
 
 
 def _generate_recommendations(profile: dict) -> list[str]:
     """
     Generates feature engineering recommendations based on profile results.
-    One recommendation per column — no duplicates.
     feature_engineering_node uses this list to make transformation decisions.
+
+    Rules:
+    - missing_rate threshold: >5% (avoids noise from negligible nulls)
+    - outlier threshold: >1% of rows (avoids flagging every numeric column)
+    - skewness is reported independently even when outliers are present
     """
     recs = []
     summary = profile.get("summary", {})
     numeric_cols = set(summary.get("numeric_columns", []))
 
-    # General quality checks
+    # General quality checks 
     missing_rate = summary.get("missing_rate", 0)
-    if missing_rate > 0.01:
+    if missing_rate > 0.05:  # raised from 0.01 → meaningful threshold
         recs.append(
             f"Eksik değer imputation gerekli (missing_rate: %{missing_rate * 100:.1f})"
         )
@@ -372,11 +381,13 @@ def _generate_recommendations(profile: dict) -> list[str]:
     if summary.get("duplicate_rows", 0) > 0:
         recs.append(f"Duplicate satır temizlenmeli ({summary['duplicate_rows']} adet)")
 
-    # Date column detection set
+    # Date column detection 
     DATE_SUFFIXES = ("_date", "_at", "_time")
     DATE_EXACT = {"created_at", "updated_at", "timestamp", "birth_date", "order_date"}
 
-    # Column-based recommendations (one per column)
+    OUTLIER_RATE_THRESHOLD = 0.01  # >1% of rows must be outliers to flag
+
+    # Column-level recommendations 
     for col, info in profile.get("columns", {}).items():
         dtype = info.get("dtype", "")
         col_lower = col.lower()
@@ -387,52 +398,63 @@ def _generate_recommendations(profile: dict) -> list[str]:
             or any(col_lower.endswith(s) for s in DATE_SUFFIXES)
         )
         is_monetary = any(k in col_lower for k in ["price", "amount", "cost", "revenue"])
-        has_outliers = info.get("has_outliers", False)
+
+        # outlier_rate is now a float (0.0–1.0), not a bool
+        outlier_rate = info.get("has_outliers", 0.0)
+        if isinstance(outlier_rate, bool):  # backward-compat guard
+            outlier_rate = 0.05 if outlier_rate else 0.0
+        has_significant_outliers = outlier_rate > OUTLIER_RATE_THRESHOLD
+
         skew = info.get("skewness")
         cardinality = info.get("cardinality", "")
         null_rate = info.get("null_rate", 0)
         unique_count = info.get("unique_count", 0)
         unique_rate = info.get("unique_rate", 0)
 
-        # 1. ID columns → drop
+        # ID columns → drop
         if is_id:
             recs.append(f"'{col}' ID sütun — model eğitiminden çıkarılmalı")
             continue
 
-        # 2. Constant value → drop
+        # Constant columns → drop
         if unique_count == 1:
             recs.append(f"'{col}' sabit değerli — model eğitiminden çıkarılmalı")
             continue
 
-        # 3. Date columns → feature extraction
+        # Date columns → feature extraction
         if is_date:
             recs.append(
                 f"'{col}' tarih kolonu — yıl/ay/gün/haftanın_günü özelliklerine dönüştür"
             )
             continue
 
-        # 4. High null rate
+        # High null rate
         if null_rate > 0.3:
             recs.append(
                 f"'{col}' çok yüksek null oranı (%{null_rate * 100:.0f}) — drop veya agresif imputation"
             )
             continue
 
-        # 5. Numeric columns — monetary + outlier combined recommendation
+        # Numeric columns
         if col in numeric_cols:
-            if is_monetary and has_outliers:
-                recs.append(f"'{col}' parasal + outlier — RobustScaler önerilir")
+            parts = []
+
+            if is_monetary and has_significant_outliers:
+                parts.append(f"parasal + outlier (%{outlier_rate*100:.1f}) → RobustScaler önerilir")
             elif is_monetary:
-                recs.append(f"'{col}' parasal kolon — StandardScaler önerilir")
-            elif has_outliers:
-                recs.append(f"'{col}' outlier var — RobustScaler veya IQR capping önerilir")
-            elif skew and abs(skew) > 1:
-                recs.append(
-                    f"'{col}' çarpık dağılım (skewness={skew}) — log/sqrt transform önerilir"
-                )
+                parts.append("parasal kolon → StandardScaler önerilir")
+            elif has_significant_outliers:
+                parts.append(f"outlier oranı %{outlier_rate*100:.1f} → RobustScaler veya IQR capping önerilir")
+
+            # Skewness is reported independently (even alongside outlier warning)
+            if skew is not None and abs(skew) > 1:
+                parts.append(f"çarpık dağılım (skewness={skew:.2f}) → log/sqrt transform önerilir")
+
+            if parts:
+                recs.append(f"'{col}': {' | '.join(parts)}")
             continue
 
-        # 6. Categorical columns
+        # Categorical columns
         if dtype == "object":
             if unique_rate > 0.95:
                 recs.append(
@@ -450,7 +472,6 @@ def _generate_recommendations(profile: dict) -> list[str]:
                 recs.append(
                     f"'{col}' düşük kardinaliteli ({unique_count} unique) — one-hot encoding önerilir"
                 )
-
 
     return recs
 

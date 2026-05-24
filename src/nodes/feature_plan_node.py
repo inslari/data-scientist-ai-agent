@@ -24,7 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
-from state import AgentState
+from src.state import AgentState
 
 load_dotenv(override=True)
 
@@ -103,6 +103,14 @@ class FeaturePlan(BaseModel):
             "time_based hedeflerde genellikle True olmalı."
         )
     )
+    math_interactions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "LLM tarafından önerilen mantıksal matematiksel etkileşimler. "
+            "Örn: ['revenue / max(1, order_count)', 'price * quantity']. "
+            "Sadece sayısal kolonlar için kullanılmalıdır."
+        )
+    )
     reasoning: str = Field(
         description="Bu planın neden seçildiğini açıklayan Türkçe metin"
     )
@@ -117,6 +125,7 @@ SYSTEM_PROMPT = """Sen bir veri bilimi uzmanısın. Görevin, kullanıcının an
 - Aggregation seviyesini analiz tipine göre belirle (churn → müşteri bazında, satış tahmini → ürün/zaman bazında)
 - time_based hedeflerde use_data_split_for_label = True olmalı
 - Gereksiz feature grubu ekleme — sadece analize katkı sağlayanları seç
+- Gerekliyse `math_interactions` alanında oran (A/B) veya çarpım (A*B) gibi mantıksal feature'lar öner.
 - Türkçe cevap ver
 """
 
@@ -175,6 +184,8 @@ Bu analiz için feature engineering planını üret.
     print(f"[feature_plan] Aggregation   : {plan.aggregation.level} "
           f"(group_by: {plan.aggregation.group_by_column})")
     print(f"[feature_plan] Feature grupları: {plan.feature_groups}")
+    if plan.math_interactions:
+        print(f"[feature_plan] Math etkileşimler: {plan.math_interactions}")
     print(f"[feature_plan] Data split    : {plan.use_data_split_for_label}")
     print(f"[feature_plan] Neden         : {plan.reasoning}")
 

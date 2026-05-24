@@ -11,7 +11,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 load_dotenv(override=True)
 
 
-# --- Pydantic Models for Structured Output ---
+# Pydantic Models for Structured Output     
 
 class TableUnderstanding(BaseModel):
     table_name: str
@@ -28,6 +28,14 @@ class ColumnProfile(BaseModel):
     nullability: str
     uniqueness: str = Field(description="high/medium/low")
     importance_score: float = Field(description="Score between 0-1 for analytics relevance")
+    description: str = Field(
+        default="",
+        description="One sentence describing what this column actually contains (units, range, meaning)"
+    )
+    sample_values: str = Field(
+        default="",
+        description="Comma-separated list of representative sample values from this column (3-5 values)"
+    )
 
 class Relationship(BaseModel):
     source_table: str
@@ -123,6 +131,11 @@ Infer:
 - nullability
 - uniqueness
 - importance_score
+- description: ONE sentence explaining what the column truly contains (be specific about units and value types)
+  Good examples: "Weekly hours worked per week (integer, range 1-99)"
+                 "Capital gains from investments in USD (can be 0 for most records)"
+                 "Binary income bracket: '>50K' or '<=50K' strings, NOT an actual salary number"
+- sample_values: 3-5 representative actual values from sample data (e.g. "Male, Female" or "0, 5178, 99999")
 
 ## 3. RELATIONSHIP DETECTION
 Infer:
