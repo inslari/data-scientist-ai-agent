@@ -4,9 +4,11 @@ import asyncio
 import os
 import sys
 
+# Add project root to sys.path so 'src' module can be found
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_openai import ChatOpenAI
+from core.llm import get_llm
 from langgraph.prebuilt import create_react_agent
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -25,7 +27,7 @@ async def run_agent(user_input: str):
     tools = await client.get_tools()
 
     model_name = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model_name, temperature=0)
+    llm = get_llm(model_name=model_name, temperature=0)
 
     system_prompt = (
         "Sen kıdemli bir Veri Mühendisisin. Görevin, sana verilen görevleri veritabanından veri çekerek yanıtlamak. "
