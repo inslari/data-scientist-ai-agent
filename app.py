@@ -256,21 +256,25 @@ with st.sidebar:
     st.markdown("<br>", unsafe_allow_html=True)
     run_btn = st.button("⬡ Run Analysis", use_container_width=True)
 
+    # Pipeline trace placeholder
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown(f"""
-    <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; color: {'#4a4a6a' if is_dark else '#aaaacc'}; line-height: 1.8;">
-        <div style="color: {'#8888aa' if is_dark else '#5a5a7a'}; font-size: 0.65rem; letter-spacing: 0.08em; margin-bottom: 0.5rem;">PIPELINE</div>
-        <div>01 · Intent Analyzer</div>
-        <div>02 · DB Context Loader</div>
-        <div>03 · Analysis Planner</div>
-        <div>04 · Execution Layer</div>
-        <div>05 · Feature Planner</div>
-        <div>06 · Feature Engineering</div>
-        <div>07 · AutoML</div>
-        <div>08 · Evaluation</div>
-        <div>09 · Report Generator</div>
-    </div>
-    """, unsafe_allow_html=True)
+    ui_placeholder = st.empty()
+    
+    # If not running, show the static pipeline structure
+    if "result" not in st.session_state or st.session_state.result is None:
+        ui_placeholder.markdown(f"""
+        <div style="font-family: 'DM Mono', monospace; font-size: 0.7rem; color: {'#4a4a6a' if is_dark else '#aaaacc'}; line-height: 1.8;">
+            <div style="color: {'#8888aa' if is_dark else '#5a5a7a'}; font-size: 0.65rem; letter-spacing: 0.08em; margin-bottom: 0.5rem;">PIPELINE ARCHITECTURE</div>
+            <div>01 · Intent Analyzer</div>
+            <div>02 · DB Context Loader</div>
+            <div>03 · SQL / ML Planner</div>
+            <div>04 · Execution Layer</div>
+            <div>05 · Feature Engineering</div>
+            <div>06 · AutoML</div>
+            <div>07 · Evaluation & Critic</div>
+            <div>08 · Report Generator</div>
+        </div>
+        """, unsafe_allow_html=True)
 
 
 # HEADER
@@ -289,107 +293,108 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# PIPELINE RUNNER
+# PIPELINE RUNNER & DYNAMIC UI
 
-def run_pipeline(user_query: str) -> AgentState:
-    """Runs the full LangGraph pipeline and returns final state."""
+def run_pipeline(user_query: str, trace_placeholder) -> AgentState:
+    """Runs the full LangGraph pipeline and streams updates to the UI."""
     app = build_graph()
     initial_state: AgentState = {
         "user_query": user_query,
         "messages": [],
     }
-    return asyncio.run(app.ainvoke(initial_state))
-
-
-# LOADING ANIMATION
-
-def show_loading():
-    """Animated node-by-node loading sequence."""
-
-    raw_query = st.session_state.get("query_input", "").lower()
-    sql_keywords = ["getir", "listele", "göster", "kaç", "filtrele", "sırala",
-                    "select", "fetch", "show", "how many", "top ", "filter"]
-    is_likely_sql = any(kw in raw_query for kw in sql_keywords)
-
-    if is_likely_sql:
-        nodes = [
-            ("01", "Intent Analyzer",  "Classifying as SQL query..."),
-            ("02", "SQL Generator",    "Writing SELECT query with GPT-4o..."),
-            ("03", "MCP Executor",     "Running query on SQLite database..."),
-            ("04", "Chart Planner",    "Deciding best visualization type..."),
-        ]
-    else:
-        nodes = [
-            ("01", "Intent Analyzer",      "Classifying analysis intent..."),
-            ("02", "DB Context Loader",    "Fetching schema & running intelligence engine..."),
-            ("03", "Analysis Planner",     "Building execution plan..."),
-            ("04", "Execution Layer",      "Fetching data & profiling..."),
-            ("05", "Feature Planner",      "LLM designing feature strategy..."),
-            ("06", "Feature Engineering",  "Encoding, scaling, selecting features..."),
-            ("07", "AutoML",               "Training & comparing 6 models with 5-fold CV..."),
-            ("08", "Evaluation",           "Computing metrics & reliability score..."),
-            ("09", "Report Generator",     "Synthesizing insights with GPT-4o..."),
-        ]
     
-    # Total steps
-    total = len(nodes)
-    
-    placeholder = st.empty()
-    for i, (num, name, desc) in enumerate(nodes):
-        progress = (i + 1) / total
-        completed = nodes[:i]
-        current = (num, name, desc)
+    node_names = {
+        "intent_node": ("01", "Intent Analyzer", "Classifying analysis intent..."),
+        "db_context_node": ("02", "DB Context Loader", "Fetching schema & metadata..."),
+        "sql_node": ("03", "SQL Executor", "Running query on database..."),
+        "planner_node": ("03", "Analysis Planner", "Building execution plan..."),
+        "execution_node": ("04", "Execution Layer", "Fetching data & profiling..."),
+        "feature_plan_node": ("05", "Feature Planner", "Designing feature strategy..."),
+        "feature_engineering_node": ("06", "Feature Engineering", "Encoding & scaling..."),
+        "automl_node": ("07", "AutoML", "Training & comparing models..."),
+        "evaluation_node": ("08", "Evaluation", "Computing metrics..."),
+        "critic_node": ("09", "AI Critic", "Checking for overfitting & leaks..."),
+        "report_node": ("10", "Report Generator", "Synthesizing insights..."),
+    }
 
+    completed_nodes = []
+    final_state = dict(initial_state)
 
-    placeholder = st.empty()
-    for i, (num, name, desc) in enumerate(nodes):
-        progress = (i + 1) / len(nodes)
-        completed = nodes[:i]
-        current = (num, name, desc)
-
-        html = f"""
-        <div style="background: #111118; border: 1px solid rgba(255,255,255,0.06);
-                    border-radius: 12px; padding: 1.5rem 2rem; font-family: 'DM Mono', monospace;">
-            <div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 1.2rem;">
-                <div style="font-family: 'Syne', sans-serif; font-size: 0.85rem; 
-                            color: #6c63ff; font-weight: 600; letter-spacing: 0.1em;">
-                    RUNNING PIPELINE
-                </div>
-                <div style="flex: 1; height: 2px; background: rgba(255,255,255,0.06); border-radius: 1px;">
-                    <div style="height: 100%; width: {progress*100:.0f}%; background: linear-gradient(90deg, #6c63ff, #ff6584);
-                                border-radius: 1px; transition: width 0.3s ease;"></div>
-                </div>
-                <div style="font-size: 0.7rem; color: #8888aa;">{i+1}/9</div>
-            </div>
-        """
-
-        # Completed nodes
-        for cn, cname, _ in completed:
+    def render_trace(current_node=None):
+        if not current_node and not completed_nodes:
+            return
+            
+        html = f"""<div style="background: #111118; border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 1.5rem 1.5rem; font-family: 'DM Mono', monospace;">
+<div style="font-family: 'Syne', sans-serif; font-size: 0.85rem; color: #6c63ff; font-weight: 600; letter-spacing: 0.1em; margin-bottom: 1.2rem;">
+LIVE EXECUTION
+</div>"""
+        
+        for cn in completed_nodes:
+            info = node_names.get(cn, ("", cn, ""))
             html += f"""
-            <div style="display: flex; align-items: center; gap: 0.8rem; margin-bottom: 0.4rem; opacity: 0.5;">
-                <span style="color: #43e97b; font-size: 0.7rem;">✓</span>
-                <span style="color: #4a4a6a; font-size: 0.72rem;">{cn} · {cname}</span>
-            </div>
-            """
+<div style="display: flex; align-items: center; gap: 0.8rem; margin-bottom: 0.6rem; opacity: 0.6;">
+<span style="color: #43e97b; font-size: 0.75rem;">✓</span>
+<span style="color: #e8e8f0; font-size: 0.75rem;">{info[0]} · {info[1]}</span>
+</div>"""
+            
+        if current_node:
+            info = node_names.get(current_node, ("", current_node, "Processing..."))
+            html += f"""
+<div style="display: flex; align-items: center; gap: 0.8rem; margin-bottom: 0.4rem; padding: 0.6rem 0.8rem; background: rgba(108,99,255,0.1); border-radius: 6px; border-left: 2px solid #6c63ff;">
+<span style="color: #6c63ff; font-size: 0.7rem; animation: pulse 1s infinite;">◉</span>
+<div>
+<div style="color: #e8e8f0; font-size: 0.75rem; font-weight: 500;">{info[0]} · {info[1]}</div>
+<div style="color: #8888aa; font-size: 0.65rem; margin-top: 2px;">{info[2]}</div>
+</div>
+</div>"""
+            
+        html += "</div>"
+        trace_placeholder.markdown(html, unsafe_allow_html=True)
 
-        # Current node
-        html += f"""
-        <div style="display: flex; align-items: center; gap: 0.8rem; margin-bottom: 0.4rem;
-                    padding: 0.5rem 0.8rem; background: rgba(108,99,255,0.08); 
-                    border-radius: 6px; border-left: 2px solid #6c63ff;">
-            <span style="color: #6c63ff; font-size: 0.7rem; animation: pulse 1s infinite;">◉</span>
-            <div>
-                <div style="color: #e8e8f0; font-size: 0.75rem; font-weight: 500;">{current[0]} · {current[1]}</div>
-                <div style="color: #8888aa; font-size: 0.68rem; margin-top: 1px;">{current[2]}</div>
-            </div>
-        </div>
-        </div>
-        """
-
-        placeholder.markdown(html, unsafe_allow_html=True)
-        time.sleep(0.4)
-
-    placeholder.empty()
+    # Initial UI state
+    render_trace("intent_node")
+    
+    # Process graph execution stream using async loop
+    async def process_stream():
+        nonlocal final_state
+        async for chunk in app.astream(initial_state):
+            node_name = list(chunk.keys())[0]
+            final_state.update(chunk[node_name])
+            completed_nodes.append(node_name)
+            
+            # Predict the next node based on current context
+            next_node = None
+            if node_name == "intent_node":
+                next_node = "db_context_node"
+            elif node_name == "db_context_node":
+                intent = final_state.get("intent", "eda")
+                next_node = "sql_node" if intent == "sql_query" else "planner_node"
+            elif node_name == "planner_node":
+                next_node = "execution_node"
+            elif node_name == "execution_node":
+                intent = final_state.get("intent", "eda")
+                next_node = "feature_plan_node" if intent in ("classification", "regression", "clustering") else "automl_node"
+            elif node_name == "feature_plan_node":
+                next_node = "feature_engineering_node"
+            elif node_name == "feature_engineering_node":
+                next_node = "automl_node"
+            elif node_name == "automl_node":
+                next_node = "evaluation_node"
+            elif node_name == "evaluation_node":
+                next_node = "critic_node"
+            elif node_name == "critic_node":
+                next_node = final_state.get("next_retry_node", "report_node")
+                
+            render_trace(next_node)
+            
+        return final_state
+        
+    final_state = asyncio.run(process_stream())
+    
+    # Clear the sidebar trace when done
+    trace_placeholder.empty()
+    
+    return final_state
 
 
 # DASHBOARD SECTIONS
@@ -1596,16 +1601,13 @@ if "result" not in st.session_state:
     st.session_state.result = None
 
 if run_btn and query.strip():
-    with st.spinner(""):
-        show_loading()
-        with st.spinner("Finalizing pipeline..."):
-            result = run_pipeline(query)
-            st.session_state.result = result
+    result = run_pipeline(query, ui_placeholder)
+    st.session_state.result = result
     st.rerun()
 
 elif not run_btn and st.session_state.result is None:
     # Welcome screen
-    st.markdown("""
+    st.markdown('''
     <div style="display: flex; flex-direction: column; align-items: center; justify-content: center;
                 min-height: 50vh; text-align: center; padding: 4rem 2rem;">
         <div style="font-size: 3rem; margin-bottom: 1rem;">⬡</div>
@@ -1636,7 +1638,7 @@ elif not run_btn and st.session_state.result is None:
             </div>
         </div>
     </div>
-    """, unsafe_allow_html=True)
+    ''', unsafe_allow_html=True)
 
 if st.session_state.result is not None:
     render_results(st.session_state.result)
