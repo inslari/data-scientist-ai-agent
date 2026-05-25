@@ -438,7 +438,7 @@ def _run_clustering(
     Silhouette score ile en iyi algoritma ve parametreyi seçer.
     """
     X_all = pd.concat([X_train, X_test], ignore_index=True).values
-    results = {}
+    results: dict[str, dict[str, Any]] = {}
 
     # KMeans — k=2..8
     print("[automl] KMeans deniyor (k=2..8)...")
@@ -504,7 +504,7 @@ def _run_clustering(
     print(f"\n[automl] En iyi clustering: {best_algo} (silhouette={best['silhouette']:.4f})")
 
     # Cluster statistics
-    cluster_stats = {}
+    cluster_stats: dict[str, dict[str, Any]] = {}
     unique_labels = sorted(set(best_labels))
     for lbl in unique_labels:
         if lbl == -1:
@@ -567,7 +567,7 @@ def _run_anomaly_detection(
     contaminations = [0.05, 0.10, 0.15]
     best_contamination = 0.10
     best_score = -np.inf
-    results = {}
+    results: dict[float, dict[str, Any]] = {}
 
     print("[automl] IsolationForest — contamination taraması...")
     for cont in contaminations:
@@ -684,6 +684,20 @@ def automl_node(state: AgentState) -> AgentState:
     )
     feature_names = X_train.columns.tolist()
 
+    # Auto-correct intent if y is categorical string but intent is regression
+    if intent == "regression" and y_train.dtype.kind in ('O', 'U', 'S'):
+        try:
+            y_train.astype(float)
+        except ValueError:
+            print("[automl] Uyarı: y değişkeni string içeriyor, intent 'classification' olarak değiştirildi.")
+            intent = "classification"
+
+    if intent == "classification" or (intent not in ("regression", "clustering", "anomaly_detection")):
+        le = LabelEncoder()
+        y_train = le.fit_transform(y_train)
+        known_classes = set(le.classes_)
+        y_test = np.array([le.transform([val])[0] if val in known_classes else -1 for val in y_test])  # type: ignore
+
     print(f"\n[automl] Başlıyor:")
     print(f"  X_train : {X_train.shape}")
     print(f"  X_test  : {X_test.shape}")
@@ -691,9 +705,7 @@ def automl_node(state: AgentState) -> AgentState:
 
     # Task routing   
     if intent == "regression":
-        model_name, model, metrics = _run_regression(
-            X_train, y_train, X_test, y_test, feature_names
-        )
+        model_name, model, metrics = _run_regression(X_train, y_train, X_test, y_test, feature_names)  # type: ignore
 
     elif intent == "clustering":
         model_name, model, metrics = _run_clustering(
@@ -710,9 +722,7 @@ def automl_node(state: AgentState) -> AgentState:
         if not y_train_raw:
             return {**state, "error": "Classification için label (y) verisi bulunamadı.",
                     "current_step": "automl_node"}
-        model_name, model, metrics = _run_classification(
-            X_train, y_train, X_test, y_test, feature_names
-        )
+        model_name, model, metrics = _run_classification(X_train, y_train, X_test, y_test, feature_names)  # type: ignore
 
     # Print results   
     print(f"\n[automl] Sonuçlar ({model_name}):")
@@ -730,6 +740,9 @@ def automl_node(state: AgentState) -> AgentState:
 
     return {
         **state,
+        "intent": intent,
+        "y_train": y_train.tolist() if isinstance(y_train, np.ndarray) else y_train,
+        "y_test": y_test.tolist() if isinstance(y_test, np.ndarray) else y_test,
         "model_name": model_name,
         "model_params": {"intent": intent},
         "model_artifact": model,

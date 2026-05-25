@@ -21,7 +21,7 @@ from typing import Literal
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from src.core.llm import get_llm
 from pydantic import BaseModel, Field
 
 from src.state import AgentState
@@ -159,7 +159,7 @@ def feature_plan_node(state: AgentState) -> AgentState:
     tables_summary = _build_db_summary(db_intelligence)
 
     model_name = os.getenv("LLM_MODEL_NAME", "gpt-4o")
-    llm = ChatOpenAI(model=model_name, temperature=0)
+    llm = get_llm(model_name=model_name, temperature=0)
     structured_llm = llm.with_structured_output(FeaturePlan)
 
     messages = [

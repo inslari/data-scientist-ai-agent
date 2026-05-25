@@ -1,23 +1,28 @@
 from __future__ import annotations
 
 import os
-import sqlite3
+import sys
 from pathlib import Path
+from typing import Literal
+
+# Add project root to sys.path so we can import src.* when running directly
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from sqlalchemy import text
+
+from src.core.db_provider import db_manager  # type: ignore[import-not-found]
 
 load_dotenv(override=True)
-
-PROJECT_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_DIR / "data" / "adult_income.db"
 
 MCP_SERVER_HOST = os.getenv("MCP_SERVER_HOST", "127.0.0.1")
 MCP_SERVER_PORT = int(os.getenv("MCP_SERVER_PORT", "9001"))
 MCP_SERVER_PATH = os.getenv("MCP_SERVER_PATH", "/mcp")
 
 mcp = FastMCP(
-    "SQLite MCP Server",
+    "Database MCP Server",
     host=MCP_SERVER_HOST,
     port=MCP_SERVER_PORT,
     streamable_http_path=MCP_SERVER_PATH,
@@ -26,21 +31,14 @@ mcp = FastMCP(
 
 @mcp.tool()
 def get_schema() -> str:
-    """Get the schema of all tables in the SQLite database. Use this to understand what columns exist."""
+    """Get the schema of all tables in the database. Use this to understand what columns exist."""
     try:
-        if not DB_PATH.exists():
-            return f"Error: Database not found at {DB_PATH}"
-
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
-        tables = cursor.fetchall()
-        conn.close()
-
-        schema_info = "Database Schema:\n"
-        for table_name, table_sql in tables:
-            schema_info += f"- Table '{table_name}': {table_sql}\n"
-        return schema_info
+        output = ""
+        for db_name, provider in db_manager.get_all_providers().items():
+            output += f"Database: '{db_name}'\n"
+            output += provider.build_full_schema_text()
+            output += "\n"
+        return output
     except Exception as e:
         return f"Error getting schema: {e}"
 
@@ -54,82 +52,85 @@ def get_column_stats() -> str:
     Use this to understand what each column actually contains before writing SQL.
     """
     try:
-        if not DB_PATH.exists():
-            return f"Error: Database not found at {DB_PATH}"
-
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [r[0] for r in cursor.fetchall()]
-
         output = "Column Statistics:\n"
+        for db_name, provider in db_manager.get_all_providers().items():
+            output += f"\n=== Database: '{db_name}' ===\n"
+            with provider.connect() as conn:
+                # Get table names
+                tables_result = conn.execute(text(provider.get_table_names_query()))
+                tables = [r[0] for r in tables_result]
 
-        for table in tables:
-            output += f"\nTable: {table}\n"
-            cursor.execute(f"PRAGMA table_info('{table}')")
-            cols = cursor.fetchall()
+                for table in tables:
+                    output += f"\nTable: {table}\n"
 
-            # Total rows 
-            cursor.execute(f'SELECT COUNT(*) FROM "{table}"')
-            total_rows = cursor.fetchone()[0]
-            output += f"  Total rows: {total_rows:,}\n"
-
-            for col in cols:
-                col_name = col[1]
-                col_type = col[2].upper() if col[2] else ""
-                is_numeric = any(t in col_type for t in
-                                 ("INT", "REAL", "FLOAT", "NUMERIC", "DOUBLE", "DECIMAL"))
-                try:
-                    # Null count
-                    cursor.execute(
-                        f'SELECT COUNT(*) FROM "{table}" WHERE "{col_name}" IS NULL'
+                    # Get column info
+                    col_result = conn.execute(
+                        text(provider.get_column_info_query(table))
                     )
-                    null_count = cursor.fetchone()[0]
-                    null_pct   = round(null_count / total_rows * 100, 1) if total_rows else 0
+                    cols = col_result.fetchall()
 
-                    if is_numeric:
-                        cursor.execute(f"""
-                            SELECT
-                                MIN("{col_name}"),
-                                MAX("{col_name}"),
-                                ROUND(AVG("{col_name}"), 4),
-                                COUNT(DISTINCT "{col_name}")
-                            FROM "{table}"
-                        """)
-                        mn, mx, avg, n_distinct = cursor.fetchone()
-                        output += (
-                            f'  "{col_name}" [numeric]: '
-                            f'min={mn}, max={mx}, avg={avg}, '
-                            f'distinct={n_distinct}, nulls={null_count} ({null_pct}%)\n'
-                        )
-                    else:
-                        # Top 10 most frequent values
-                        cursor.execute(f"""
-                            SELECT "{col_name}", COUNT(*) as cnt
-                            FROM "{table}"
-                            WHERE "{col_name}" IS NOT NULL
-                            GROUP BY "{col_name}"
-                            ORDER BY cnt DESC
-                            LIMIT 10
-                        """)
-                        top_vals = cursor.fetchall()
-                        vals_str = ", ".join(
-                            f'"{v}"({c})' for v, c in top_vals
-                        )
-                        cursor.execute(
-                            f'SELECT COUNT(DISTINCT "{col_name}") FROM "{table}"'
-                        )
-                        n_distinct = cursor.fetchone()[0]
-                        output += (
-                            f'  "{col_name}" [text]: '
-                            f'distinct={n_distinct}, nulls={null_count} ({null_pct}%), '
-                            f'top values=[{vals_str}]\n'
-                        )
-                except Exception as col_err:
-                    output += f'  "{col_name}": error — {col_err}\n'
+                    # Total rows
+                    count_result = conn.execute(
+                        text(provider.get_count_query(table))
+                    )
+                    count_row = count_result.fetchone()
+                    total_rows = count_row[0] if count_row else 0
+                    output += f"  Total rows: {total_rows:,}\n"
 
-        conn.close()
+                    for col in cols:
+                        if provider.provider == "sqlite":
+                            # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+                            col_name = col[1]
+                            col_type = col[2] or ""
+                        else:
+                            # information_schema returns: column_name, data_type, is_nullable, column_default
+                            col_name = col[0]
+                            col_type = col[1] or ""
+
+                        is_numeric = provider.is_numeric_type(col_type)
+
+                        try:
+                            # Null count
+                            null_result = conn.execute(
+                                text(provider.get_null_count_query(table, col_name))
+                            )
+                            null_row = null_result.fetchone()
+                            null_count = null_row[0] if null_row else 0
+                            null_pct = round(null_count / total_rows * 100, 1) if total_rows else 0
+
+                            if is_numeric:
+                                stats_result = conn.execute(
+                                    text(provider.get_column_stats_numeric_query(table, col_name))
+                                )
+                                stats_row = stats_result.fetchone()
+                                mn, mx, avg, n_distinct = stats_row if stats_row else (0, 0, 0, 0)
+                                output += (
+                                    f'  "{col_name}" [numeric]: '
+                                    f'min={mn}, max={mx}, avg={avg}, '
+                                    f'distinct={n_distinct}, nulls={null_count} ({null_pct}%)\n'
+                                )
+                            else:
+                                # Top 10 most frequent values
+                                top_result = conn.execute(
+                                    text(provider.get_column_stats_text_top_values_query(table, col_name))
+                                )
+                                top_vals = top_result.fetchall()
+                                vals_str = ", ".join(
+                                    f'"{v}"({c})' for v, c in top_vals
+                                )
+                                distinct_result = conn.execute(
+                                    text(provider.get_distinct_count_query(table, col_name))
+                                )
+                                distinct_row = distinct_result.fetchone()
+                                n_distinct = distinct_row[0] if distinct_row else 0
+                                output += (
+                                    f'  "{col_name}" [text]: '
+                                    f'distinct={n_distinct}, nulls={null_count} ({null_pct}%), '
+                                    f'top values=[{vals_str}]\n'
+                                )
+                        except Exception as col_err:
+                            output += f'  "{col_name}": error — {col_err}\n'
+
         return output
 
     except Exception as e:
@@ -137,28 +138,30 @@ def get_column_stats() -> str:
 
 
 @mcp.tool()
-def run_sql_query(query: str) -> str:
-    """Execute a SELECT query on the SQLite database and return the results. Only SELECT queries are allowed."""
+def run_sql_query(query: str, db_name: str = "default") -> str:
+    """Execute a SELECT query on the specified database and return the results. Only SELECT queries are allowed."""
     try:
         if not query.strip().upper().startswith("SELECT"):
             return "Error: Only SELECT queries are allowed."
 
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(query)
-        results = cursor.fetchall()
+        try:
+            provider = db_manager.get_provider(db_name)
+        except ValueError as e:
+            return f"Error: {e}"
 
-        column_names = [description[0] for description in cursor.description]
-        conn.close()
+        with provider.connect() as conn:
+            result = conn.execute(text(query))
+            rows = result.fetchall()
+            column_names = list(result.keys())
 
         output = f"Columns: {', '.join(column_names)}\n"
-        output += f"Returned {len(results)} rows.\nResults:\n"
+        output += f"Returned {len(rows)} rows.\nResults:\n"
 
         MAX_DISPLAY_ROWS = 10_000
-        for row in results[:MAX_DISPLAY_ROWS]:
-            output += str(row) + "\n"
+        for row in rows[:MAX_DISPLAY_ROWS]:
+            output += str(tuple(row)) + "\n"
 
-        if len(results) > MAX_DISPLAY_ROWS:
+        if len(rows) > MAX_DISPLAY_ROWS:
             output += f"... (Showing only first {MAX_DISPLAY_ROWS} rows)"
 
         return output
@@ -166,9 +169,14 @@ def run_sql_query(query: str) -> str:
         return f"SQL Error: {e}"
 
 
-def start_mcp_server(transport: str = "streamable-http", **kwargs) -> None:
+def start_mcp_server(transport: Literal["sse", "stdio", "streamable-http"] = "streamable-http", **kwargs) -> None:
     """Start the MCP server with the given transport."""
+    print(f"Starting MCP Server on http://{MCP_SERVER_HOST}:{MCP_SERVER_PORT}{MCP_SERVER_PATH}", flush=True)
+    db_names = list(db_manager.get_all_providers().keys())
+    print(f"Transport: {transport} | Databases: {', '.join(db_names)}", flush=True)
+    print("Press Ctrl+C to stop...", flush=True)
     mcp.run(transport=transport, **kwargs)
+
 
 
 if __name__ == "__main__":

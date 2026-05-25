@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from src.core.llm import get_llm
+from src.core.config import settings
 from pydantic import BaseModel, Field
 from typing import Optional
 from src.state import AgentState
@@ -61,7 +62,7 @@ def planner_node(state: AgentState) -> AgentState:
     """
     Node 3: Takes the database intelligence and user query as input and produces an analysis plan.
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
     structured_llm = llm.with_structured_output(AnalysisPlan)
 
     db_intelligence = state.get("db_intelligence", {})

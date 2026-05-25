@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
-from src.intelligence_engine import DatabaseIntelligenceEngine
-from src.state import AgentState
+from src.intelligence_engine import DatabaseIntelligenceEngine  # type: ignore[import-not-found]
+from src.state import AgentState  # type: ignore[import-not-found]
 
 MCP_URL = "http://127.0.0.1:9001/mcp"
 
@@ -34,29 +34,37 @@ async def db_context_node(state: AgentState) -> AgentState:
 
 
 async def _fetch_schema_and_samples() -> tuple[str, str]:
-    async with streamablehttp_client(MCP_URL) as (read, write, _):
+    async with streamable_http_client(MCP_URL) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
             result     = await session.call_tool("get_schema", {})
-            raw_schema = result.content[0].text if result.content else ""
+            raw_schema = getattr(result.content[0], "text", "") if result.content else ""
 
-            table_names = []
+            table_info = []
+            current_db = "default"
             for line in raw_schema.splitlines():
-                if line.strip().startswith("- Table '"):
+                if line.strip().startswith("Database: '"):
                     try:
-                        table_names.append(line.split("'")[1])
+                        current_db = line.split("'")[1]
+                    except IndexError:
+                        continue
+                elif line.strip().startswith("- Table '"):
+                    try:
+                        table_name = line.split("'")[1]
+                        table_info.append((current_db, table_name))
                     except IndexError:
                         continue
 
             sample_parts = []
-            for table in table_names[:5]:
+            for db_name, table in table_info[:5]:
                 try:
                     r = await session.call_tool(
                         "run_sql_query",
-                        {"query": f'SELECT * FROM "{table}" LIMIT 3'}
+                        {"query": f'SELECT * FROM "{table}" LIMIT 3', "db_name": db_name}
                     )
-                    sample_parts.append(f"Table: {table}\n{r.content[0].text}")
+                    r_text = getattr(r.content[0], "text", "") if r.content else ""
+                    sample_parts.append(f"Database: {db_name} | Table: {table}\n{r_text}")
                 except Exception:
                     pass
 
