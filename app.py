@@ -24,9 +24,9 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from src.graph import build_graph
-from src.state import AgentState
-from src.history_tracker import get_experiments
+from src.graph import build_graph # type: ignore[import-not-found]
+from src.state import AgentState # type: ignore[import-not-found]
+from src.history_tracker import get_experiments # type: ignore[import-not-found]
 
 # Page config
 st.set_page_config(
@@ -315,7 +315,7 @@ def show_loading():
         nodes = [
             ("01", "Intent Analyzer",  "Classifying as SQL query..."),
             ("02", "SQL Generator",    "Writing SELECT query with GPT-4o..."),
-            ("03", "MCP Executor",     "Running query on SQLite database..."),
+            ("03", "MCP Executor",     "Running query on database..."),
             ("04", "Chart Planner",    "Deciding best visualization type..."),
         ]
     else:

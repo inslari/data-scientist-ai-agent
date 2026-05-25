@@ -7,17 +7,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from mcp.client.streamable_http import streamable_http_client
+from mcp.client.session import ClientSession
 
 from src.state import AgentState
 from src.core.config import settings
-
-MCP_CONFIG = {
-    "sqlite": {
-        "url": settings.MCP_SERVER_URL,
-        "transport": "streamable_http",
-    }
-}
 
 MAX_ROWS = 10_000
 
@@ -76,10 +70,13 @@ def _build_merge_order(
         if not remaining:
             break
         for rel in relationships:
-            src = rel.get("source_table")
-            tgt = rel.get("target_table")
-            src_col = rel.get("source_column")
-            tgt_col = rel.get("target_column")
+            src = str(rel.get("source_table", ""))
+            tgt = str(rel.get("target_table", ""))
+            src_col = str(rel.get("source_column", ""))
+            tgt_col = str(rel.get("target_column", ""))
+
+            if not (src and tgt and src_col and tgt_col):
+                continue
 
             if src in merged and tgt in remaining:
                 ops.append({"left": src, "right": tgt,
@@ -192,33 +189,31 @@ def _infer_and_cast_dtypes(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # MCP async caller — tables are fetched in parallel
-async def _fetch_all_tables(table_names: list[str]) -> dict[str, str]:
-    client = MultiServerMCPClient(MCP_CONFIG)
-    tools = await client.get_tools()
-    tool_map = {t.name: t for t in tools}
+async def _fetch_all_tables(table_to_db: dict[str, str]) -> dict[str, str]:
+    MCP_URL = settings.MCP_SERVER_URL
+    async with streamable_http_client(MCP_URL) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
 
-    if "run_sql_query" not in tool_map:
-        raise RuntimeError("MCP'de 'run_sql_query' tool bulunamadı.")
+            async def fetch_one(table: str, db_name: str) -> tuple[str, str]:
+                query = f'SELECT * FROM "{table}" LIMIT {MAX_ROWS}'
+                result = await session.call_tool("run_sql_query", {"query": query, "db_name": db_name})
+                if getattr(result, "content", None):
+                    for item in result.content:
+                        if getattr(item, "type", "") == "text":
+                            return table, getattr(item, "text", "")
+                return table, str(result)
 
-    async def fetch_one(table: str) -> tuple[str, str]:
-        query = f"SELECT * FROM {table} LIMIT {MAX_ROWS}"
-        result = await tool_map["run_sql_query"].ainvoke({"query": query})
-        if isinstance(result, list):
-            for item in result:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    return table, item["text"]
-            return table, str(result)
-        return table, result if isinstance(result, str) else str(result)
+            results = await asyncio.gather(*[fetch_one(t, db) for t, db in table_to_db.items()],
+                                           return_exceptions=True)
 
-    results = await asyncio.gather(*[fetch_one(t) for t in table_names],
-                                   return_exceptions=True)
-
-    output: dict[str, str] = {}
-    for res in results:
-        if isinstance(res, Exception):
-            raise res
-        table, raw = res
-        output[table] = raw
+            output: dict[str, str] = {}
+            for res in results:
+                if isinstance(res, BaseException):
+                    raise res
+                table, raw = res
+                output[table] = raw
+            return output
 
     return output
 
@@ -267,9 +262,9 @@ def _profile_dataframe(df: pd.DataFrame) -> dict:
     if df.empty:
         return {"error": "Boş DataFrame, profiling yapılamadı."}
 
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
-    datetime_cols = df.select_dtypes(include=["datetime64"]).columns.tolist()
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()  # type: ignore[arg-type]
+    datetime_cols = df.select_dtypes(include="datetime").columns.tolist()
 
     profile: dict[str, Any] = {
         "shape": {"rows": len(df), "columns": len(df.columns)},
@@ -528,11 +523,23 @@ def execution_node(state: AgentState) -> AgentState:
                 all_tables = _resolve_all_related_tables(
                     selected_tables, relationships, all_known_tables
                 )
+                
+                # Extract db_name for each table
+                tables_info = db_intelligence.get("tables", [])
+                table_to_db = {}
+                for t in all_tables:
+                    db_name = "default"
+                    for t_info in tables_info:
+                        if t_info.get("table_name") == t:
+                            db_name = t_info.get("db_name", "default")
+                            break
+                    table_to_db[t] = db_name
+
                 print(f"[execution_node] Planner seçti  : {selected_tables}")
                 print(f"[execution_node] Graph traverse  : {all_tables}")
 
                 # Parallel table fetch
-                raw_results = asyncio.run(_fetch_all_tables(all_tables))
+                raw_results = asyncio.run(_fetch_all_tables(table_to_db))
 
                 # Parse → DataFrame
                 dfs: dict[str, pd.DataFrame] = {}
@@ -546,7 +553,7 @@ def execution_node(state: AgentState) -> AgentState:
                 df = _merge_all_dataframes(dfs, merge_ops, anchor)
 
                 print(f"[execution_node] Final: {len(df)} satır x {len(df.columns)} kolon")
-                sql_results = df.where(pd.notnull(df), None).to_dict(orient="records")
+                sql_results = df.where(pd.notnull(df), None).to_dict(orient="records")  # type: ignore[arg-type]
 
             except Exception as e:
                 return {**state, "error": f"SQL hatası: {str(e)}",

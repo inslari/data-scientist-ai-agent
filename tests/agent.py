@@ -9,18 +9,19 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')  # type: ignore[union-attr]
 load_dotenv()
 
 MCP_CONFIG = {
-    "sqlite": {
+    "database": {
         "url": "http://127.0.0.1:9001/mcp",
         "transport": "streamable_http",
     }
 }
 
 async def run_agent(user_input: str):
-    client = MultiServerMCPClient(MCP_CONFIG)
+    client = MultiServerMCPClient(MCP_CONFIG)  # type: ignore[arg-type]
     tools = await client.get_tools()
 
     model_name = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")

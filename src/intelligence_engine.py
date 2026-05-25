@@ -14,6 +14,7 @@ load_dotenv(override=True)
 # Pydantic Models for Structured Output     
 
 class TableUnderstanding(BaseModel):
+    db_name: str = Field(description="The name of the database this table belongs to (from Database: 'X' tags in the schema)", default="default")
     table_name: str
     inferred_entity: str
     description: str
@@ -21,6 +22,7 @@ class TableUnderstanding(BaseModel):
     analytics_potential_score: float = Field(description="Score between 0-1 based on relationships, metrics, time columns")
 
 class ColumnProfile(BaseModel):
+    db_name: str = Field(description="The name of the database this column's table belongs to", default="default")
     table_name: str
     column_name: str
     data_type: str
@@ -122,7 +124,7 @@ If uncertain:
 Build a structured "Database Intelligence Model" with the following considerations:
 
 ## 1. TABLE UNDERSTANDING
-Identify real-world entity, estimate business meaning.
+Identify real-world entity, estimate business meaning, and carefully extract the `db_name` from the "Database: 'X'" tags in the schema text.
 
 ## 2. COLUMN PROFILING
 Infer:
