@@ -7,7 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
+from src.core.llm import get_llm
+from src.core.config import settings
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel, Field
@@ -300,7 +301,7 @@ def sql_node(state: AgentState) -> AgentState:
       4. LLM ile chart konfigürasyonu belirler
       5. State'e yazar
     """
-    llm        = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm        = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
     user_query = state["user_query"]
 
     # db_intelligence taken from db_context_node
@@ -318,7 +319,7 @@ def sql_node(state: AgentState) -> AgentState:
             "db_providers":    db_providers_info,
         })
         sql                  = sql_result.sql.strip()
-        target_db_name       = sql_result.db_name.strip()
+        target_db_name       = str(sql_result.db_name).strip().strip('",\'”’ \t\n')
         data_warning         = sql_result.data_warning or ""
         is_approximation     = sql_result.is_approximation
         approximation_warning = sql_result.approximation_warning or ""

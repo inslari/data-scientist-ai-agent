@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field
 
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
+from src.core.llm import get_llm
+from src.core.config import settings
 from langchain_core.output_parsers import PydanticOutputParser
 
 load_dotenv(override=True)
@@ -65,7 +66,7 @@ class DatabaseIntelligenceEngine:
         Defaults to ChatOpenAI with gpt-4o if no LLM is provided.
         """
         if llm is None:
-            self.llm = ChatOpenAI(model="gpt-4o", temperature=0)
+            self.llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
         else:
             self.llm = llm
 
@@ -178,20 +179,20 @@ Build a graph representation:
 # OUTPUT FORMAT
 {format_instructions}
 """
-        parser = PydanticOutputParser(pydantic_object=DatabaseIntelligenceModel)
+        structured_llm = self.llm.with_structured_output(DatabaseIntelligenceModel)
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
             ("human", "Please analyze the provided schema and return the structured JSON.")
         ])
         
-        chain = prompt | self.llm | parser
+        chain = prompt | structured_llm
         
         response = chain.invoke({
             "schema_text": schema_text or "No schema provided.",
             "sample_data": sample_data or "No sample data provided.",
             "foreign_keys": foreign_keys or "No explicit foreign keys provided.",
-            "format_instructions": parser.get_format_instructions()
+            "format_instructions": "Return a structured JSON object according to the schema."
         })
         
         return response

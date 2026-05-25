@@ -212,6 +212,30 @@ AXIS_STYLE = dict(
 COLORS = ["#6c63ff", "#ff6584", "#43e97b", "#f7971e", "#38b2f4", "#f093fb"]
 
 
+# DB Status
+@st.cache_data(ttl=60)
+def check_db_status():
+    try:
+        from src.core.db_provider import db_manager
+        from sqlalchemy import text
+        stats = []
+        for db_name, provider in db_manager.get_all_providers().items():
+            try:
+                with provider.connect() as conn:
+                    tables_result = conn.execute(text(provider.get_table_names_query()))
+                    tables = [r[0] for r in tables_result]
+                    total_rows = 0
+                    for table in tables:
+                        count_result = conn.execute(text(provider.get_count_query(table)))
+                        count_row = count_result.fetchone()
+                        total_rows += count_row[0] if count_row else 0
+                    stats.append({"db": db_name, "tables": len(tables), "rows": total_rows, "status": "ok"})
+            except Exception as e:
+                stats.append({"db": db_name, "status": "error", "error": str(e)})
+        return stats
+    except Exception as e:
+        return [{"db": "System", "status": "error", "error": str(e)}]
+
 # SIDEBAR
 
 with st.sidebar:
@@ -237,6 +261,22 @@ with st.sidebar:
             st.session_state.theme = "light" if is_dark else "dark"
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
+
+    db_stats = check_db_status()
+    st.markdown(f"<p style='font-family: DM Mono; font-size: 0.72rem; color: {'#8888aa' if is_dark else '#5a5a7a'}; letter-spacing: 0.08em; margin-bottom: 0.5rem;'>DATABASE STATUS</p>", unsafe_allow_html=True)
+    for stat in db_stats:
+        if stat["status"] == "ok":
+            st.markdown(f"""
+            <div style="background: rgba(67,233,123,0.06); border: 1px solid rgba(67,233,123,0.15); border-radius: 8px; padding: 0.6rem 0.8rem; margin-bottom: 0.5rem;">
+                <div style="color: #43e97b; font-size: 0.7rem; font-family: DM Mono;">✓ {stat['db'].upper()} · {stat['tables']} tables, {stat['rows']:,} rows</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="background: rgba(255,101,132,0.07); border: 1px solid rgba(255,101,132,0.3); border-radius: 8px; padding: 0.6rem 0.8rem; margin-bottom: 0.5rem;">
+                <div style="color: #ff6584; font-size: 0.7rem; font-family: DM Mono;">⚠ {stat['db'].upper()} · Connection Error</div>
+            </div>
+            """, unsafe_allow_html=True)
 
     st.markdown(f"""
     <hr style="border-color: {'rgba(255,255,255,0.06)' if is_dark else 'rgba(0,0,0,0.07)'}; margin-bottom: 1.5rem;">

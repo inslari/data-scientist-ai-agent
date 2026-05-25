@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
+from src.core.llm import get_llm
+from src.core.config import settings
 from pydantic import BaseModel, Field
 
 from src.state import AgentState
@@ -64,7 +65,7 @@ def intent_node(state: AgentState) -> AgentState:
     """
     Node 1: Kullanıcının sorgusunu analiz edip intent'i belirler.
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
     structured_llm = llm.with_structured_output(IntentResult)
 
     chain = INTENT_PROMPT | structured_llm

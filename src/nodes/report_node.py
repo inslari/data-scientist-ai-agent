@@ -28,22 +28,20 @@ import os
 from datetime import datetime
 from typing import Any
 
-from langchain_openai import ChatOpenAI
+from src.core.llm import get_llm
 from langchain_core.messages import HumanMessage, SystemMessage
-
+from src.core.config import settings
 from src.state import AgentState
 
 
 # LLM Setup
 
-def _get_llm() -> ChatOpenAI:
+def _get_llm():
     from dotenv import load_dotenv
     load_dotenv()
     
-    return ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.3
-    )
+    
+    return get_llm(model_name=settings.DEFAULT_LLM_MODEL, temperature=0.3)
 
 
 # Context Builder
@@ -508,6 +506,10 @@ def report_node(state: AgentState) -> AgentState:
             HumanMessage(content=prompt),
         ])
         report_text = response.content
+        if isinstance(report_text, list):
+            report_text = "".join([str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in report_text])
+        elif not isinstance(report_text, str):
+            report_text = str(report_text)
 
         # create header note with model name and date 
         timestamp = datetime.now().strftime("%d.%m.%Y %H:%M")

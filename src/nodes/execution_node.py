@@ -472,7 +472,7 @@ def _generate_recommendations(profile: dict) -> list[str]:
 
 
 # Main node
-def execution_node(state: AgentState) -> AgentState:
+async def execution_node(state: AgentState) -> AgentState:
     """
     Executes the analysis plan created by the planner.
 
@@ -531,7 +531,7 @@ def execution_node(state: AgentState) -> AgentState:
                     db_name = "default"
                     for t_info in tables_info:
                         if t_info.get("table_name") == t:
-                            db_name = t_info.get("db_name", "default")
+                            db_name = str(t_info.get("db_name", "default")).strip().strip('",\'”’ \t\n')
                             break
                     table_to_db[t] = db_name
 
@@ -539,7 +539,7 @@ def execution_node(state: AgentState) -> AgentState:
                 print(f"[execution_node] Graph traverse  : {all_tables}")
 
                 # Parallel table fetch
-                raw_results = asyncio.run(_fetch_all_tables(table_to_db))
+                raw_results = await _fetch_all_tables(table_to_db)
 
                 # Parse → DataFrame
                 dfs: dict[str, pd.DataFrame] = {}
