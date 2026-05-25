@@ -9,13 +9,11 @@ from typing import Any
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from pydantic import BaseModel, Field
 
-import nest_asyncio
-nest_asyncio.apply()
-
-from src.state import AgentState
+from ..state import AgentState
+from ..core.db_provider import db_manager
 
 # ---------------------------------------------------------------------------
 # MCP bağlantı ayarları
@@ -32,6 +30,7 @@ MCP_URL  = f"http://{MCP_HOST}:{MCP_PORT}{MCP_PATH}"
 
 class SQLGenerationResult(BaseModel):
     sql: str = Field(description="Çalıştırılacak SELECT sorgusu")
+    db_name: str = Field(description="Sorgunun çalıştırılacağı veritabanı adı")
     reasoning: str = Field(description="Sorgunun neden bu şekilde yazıldığını açıklayan tek cümle (Türkçe)")
     data_warning: str = Field(
         default="",
@@ -64,7 +63,8 @@ class ChartConfig(BaseModel):
 SQL_GEN_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """Sen bir SQLite uzmanısın. Kullanıcının sorusunu anlayıp ona uygun bir SELECT sorgusu üreteceksin.
+        """Sen bir SQL veritabanı uzmanısın. Kullanılabilir veritabanları: {db_providers}.
+Kullanıcının sorusunu anlayıp ona uygun bir SELECT sorgusu ve bu sorgunun çalıştırılacağı veritabanı adını (db_name) üreteceksin.
 
 Aşağıda veritabanının ham şeması ve her kolon için semantik profil bilgisi verilmiştir.
 
@@ -194,12 +194,12 @@ def _build_column_profiles(db_intelligence: dict) -> str:
 
 # Async MCP yardımcıları
 
-async def _async_run_query(sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
-    async with streamablehttp_client(MCP_URL) as (read, write, _):
+async def _async_run_query(sql: str, db_name: str) -> tuple[list[str], list[tuple[Any, ...]]]:
+    async with streamable_http_client(MCP_URL) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            result = await session.call_tool("run_sql_query", {"query": sql})
-            raw_text = result.content[0].text if result.content else ""
+            result = await session.call_tool("run_sql_query", {"query": sql, "db_name": db_name})
+            raw_text = getattr(result.content[0], "text", "") if result.content else ""
 
     lines   = raw_text.strip().splitlines()
     columns: list[str]              = []
@@ -236,8 +236,8 @@ def _run_async(coro):
         return asyncio.run(coro)
 
 
-def _mcp_run_query(sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
-    return _run_async(_async_run_query(sql))
+def _mcp_run_query(sql: str, db_name: str) -> tuple[list[str], list[tuple[Any, ...]]]:
+    return _run_async(_async_run_query(sql, db_name))
 
 
 # Chart payload
@@ -308,15 +308,17 @@ def sql_node(state: AgentState) -> AgentState:
     raw_schema       = state.get("raw_schema", "Schema not available.")
     column_profiles  = _build_column_profiles(db_intelligence)
 
-    # Generate SQL query
     try:
+        db_providers_info = ", ".join([f"{k} ({v.provider_display_name})" for k, v in db_manager.get_all_providers().items()])
         sql_chain  = SQL_GEN_PROMPT | llm.with_structured_output(SQLGenerationResult)
-        sql_result: SQLGenerationResult = sql_chain.invoke({
+        sql_result: SQLGenerationResult = sql_chain.invoke({  # type: ignore[assignment]
             "schema":          raw_schema,
             "column_profiles": column_profiles,
             "user_query":      user_query,
+            "db_providers":    db_providers_info,
         })
         sql                  = sql_result.sql.strip()
+        target_db_name       = sql_result.db_name.strip()
         data_warning         = sql_result.data_warning or ""
         is_approximation     = sql_result.is_approximation
         approximation_warning = sql_result.approximation_warning or ""
@@ -341,7 +343,7 @@ def sql_node(state: AgentState) -> AgentState:
         }
     # 4. Execute the query
     try:
-        columns, rows = _mcp_run_query(sql)
+        columns, rows = _mcp_run_query(sql, target_db_name)
     except Exception as e:
         return {**state, "error": f"SQL çalıştırma hatası: {e}", "current_step": "sql_node"}
 
@@ -363,7 +365,7 @@ def sql_node(state: AgentState) -> AgentState:
     sample_rows = rows[:5]
     try:
         chart_chain = CHART_CFG_PROMPT | llm.with_structured_output(ChartConfig)
-        chart_cfg: ChartConfig = chart_chain.invoke({
+        chart_cfg: ChartConfig = chart_chain.invoke({  # type: ignore[assignment]
             "columns":     ", ".join(columns),
             "sample_rows": json.dumps([list(r) for r in sample_rows], ensure_ascii=False),
             "user_query":  user_query,

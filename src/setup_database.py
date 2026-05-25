@@ -1,6 +1,7 @@
 """
-Dataset to SQLite Loader
-Downloads a specified Kaggle dataset and loads it into a SQLite database.
+Dataset to Database Loader
+Downloads a specified Kaggle dataset and loads it into the configured database.
+Supports SQLite, PostgreSQL, MySQL, and SQL Server via SQLAlchemy.
 
 Usage:
     uv run python src/setup_database.py <kaggle_path>
@@ -10,11 +11,17 @@ Usage:
 from __future__ import annotations
 
 import sys
-import sqlite3
 import re
 from pathlib import Path
 
+# Add project root to sys.path so we can import src.* when running directly
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import pandas as pd
+from sqlalchemy import text, inspect
+
+from core.db_provider import db_manager
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_DIR / "data"
@@ -50,16 +57,16 @@ def download_dataset(kaggle_path: str) -> tuple[pd.DataFrame, str]:
     return df, table_name
 
 def clean_dataset(df: pd.DataFrame, table_name: str) -> pd.DataFrame:
-    """Cleans dataset and prepares it for SQLite."""
+    """Cleans dataset and prepares it for database loading."""
     
     # Clean column names
     df.columns = [str(c).strip().lower().replace("-", "_").replace(" ", "_") for c in df.columns]
 
-    # Convert common missing value indicators to None (NULL in SQLite)
+    # Convert common missing value indicators to None (NULL in database)
     df = df.replace(["?", " ?", "NA", "N/A", "null", ""], None)
 
     # Strip whitespace from string columns
-    str_cols = df.select_dtypes(include=["object"]).columns
+    str_cols = df.select_dtypes(include="object").columns
     for col in str_cols:
         df[col] = df[col].str.strip() if df[col].dtype == object else df[col]
 
@@ -73,41 +80,42 @@ def clean_dataset(df: pd.DataFrame, table_name: str) -> pd.DataFrame:
     return df
 
 
-def load_to_sqlite(df: pd.DataFrame, table_name: str) -> Path:
-    """Loads DataFrame into SQLite."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    
-    db_path = DATA_DIR / f"{table_name}.db"
-    conn = sqlite3.connect(db_path)
+def load_to_database(df: pd.DataFrame, table_name: str, provider) -> None:
+    """Loads DataFrame into the configured database using SQLAlchemy."""
+    engine = provider.engine
 
-    # Create or overwrite table
-    df.to_sql(table_name, conn, if_exists="replace", index=False)
-    print(f"\nLoaded to SQLite: {db_path}")
+    # For SQLite, ensure data directory exists
+    if provider.provider == "sqlite":
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # pandas to_sql works with SQLAlchemy engines for all providers
+    df.to_sql(table_name, engine, if_exists="replace", index=False)
+    print(f"\nLoaded to {provider.provider_display_name}: {table_name}")
     print(f"Table: {table_name} | {len(df)} rows")
 
-    cursor = conn.cursor()
-    cursor.execute(f"SELECT sql FROM sqlite_master WHERE name='{table_name}'")
-    schema = cursor.fetchone()
-    if schema:
-        print(f"\nSchema:\n{schema[0]}")
+    # Show schema info
+    try:
+        inspector = inspect(engine)
+        columns = inspector.get_columns(table_name)
+        col_defs = ", ".join(f"{c['name']} {c['type']}" for c in columns)
+        print(f"\nSchema:\nCREATE TABLE {table_name} ({col_defs})")
+    except Exception as e:
+        print(f"\nSchema bilgisi alınamadı: {e}")
 
-    conn.close()
-    return db_path
 
-
-def verify(db_path: Path, table_name: str) -> None:
+def verify(table_name: str, provider) -> None:
     """Verifies the database load."""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+    with provider.connect() as conn:
+        count_result = conn.execute(
+            text(provider.get_count_query(table_name))
+        )
+        count = count_result.fetchone()[0]
 
-    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-    count = cursor.fetchone()[0]
-
-    cursor.execute(f"SELECT * FROM {table_name} LIMIT 3")
-    rows = cursor.fetchall()
-    cols = [d[0] for d in cursor.description]
-
-    conn.close()
+        sample_result = conn.execute(
+            text(provider.get_limit_query(table_name, 3))
+        )
+        cols = list(sample_result.keys())
+        rows = sample_result.fetchall()
 
     print(f"\nVerification: {count} rows loaded")
     print("First 3 rows:")
@@ -116,22 +124,29 @@ def verify(db_path: Path, table_name: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Error: Kaggle dataset path not provided!")
-        print("Usage: uv run python src/setup_database.py <kaggle_path>")
-        print("Example: uv run python src/setup_database.py uciml/adult-census-income")
+    import argparse
+    parser = argparse.ArgumentParser(description="Dataset to Database Loader")
+    parser.add_argument("kaggle_path", help="Kaggle dataset path (e.g. uciml/adult-census-income)")
+    parser.add_argument("--db", type=str, default="default", help="Target database name (default: 'default')")
+    args = parser.parse_args()
+
+    kaggle_path = args.kaggle_path
+    db_name = args.db
+    
+    try:
+        provider = db_manager.get_provider(db_name)
+    except ValueError as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
-    kaggle_path = sys.argv[1]
-    
     print(f"=== Dataset Setup: {kaggle_path} ===\n")
+    print(f"Database Provider: {provider.provider_display_name} ({db_name})")
 
     df, table_name = download_dataset(kaggle_path)
     df = clean_dataset(df, table_name)
-    db_path = load_to_sqlite(df, table_name)
-    verify(db_path, table_name)
+    load_to_database(df, table_name, provider)
+    verify(table_name, provider)
 
     print(f"\n✓ Done!")
-    print(f"  DB_PATH = {db_path}")
-    print(f"\nUpdate mcp_server.py with the following to connect to this database:")
-    print(f'  DB_PATH = PROJECT_DIR / "data" / "{table_name}.db"')
+    print(f"  Provider: {provider.provider_display_name} ({db_name})")
+    print(f"  Table   : {table_name}")

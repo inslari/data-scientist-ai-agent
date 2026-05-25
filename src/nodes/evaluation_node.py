@@ -48,8 +48,8 @@ from sklearn.metrics import (
 )
 from sklearn.calibration import calibration_curve
 
-from src.state import AgentState
-from src.history_tracker import log_experiment
+from ..state import AgentState
+from ..history_tracker import log_experiment
 
 warnings.filterwarnings("ignore")
 
@@ -149,16 +149,17 @@ def _evaluate_classification(
     try:
         report = classification_report(y_test, y_pred_test, output_dict=True, zero_division=0)
         per_class = {}
-        for key, vals in report.items():
-            if key in ("accuracy", "macro avg", "weighted avg"):
-                continue
-            if isinstance(vals, dict):
-                per_class[key] = {
-                    "precision": round(vals.get("precision", 0), 4),
-                    "recall": round(vals.get("recall", 0), 4),
-                    "f1": round(vals.get("f1-score", 0), 4),
-                    "support": int(vals.get("support", 0)),
-                }
+        if isinstance(report, dict):
+            for key, vals in report.items():
+                if key in ("accuracy", "macro avg", "weighted avg"):
+                    continue
+                if isinstance(vals, dict):
+                    per_class[key] = {
+                        "precision": round(vals.get("precision", 0), 4),
+                        "recall": round(vals.get("recall", 0), 4),
+                        "f1": round(vals.get("f1-score", 0), 4),
+                        "support": int(vals.get("support", 0)),
+                    }
         evaluation["per_class_metrics"] = per_class
     except Exception:
         pass
@@ -292,7 +293,7 @@ def _evaluate_regression(
         "median_residual": round(float(np.median(residuals)), 4),
         "max_overpredict": round(float(np.min(residuals)), 4),
         "max_underpredict": round(float(np.max(residuals)), 4),
-        "residual_skewness": round(float(pd.Series(residuals).skew()), 4),
+        "residual_skewness": round(float(pd.Series(residuals).skew()), 4),  # type: ignore[arg-type]
     }
 
     # Feature importance
@@ -330,12 +331,8 @@ def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def _analyze_overfitting(train_metrics: dict, test_metrics: dict) -> dict:
     """Train vs test metrik farkını analiz eder."""
     # Ana metrik: roc_auc varsa onu kullan, yoksa accuracy
-    train_score = train_metrics.get("roc_auc",
-                  train_metrics.get("roc_auc_ovr",
-                  train_metrics.get("accuracy", 0)))
-    test_score = test_metrics.get("roc_auc",
-                 test_metrics.get("roc_auc_ovr",
-                 test_metrics.get("accuracy", 0)))
+    train_score = train_metrics.get("roc_auc") or train_metrics.get("roc_auc_ovr") or train_metrics.get("accuracy") or 0.0
+    test_score = test_metrics.get("roc_auc") or test_metrics.get("roc_auc_ovr") or test_metrics.get("accuracy") or 0.0
 
     gap = round(float(train_score - test_score), 4)
     status = "normal"
@@ -466,7 +463,7 @@ def _bootstrap_ci_classification(
 
     for _ in range(n_iterations):
         idx = rng.integers(0, n, size=n)
-        X_b = X_test.iloc[idx]
+        X_b = X_test.iloc[idx]  # type: ignore[call-overload]
         y_b = y_test[idx]
         if len(np.unique(y_b)) < 2:
             continue
@@ -516,7 +513,7 @@ def _bootstrap_ci_regression(
 
     for _ in range(n_iterations):
         idx = rng.integers(0, n, size=n)
-        X_b = X_test.iloc[idx]
+        X_b = X_test.iloc[idx]  # type: ignore[call-overload]
         y_b = y_test[idx]
         try:
             y_pred_b = model.predict(X_b)
@@ -567,7 +564,7 @@ def _compute_shap_values(
             shap_values = explainer.shap_values(X_sample)
         else:
             explainer = shap.Explainer(est, X_sample)
-            shap_values = explainer(X_sample).values
+            shap_values = explainer(X_sample).values  # type: ignore[attr-defined]
 
         if isinstance(shap_values, list):
             arr = np.abs(np.array(shap_values)).mean(axis=0)
@@ -675,7 +672,7 @@ def _analyze_errors(
     X_errors = X_test[errors]
     X_correct = X_test[~errors]
     feature_diff = {}
-    numeric_cols = X_test.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = X_test.select_dtypes(include="number").columns.tolist()
     for col in numeric_cols[:15]:
         mean_err = float(X_errors[col].mean())
         mean_cor = float(X_correct[col].mean())
@@ -735,7 +732,7 @@ def _analyze_bias(y_true: np.ndarray, y_pred: np.ndarray, X_test: pd.DataFrame, 
         col_bias = {}
         for col in related_cols:
             if X_test[col].nunique() == 2:
-                mask_1 = X_test[col] > 0.5
+                mask_1 = (X_test[col] > 0.5).to_numpy()
                 mask_0 = ~mask_1
                 
                 if mask_1.sum() < 5 or mask_0.sum() < 5:
@@ -1188,13 +1185,13 @@ def evaluation_node(state: AgentState) -> AgentState:
             target_name=feature_report.get("target_name", "unknown"),
             dataset_shape=f"Train: {X_train.shape}, Test: {X_test.shape}"
         )
-        print("[evaluation] Deney başarıyla SQLite audit_trail'e loglandı.")
+        print("[evaluation] Deney başarıyla veritabanına loglandı.")
     except Exception as e:
         print(f"[evaluation] Deney loglanırken hata: {e}")
 
     return {
         **state,
         "evaluation_report": evaluation_report,
-        "optimal_threshold": evaluation_report.get("optimal_threshold"),
+        "optimal_threshold": float(evaluation_report.get("optimal_threshold") or 0.5),
         "current_step": "evaluation_node",
     }
