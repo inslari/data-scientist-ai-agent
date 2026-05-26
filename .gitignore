@@ -17,6 +17,7 @@ __pycache__/
 # Database
 *.sqlite
 *.sqlite3
+*.db
 
 # OS Generated Files
 .DS_Store
