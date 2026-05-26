@@ -35,6 +35,9 @@ def download_dataset(kaggle_path: str) -> tuple[pd.DataFrame, str]:
         subprocess.run(["uv", "add", "kagglehub"], check=True)
         import kagglehub
 
+    if "kaggle.com/datasets/" in kaggle_path:
+        kaggle_path = kaggle_path.split("kaggle.com/datasets/")[-1].strip("/")
+
     print(f"Downloading from Kaggle: {kaggle_path} ...")
     path = kagglehub.dataset_download(kaggle_path)
     print(f"Downloaded to: {path}")

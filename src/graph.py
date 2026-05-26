@@ -37,7 +37,9 @@ def route_after_execution(state: AgentState) -> str:
     intent = state.get("intent", "eda")
     if intent in ("classification", "regression", "clustering"):
         return "feature_plan_node"
-    return "automl_node"
+    if intent == "anomaly_detection":
+        return "automl_node"
+    return "report_node"
 
 
 def route_after_critic(state: AgentState) -> str:
@@ -110,6 +112,7 @@ def build_graph() -> StateGraph:
         {
             "feature_plan_node": "feature_plan_node",
             "automl_node":       "automl_node",
+            "report_node":       "report_node",
         },
     )
 

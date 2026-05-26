@@ -12,14 +12,19 @@ MCP_URL = "http://127.0.0.1:9001/mcp"
 async def db_context_node(state: AgentState) -> AgentState:
     """Async node — LangGraph ainvoke ile uyumlu."""
     
+    print(">>> db_context_node başladı!")
     # Fetch schema + sample data
+    print(">>> MCP'den şema ve örnek veri çekiliyor...")
     raw_schema, sample_data = await _fetch_schema_and_samples()
+    print(">>> Şema başarıyla çekildi. Uzunluk:", len(raw_schema))
 
     engine   = DatabaseIntelligenceEngine()
+    print(">>> DatabaseIntelligenceEngine başlatıldı. Şema analizi için LLM'e (Ollama) istek atılıyor (Bu işlem uzun sürebilir)...")
     db_model = engine.analyze_schema(
         schema_text=raw_schema,
         sample_data=sample_data,
     )
+    print(">>> LLM analizi başarıyla tamamlandı!")
 
     intent          = state.get("intent", "eda")
     relevant_tables = _filter_tables_by_intent(db_model, intent)

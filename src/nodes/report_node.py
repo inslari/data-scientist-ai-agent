@@ -280,9 +280,10 @@ Write the report strictly using the following Markdown structure:
 
 # 📊 Analiz Raporu — [Title]
 
-## 1. Yönetici Özeti (Executive Summary)
+## 1. Yönetici Özeti ve Soruya Yanıt (Executive Summary & Direct Answer)
 Provide a 3-4 sentence summary that a non-technical stakeholder can understand.
-What problem was solved, how good is the model, and what is the key finding?
+CRITICAL INSTRUCTION: You MUST directly and explicitly answer the user's original query here! If the user asked "Why X happens?", explain the exact reasons based on the feature importance, profiling data, or bias analysis. DO NOT just give a generic model summary.
+What problem was solved, how good is the model, and what is the direct answer to the user's question?
 
 ## 2. Veri Kalitesi (Data Quality)
 - Evaluate the overall state of the dataset.
@@ -310,10 +311,10 @@ What problem was solved, how good is the model, and what is the key finding?
 - If biases are found, explain the real-world implications (e.g., "The model rejects loan applications from Group X more frequently").
 - If no bias data is present, state that it was not evaluated.
 
-## 7. En Etkili Özellikler (Most Impactful Features)
+## 7. En Etkili Özellikler ve Kullanıcı Sorusunun Kök Nedeni (Most Impactful Features & Root Cause)
 - Compare and interpret SHAP values and Feature Importance.
-- Explain the impact of each top feature on the target variable using **real-world domain knowledge**, not just mathematical impact.
-- For example, deduce logical causalities like: "Capital gain strongly impacts the model because it directly represents wealth and investment income."
+- Explain the impact of each top feature on the target variable using **real-world domain knowledge**.
+- CRITICAL: Tie these features back to the user's specific question. If the user asked "Why does group X earn less?", analyze how the top features (e.g., education, age, capital gain) might disproportionately affect or describe group X based on the context.
 - DO NOT use circular, generic, or repetitive statements like "This feature is important because it had the highest contribution score."
 
 ## 8. Operasyonel Öneriler (Operational Recommendations)
