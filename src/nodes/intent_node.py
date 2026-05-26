@@ -51,6 +51,7 @@ Kurallar:
   * "X ile Y arasındaki fark", "X'e göre ortalama", "gruba göre sayı/toplam/ortalama"
   * "erkek vs kadın", "A ile B'yi karşılaştır", "oranı nedir", "dağılımı nedir (basit)"
   * Bu tür sorgular GROUP BY / AVG / COUNT / SUM ile cevaplanabilir → sql_query
+- DİKKAT (ÇOK ÖNEMLİ): Eğer soru "Neden" (Why) ile başlıyorsa, bir şeyin KÖK NEDENİNİ (root cause) soruyorsa, arka planda neyin tetiklediğini merak ediyorsa (örn: "Neden x düşüyor?", "Neden y az kazanıyor?", "Z'yi ne etkiliyor?") KESİNLİKLE sql_query VEYA eda SEÇME! Bu tür sorular bir "hedef değişken" (target) barındırdığı için, hedef değişkenin tahminleyicilerini (predictors) bulmayı gerektirir. Bu yüzden KESİNLİKLE "classification" veya "regression" seç (hedef kategorikse classification, sayısal ise regression).
 - Eğer soru bir MODELİN EĞİTİLMESİNİ veya TAHMİN YAPILMASINI gerektiriyorsa → classification/regression
 - Yukarıdaki liste dışında intent üretme
 
