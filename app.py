@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -19,6 +21,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -195,6 +198,44 @@ hr {{ border-color: var(--border) !important; }}
 @keyframes fade-up {{
     from {{ opacity:0; transform:translateY(6px); }}
     to   {{ opacity:1; transform:translateY(0); }}
+}}
+@media print {{
+    @page {{
+        margin: 0;
+    }}
+    * {{
+        -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important;
+    }}
+    html, body, [data-testid="stAppViewContainer"], .stApp, .main, .block-container {{
+        background: var(--bg) !important;
+        color: var(--text) !important;
+        height: auto !important;
+        min-height: 100% !important;
+        overflow: visible !important;
+        display: block !important;
+        position: relative !important;
+    }}
+    .main .block-container {{
+        padding: 1.5cm 1.5cm !important;
+        max-width: 100% !important;
+    }}
+    [data-testid="stSidebar"] {{ display: none !important; }}
+    header {{ display: none !important; }}
+    .stChatInputContainer {{ display: none !important; }}
+    /* Hide the print button iframe itself */
+    iframe {{ display: none !important; }}
+    
+    /* Mesajların ortadan ikiye bölünüp beyaz boşluk yaratmasını önler */
+    [data-testid="stChatMessage"] {{
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
+    }}
+    
+    /* Gereksiz boşlukları engellemek için */
+    [data-testid="stVerticalBlock"] {{
+        gap: 0 !important;
+    }}
 }}
 </style>
 """, unsafe_allow_html=True)
@@ -518,7 +559,45 @@ def render_chat_message(msg):
             st.plotly_chart(msg["chart"], use_container_width=True)
 
 def render_chat_history():
-    for msg in st.session_state.get("chat_history", []):
+    history = st.session_state.get("chat_history", [])
+    if not history:
+        return
+        
+    col1, col2 = st.columns([8, 1])
+    with col2:
+        components.html(
+            """
+            <script>
+            function printPage() {
+                window.parent.print();
+            }
+            </script>
+            <style>
+            button {
+                background: linear-gradient(135deg, #6c63ff, #9c56d8);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0.5rem 0.2rem;
+                font-family: 'Space Grotesk', sans-serif;
+                font-weight: 600;
+                font-size: 0.8rem;
+                cursor: pointer;
+                width: 100%;
+                box-shadow: 0 4px 14px rgba(108,99,255,0.3);
+                transition: all 0.2s;
+            }
+            button:hover {
+                transform: translateY(-1px);
+                box-shadow: 0 6px 20px rgba(108,99,255,0.4);
+            }
+            </style>
+            <button onclick="printPage()">🖨️ PDF</button>
+            """,
+            height=45
+        )
+
+    for msg in history:
         render_chat_message(msg)
 
 # ── HELPERS ──────────────────────────────────────────────────

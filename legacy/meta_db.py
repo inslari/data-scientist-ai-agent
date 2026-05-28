@@ -94,8 +94,9 @@ def parse_and_save_schema(schema_text: str):
     
     # Run intelligence engine
     try:
-        print("Running Database Intelligence Engine...")
-        engine = DatabaseIntelligenceEngine()
+        from src.core.config import settings
+        print(f"Running Database Intelligence Engine with {settings.DEFAULT_LLM_PROVIDER} provider...")
+        engine = DatabaseIntelligenceEngine(provider=settings.DEFAULT_LLM_PROVIDER)
         intelligence = engine.analyze_schema(schema_text)
         
         # Save table metadata

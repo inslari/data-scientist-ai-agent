@@ -648,3 +648,4 @@ def _generate_fallback_report(state: AgentState) -> str:
         lines.append(f"  - ✓ {factor}")
 
     return "\n".join(lines)
+

@@ -60,13 +60,18 @@ class DatabaseIntelligenceModel(BaseModel):
     global_insights: List[str] = Field(description="Short observations about dataset structure")
 
 class DatabaseIntelligenceEngine:
-    def __init__(self, llm=None):
+    def __init__(self, llm=None, provider: Optional[str] = None):
         """
         Initialize the intelligence engine.
         Defaults to ChatOpenAI with gpt-4o if no LLM is provided.
+        
+        Args:
+            llm: Custom LLM instance (optional). If provided, provider is ignored.
+            provider: LLM provider to use ('openai', 'anthropic', 'google', 'ollama'). 
+                     Defaults to settings.DEFAULT_LLM_PROVIDER.
         """
         if llm is None:
-            self.llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
+            self.llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0, provider=provider)
         else:
             self.llm = llm
 

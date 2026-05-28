@@ -3,6 +3,7 @@ from __future__ import annotations
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from src.core.config import settings
 from src.intelligence_engine import DatabaseIntelligenceEngine  # type: ignore[import-not-found]
 from src.state import AgentState  # type: ignore[import-not-found]
 
@@ -18,8 +19,8 @@ async def db_context_node(state: AgentState) -> AgentState:
     raw_schema, sample_data = await _fetch_schema_and_samples()
     print(">>> Şema başarıyla çekildi. Uzunluk:", len(raw_schema))
 
-    engine   = DatabaseIntelligenceEngine()
-    print(">>> DatabaseIntelligenceEngine başlatıldı. Şema analizi için LLM'e (Ollama) istek atılıyor (Bu işlem uzun sürebilir)...")
+    engine   = DatabaseIntelligenceEngine(provider=settings.DEFAULT_LLM_PROVIDER)
+    print(f">>> DatabaseIntelligenceEngine başlatıldı. Şema analizi için LLM'e ({settings.DEFAULT_LLM_PROVIDER.upper()}) istek atılıyor (Bu işlem uzun sürebilir)...")
     db_model = engine.analyze_schema(
         schema_text=raw_schema,
         sample_data=sample_data,
