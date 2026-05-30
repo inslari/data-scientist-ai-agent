@@ -174,6 +174,42 @@ Build a graph representation:
 - Be conservative and avoid hallucinations
 - Prefer deterministic reasoning over assumptions
 
+## CRITICAL: semantic_type Decision Framework
+
+For each column, assign semantic_type using this strict decision tree:
+
+### Step 1 — Is it an identifier or key?
+  → PK, FK, UUID, name, email, phone, address: assign `identifier`
+  → Rule: identifiers uniquely address an entity row, not measure anything
+
+### Step 2 — Is it a date, time, or datetime?
+  → Assign `timestamp`
+
+### Step 3 — Is it numeric and measurable?
+  → Amounts, counts, scores, rates, durations, ages: assign `metric`
+
+### Step 4 — Is it a label of an ML outcome? Apply the PREDICTABILITY TEST:
+  Ask yourself: "Could a machine learning model be built where OTHER features, observed BEFORE this column's value was determined, are used to PREDICT this column?"
+  AND: "Does this column represent a discrete BUSINESS EVENT or OUTCOME that happened (or didn't happen) at a specific point in time?"
+  
+  Examples of `target`:
+  - A label saying a transaction was fraudulent (the event: fraud occurred)
+  - A label saying a customer stopped buying (the event: churn occurred)
+  - A label saying a loan was not repaid (the event: default occurred)
+  - A label saying a patient was diagnosed with a disease
+  
+  NOT `target` — these are `category` or `metric`:
+  - Current status/state flags that describe the PRESENT state of an entity ("is this account currently active?", "is this merchant on a blacklist?")
+  - Boolean flags that are simultaneously true/false with all other data, not a post-hoc outcome
+  - Risk scores (they are input metrics, not outcome labels)
+  - Operational flags set by the system (is_foreign, is_weekend, etc.)
+  
+  Decision rule: `target` ONLY if the column encodes a concrete OUTCOME/EVENT that a business would want to predict IN ADVANCE.
+  When in doubt: assign `category`.
+
+### Step 5 — Everything else (string labels, low-cardinality categoricals, boolean flags):
+  → Assign `category`
+
 ---
 
 # OUTPUT FORMAT
@@ -196,4 +232,3 @@ Build a graph representation:
         })
         
         return response
-

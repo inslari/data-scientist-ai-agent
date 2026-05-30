@@ -50,17 +50,14 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedKFold, KFold, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-
+from sklearn.metrics import roc_curve, precision_recall_curve
 from src.state import AgentState
 
 warnings.filterwarnings("ignore")
 RANDOM_STATE = 42
 
 
-# ─────────────────────────────────────────────────────────────────
-# MODEL KATALOGLARI
-# ─────────────────────────────────────────────────────────────────
-
+# Model Catalogs
 def _get_classification_models() -> dict:
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
@@ -114,10 +111,7 @@ def _get_regression_models() -> dict:
     return models
 
 
-# ─────────────────────────────────────────────────────────────────
-# HELPERS — feature importance
-# ─────────────────────────────────────────────────────────────────
-
+# Feature importance
 def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
     try:
         est = model
@@ -150,13 +144,11 @@ def _prep_data(X_train_raw, X_test_raw, y_train_raw, y_test_raw):
     return X_train, X_test, y_train, y_test
 
 
-# ─────────────────────────────────────────────────────────────────
-# OPTUNA TUNING
-# ─────────────────────────────────────────────────────────────────
-
-def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, is_binary: bool) -> Any:
-    """Tunes the selected model using Optuna."""
-    print(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor (15 sn limiti)...")
+# Optuna tuning
+def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, is_binary: bool, strong_regularization: bool = False) -> Any:
+    """Tunes the selected model using Optuna. If strong_regularization is True, shrinks the search space to prevent overfitting."""
+    reg_msg = " (STRONG REGULARIZATION)" if strong_regularization else ""
+    print(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor{reg_msg} (15 sn limiti)...")
     
     cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
     scoring = "roc_auc" if is_binary else "roc_auc_ovr_weighted"
@@ -166,30 +158,34 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
         if model_name == "random_forest":
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 300),
-                "max_depth": trial.suggest_int("max_depth", 3, 20),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+                "max_depth": trial.suggest_int("max_depth", 5, 12) if strong_regularization else trial.suggest_int("max_depth", 3, 20),
+                "min_samples_split": trial.suggest_int("min_samples_split", 20, 100) if strong_regularization else trial.suggest_int("min_samples_split", 2, 10),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 10, 50) if strong_regularization else trial.suggest_int("min_samples_leaf", 1, 5),
+                "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2"]) if strong_regularization else "sqrt",
             }
             model = RandomForestClassifier(**params, random_state=RANDOM_STATE, n_jobs=-1)
         elif model_name == "extra_trees":
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 300),
-                "max_depth": trial.suggest_int("max_depth", 3, 20),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+                "max_depth": trial.suggest_int("max_depth", 5, 12) if strong_regularization else trial.suggest_int("max_depth", 3, 20),
+                "min_samples_split": trial.suggest_int("min_samples_split", 20, 100) if strong_regularization else trial.suggest_int("min_samples_split", 2, 10),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 10, 50) if strong_regularization else trial.suggest_int("min_samples_leaf", 1, 5),
+                "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2"]) if strong_regularization else "sqrt",
             }
             model = ExtraTreesClassifier(**params, random_state=RANDOM_STATE, n_jobs=-1)
         elif model_name == "gradient_boosting":
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 300),
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True) if strong_regularization else trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 4, 7) if strong_regularization else trial.suggest_int("max_depth", 3, 10),
             }
             model = GradientBoostingClassifier(**params, random_state=RANDOM_STATE)
         elif model_name == "xgboost":
             from xgboost import XGBClassifier
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 300),
-                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True) if strong_regularization else trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+                "max_depth": trial.suggest_int("max_depth", 4, 7) if strong_regularization else trial.suggest_int("max_depth", 3, 10),
             }
             model = XGBClassifier(**params, random_state=RANDOM_STATE, eval_metric="logloss", verbosity=0, n_jobs=-1)
         elif model_name == "lightgbm":
@@ -212,7 +208,7 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
         best_params = study.best_params
         print(f"[automl] Optuna tamamlandı. En iyi parametreler: {best_params}")
         
-        # Instantiate the best model
+        # Best model Instantiate
         if model_name == "random_forest":
             return RandomForestClassifier(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
         elif model_name == "extra_trees":
@@ -230,9 +226,10 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
         
     return None
 
-def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray) -> Any:
+def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, strong_regularization: bool = False) -> Any:
     """Tunes the selected regression model using Optuna."""
-    print(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor (15 sn limiti)...")
+    reg_msg = " (STRONG REGULARIZATION)" if strong_regularization else ""
+    print(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor{reg_msg} (15 sn limiti)...")
     
     cv = KFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
 
@@ -241,15 +238,15 @@ def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.n
         if model_name == "random_forest":
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 300),
-                "max_depth": trial.suggest_int("max_depth", 3, 20),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+                "max_depth": trial.suggest_int("max_depth", 3, 7) if strong_regularization else trial.suggest_int("max_depth", 3, 20),
+                "min_samples_split": trial.suggest_int("min_samples_split", 10, 50) if strong_regularization else trial.suggest_int("min_samples_split", 2, 10),
             }
             model = RandomForestRegressor(**params, random_state=RANDOM_STATE, n_jobs=-1)
         elif model_name == "extra_trees":
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 300),
-                "max_depth": trial.suggest_int("max_depth", 3, 20),
-                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+                "max_depth": trial.suggest_int("max_depth", 3, 7) if strong_regularization else trial.suggest_int("max_depth", 3, 20),
+                "min_samples_split": trial.suggest_int("min_samples_split", 10, 50) if strong_regularization else trial.suggest_int("min_samples_split", 2, 10),
             }
             model = ExtraTreesRegressor(**params, random_state=RANDOM_STATE, n_jobs=-1)
         elif model_name == "gradient_boosting":
@@ -305,61 +302,226 @@ def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.n
     return None
 
 
-
-
-# ─────────────────────────────────────────────────────────────────
-# CLASSIFICATION
-# ─────────────────────────────────────────────────────────────────
-
+# Classification
+def _get_class_weights(y: np.ndarray) -> dict:
+    """Calculates class weights."""
+    from sklearn.utils.class_weight import compute_class_weight
+    classes = np.unique(y)
+    weights = compute_class_weight("balanced", classes=classes, y=y)
+    return dict(zip(classes.tolist(), weights.tolist()))
+ 
+ 
+def _apply_smote(X: pd.DataFrame, y: np.ndarray) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    Oversamples minority class with SMOTE.
+    Applies only to imbalanced datasets (minority/majority < 0.3).
+    """
+    classes, counts = np.unique(y, return_counts=True)
+    if len(classes) != 2:
+        return X, y  # only for binary
+ 
+    minority_ratio = counts.min() / counts.max()
+    if minority_ratio > 0.3:
+        print(f"[automl] Sınıf dengeli ({minority_ratio:.2f}), SMOTE atlandı.")
+        return X, y
+ 
+    try:
+        from imblearn.over_sampling import SMOTE
+        sm = SMOTE(random_state=RANDOM_STATE, k_neighbors=min(5, counts.min()-1))
+        X_res, y_res = sm.fit_resample(X, y)
+        print(f"[automl] SMOTE: {len(X)} → {len(X_res)} satır "
+              f"(minority: {counts.min()} → {np.sum(y_res==classes[np.argmin(counts)])})")
+        return pd.DataFrame(X_res, columns=X.columns), y_res
+    except ImportError:
+        print("[automl] imbalanced-learn yok, class_weight kullanılacak.")
+        return X, y
+    except Exception as e:
+        print(f"[automl] SMOTE hatası: {e}, class_weight kullanılacak.")
+        return X, y
+ 
+ 
+def _get_classification_models_balanced(class_weights: dict) -> dict:
+    """Balanced versions of models supporting class_weight."""
+    cw = "balanced"  # sklearn'in built-in balanced weight
+ 
+    models = {
+        "random_forest": RandomForestClassifier(
+            n_estimators=200, random_state=RANDOM_STATE,
+            n_jobs=-1, class_weight=cw
+        ),
+        "extra_trees": ExtraTreesClassifier(
+            n_estimators=200, random_state=RANDOM_STATE,
+            n_jobs=-1, class_weight=cw
+        ),
+        "gradient_boosting": GradientBoostingClassifier(
+            n_estimators=200, random_state=RANDOM_STATE
+            # GradientBoosting class_weight desteklemiyor, sample_weight kullanacağız
+        ),
+        "logistic_regression": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(
+                max_iter=1000, random_state=RANDOM_STATE, class_weight=cw
+            )),
+        ]),
+    }
+ 
+    try:
+        from xgboost import XGBClassifier
+        # scale_pos_weight for XGBoost binary imbalance
+        pos_weight = class_weights.get(0, 1) / max(class_weights.get(1, 1), 1e-9)
+        models["xgboost"] = XGBClassifier(
+            n_estimators=200, random_state=RANDOM_STATE,
+            eval_metric="logloss", verbosity=0, n_jobs=-1,
+            scale_pos_weight=pos_weight
+        )
+    except ImportError:
+        pass
+ 
+    try:
+        from lightgbm import LGBMClassifier
+        models["lightgbm"] = LGBMClassifier(
+            n_estimators=200, random_state=RANDOM_STATE,
+            verbose=-1, n_jobs=-1, class_weight=cw
+        )
+    except ImportError:
+        pass
+ 
+    return models
+ 
+ 
 def _run_classification(
     X_train: pd.DataFrame, y_train: np.ndarray,
     X_test: pd.DataFrame, y_test: np.ndarray,
     feature_names: list[str],
+    top_models: list[str] = None,
+    strong_regularization: bool = False,
 ) -> tuple[str, Any, dict]:
-    """6 model, 5-fold stratified CV, ROC-AUC bazlı seçim."""
+    """
+    6 models, 5-fold stratified CV, ROC-AUC based selection.
+    For class imbalance: SMOTE + class_weight automatically applied.
+    """
+    from sklearn.utils.class_weight import compute_sample_weight
+ 
     is_binary = len(np.unique(y_train)) == 2
-    models = _get_classification_models()
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+ 
+    # Class imbalance check
+    classes, counts = np.unique(y_train, return_counts=True)
+    minority_ratio  = counts.min() / counts.max()
+    is_imbalanced   = minority_ratio < 0.3
+ 
+    if is_imbalanced:
+        print(f"[automl] Dengesiz sınıf tespit edildi: {dict(zip(classes.tolist(), counts.tolist()))}")
+        print(f"[automl] Minority ratio: {minority_ratio:.3f} → SMOTE + class_weight uygulanıyor")
+ 
+    # SMOTE apply (train set)
+    X_train_bal, y_train_bal = _apply_smote(X_train, y_train) if is_imbalanced else (X_train, y_train)
+ 
+    # Class weights hesapla
+    class_weights = _get_class_weights(y_train)
+ 
+    # Model selection
+    if is_imbalanced:
+        models = _get_classification_models_balanced(class_weights)
+    else:
+        models = _get_classification_models()
+        
+    if top_models:
+        print(f"[automl] Sadece Top Modeller denenecek: {top_models}")
+        models = {k: v for k, v in models.items() if k in top_models}
+        
+        if not models:
+            print("[automl] Top modeller bulunamadı! Liste fail-safe olarak sıfırlanıyor.")
+            models = _get_classification_models_balanced(class_weights) if is_imbalanced else _get_classification_models()
+ 
+    cv      = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    scoring = "roc_auc" if is_binary else "roc_auc_ovr_weighted"
     results = {}
-
+ 
     for name, model in models.items():
         start = time.time()
         try:
-            scores = cross_val_score(model, X_train, y_train, cv=cv,
-                                     scoring="roc_auc" if is_binary else "roc_auc_ovr_weighted",
-                                     n_jobs=-1)
+            # GradientBoosting için sample_weight with CV
+            if name == "gradient_boosting" and is_imbalanced:
+                fold_scores = []
+                for train_idx, val_idx in cv.split(X_train_bal, y_train_bal):
+                    X_fold_train = X_train_bal.iloc[train_idx]
+                    y_fold_train = y_train_bal[train_idx]
+                    X_fold_val   = X_train_bal.iloc[val_idx]
+                    y_fold_val   = y_train_bal[val_idx]
+                    sw = compute_sample_weight("balanced", y_fold_train)
+                    model_clone = GradientBoostingClassifier(n_estimators=200, random_state=RANDOM_STATE)
+                    model_clone.fit(X_fold_train, y_fold_train, sample_weight=sw)
+                    proba = model_clone.predict_proba(X_fold_val)[:, 1]
+                    fold_scores.append(roc_auc_score(y_fold_val, proba))
+                scores_mean = np.mean(fold_scores)
+                scores_std  = np.std(fold_scores)
+            else:
+                scores = cross_val_score(
+                    model, X_train_bal, y_train_bal,
+                    cv=cv, scoring=scoring, n_jobs=-1
+                )
+                scores_mean = scores.mean()
+                scores_std  = scores.std()
+ 
             elapsed = time.time() - start
-            results[name] = {"score": scores.mean(), "std": scores.std(), "time": elapsed}
-            print(f"[automl] {name:25s} ROC-AUC: {scores.mean():.4f} ± {scores.std():.4f} ({elapsed:.1f}sn)")
+            results[name] = {"score": scores_mean, "std": scores_std, "time": elapsed}
+            print(f"[automl] {name:25s} ROC-AUC: {scores_mean:.4f} ± {scores_std:.4f} ({elapsed:.1f}s)")
+ 
         except Exception as e:
             print(f"[automl] {name:25s} HATA: {e}")
-
+ 
+    if not results:
+        raise ValueError("Hiçbir model çalışmadı.")
+ 
     best_name = max(results, key=lambda k: results[k]["score"])
-    print(f"\n[automl] Baseline en iyi model: {best_name} (ROC-AUC: {results[best_name]['score']:.4f})")
-    
+    print(f"\n[automl] Baseline en iyi: {best_name} (ROC-AUC: {results[best_name]['score']:.4f})")
+ 
     # Optuna tuning
-    tuned_model = _tune_model_classification(best_name, X_train, y_train, is_binary)
-    best_model = tuned_model if tuned_model is not None else models[best_name]
-
-    best_model.fit(X_train, y_train)
-    y_pred = best_model.predict(X_test)
+    tuned_model = _tune_model_classification(best_name, X_train_bal, y_train_bal, is_binary, strong_regularization)
+    best_model  = tuned_model if tuned_model is not None else models[best_name]
+ 
+    # Final training
+    if best_name == "gradient_boosting" and is_imbalanced:
+        sw_final = compute_sample_weight("balanced", y_train_bal)
+        best_model.fit(X_train_bal, y_train_bal, sample_weight=sw_final)
+    else:
+        best_model.fit(X_train_bal, y_train_bal)
+    
     y_prob = None
+    optimal_threshold = 0.5  # default
+
     try:
         y_prob = best_model.predict_proba(X_test)
-    except Exception:
-        pass
+        if y_prob is not None and is_binary:
+            
+        
+            # F1-score maximize threshold
+            precisions, recalls, pr_thresholds = precision_recall_curve(y_test, y_prob[:, 1])
+            f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-9)
+            best_f1_idx = np.argmax(f1_scores)
+            optimal_threshold = float(pr_thresholds[best_f1_idx]) if best_f1_idx < len(pr_thresholds) else 0.5
+        
+            y_pred = (y_prob[:, 1] >= optimal_threshold).astype(int)
+            print(f"[automl] Optimal threshold (F1-max): {optimal_threshold:.4f}")
+    except Exception as e:
+        print(f"[automl] Threshold hesaplama hatası: {e}")
 
+    # Metrics
     metrics: dict[str, Any] = {
-        "accuracy": round(float(accuracy_score(y_test, y_pred)), 4),
-        "f1_weighted": round(float(f1_score(y_test, y_pred, average="weighted", zero_division=0)), 4),
-        "precision_weighted": round(float(precision_score(y_test, y_pred, average="weighted", zero_division=0)), 4),
-        "recall_weighted": round(float(recall_score(y_test, y_pred, average="weighted", zero_division=0)), 4),
-        "task": "binary_classification" if is_binary else "multiclass_classification",
-        "all_model_scores": {k: round(v["score"], 4) for k, v in results.items()},
-        "cv_roc_auc": round(float(results[best_name]["score"]), 4),
-        "cv_roc_auc_std": round(float(results[best_name]["std"]), 4),
+        "accuracy":            round(float(accuracy_score(y_test, y_pred)), 4),
+        "f1_weighted":         round(float(f1_score(y_test, y_pred, average="weighted", zero_division=0)), 4),
+        "precision_weighted":  round(float(precision_score(y_test, y_pred, average="weighted", zero_division=0)), 4),
+        "recall_weighted":     round(float(recall_score(y_test, y_pred, average="weighted", zero_division=0)), 4),
+        "task":                "binary_classification" if is_binary else "multiclass_classification",
+        "all_model_scores":    {k: round(v["score"], 4) for k, v in results.items()},
+        "cv_roc_auc":          round(float(results[best_name]["score"]), 4),
+        "cv_roc_auc_std":      round(float(results[best_name]["std"]), 4),
+        "imbalance_handled":   is_imbalanced,
+        "minority_ratio":      round(float(minority_ratio), 4),
+        "smote_applied":       is_imbalanced and len(X_train_bal) > len(X_train),
+        "optimal_threshold":   round(optimal_threshold, 4),
     }
-
+ 
     if y_prob is not None:
         try:
             if is_binary:
@@ -370,64 +532,124 @@ def _run_classification(
                 ), 4)
         except Exception:
             pass
-
+ 
     metrics["feature_importance"] = _extract_feature_importance(best_model, feature_names)
     return best_name, best_model, metrics
+ 
 
 
-# ─────────────────────────────────────────────────────────────────
-# REGRESSION
-# ─────────────────────────────────────────────────────────────────
-
+# Regression
+def _handle_skewed_target(y: np.ndarray) -> tuple[np.ndarray, bool]:
+    """
+    Hedef değişken skewed ise log1p transform uygular.
+    Skewness > 1 ve tüm değerler >= 0 ise uygular.
+    """
+    try:
+        from scipy.stats import skew as scipy_skew
+        sk = float(scipy_skew(y))
+    except ImportError:
+        # no scipy -> manual calculation
+        mean = np.mean(y)
+        std  = np.std(y)
+        sk   = float(np.mean(((y - mean) / (std + 1e-9)) ** 3)) if std > 0 else 0.0
+ 
+    if abs(sk) > 1.0 and np.all(y >= 0):
+        print(f"[automl] Regression hedef skewed (skewness={sk:.2f}) → log1p transform uygulanıyor")
+        return np.log1p(y), True
+ 
+    print(f"[automl] Regression hedef skewness={sk:.2f} — transform gerekmez")
+    return y, False
+ 
+ 
 def _run_regression(
     X_train: pd.DataFrame, y_train: np.ndarray,
     X_test: pd.DataFrame, y_test: np.ndarray,
     feature_names: list[str],
+    top_models: list[str] = None,
+    strong_regularization: bool = False,
 ) -> tuple[str, Any, dict]:
-    """6 model, 5-fold CV, R² bazlı seçim."""
-    models = _get_regression_models()
-    cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    """
+    6 model, 5-fold CV, R² bazlı seçim.
+    Skewed hedef için log1p transform otomatik uygulanır.
+    """
+    # Skew handling
+    y_train_transformed, log_applied = _handle_skewed_target(y_train)
+    # test setini de aynı transform ile dönüştür
+    y_test_transformed = np.log1p(y_test) if log_applied else y_test
+ 
+    models  = _get_regression_models()
+    
+    if top_models:
+        print(f"[automl] Sadece Top Modeller denenecek: {top_models}")
+        models = {k: v for k, v in models.items() if k in top_models}
+        if not models:
+            print("[automl] Top modeller bulunamadı! Liste fail-safe olarak sıfırlanıyor.")
+            models = _get_regression_models()
+            
+    cv      = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     results = {}
-
+ 
     for name, model in models.items():
         start = time.time()
         try:
-            scores = cross_val_score(model, X_train, y_train, cv=cv,
-                                     scoring="r2", n_jobs=-1)
+            scores = cross_val_score(
+                model, X_train, y_train_transformed,
+                cv=cv, scoring="r2", n_jobs=-1
+            )
             elapsed = time.time() - start
             results[name] = {"score": scores.mean(), "std": scores.std(), "time": elapsed}
-            print(f"[automl] {name:25s} R²: {scores.mean():.4f} ± {scores.std():.4f} ({elapsed:.1f}sn)")
+            print(f"[automl] {name:25s} R²: {scores.mean():.4f} ± {scores.std():.4f} ({elapsed:.1f}s)")
         except Exception as e:
             print(f"[automl] {name:25s} HATA: {e}")
-
+ 
+    if not results:
+        raise ValueError("Hiçbir regression modeli çalışmadı.")
+ 
     best_name = max(results, key=lambda k: results[k]["score"])
-    print(f"\n[automl] Baseline en iyi model: {best_name} (R²: {results[best_name]['score']:.4f})")
-    
+    print(f"\n[automl] Baseline en iyi: {best_name} (R²: {results[best_name]['score']:.4f})")
+ 
     # Optuna tuning
-    tuned_model = _tune_model_regression(best_name, X_train, y_train)
-    best_model = tuned_model if tuned_model is not None else models[best_name]
-
-    best_model.fit(X_train, y_train)
-    y_pred = best_model.predict(X_test)
-
-    mse = mean_squared_error(y_test, y_pred)
+    tuned_model = _tune_model_regression(best_name, X_train, y_train_transformed, strong_regularization)
+    best_model  = tuned_model if tuned_model is not None else models[best_name]
+ 
+    # Final training
+    best_model.fit(X_train, y_train_transformed)
+ 
+    # Prediction + inverse transform
+    y_pred_transformed = best_model.predict(X_test)
+ 
+    if log_applied:
+        y_pred = np.expm1(y_pred_transformed)   
+        y_test_orig = y_test                     
+        print(f"[automl] log1p inverse transform uygulandı (expm1)")
+    else:
+        y_pred      = y_pred_transformed
+        y_test_orig = y_test
+ 
+    # Negative predictions reset to 0 (safety after log transform)
+    y_pred = np.maximum(y_pred, 0)
+ 
+    mse = mean_squared_error(y_test_orig, y_pred)
+    r2  = r2_score(y_test_orig, y_pred)
+ 
     metrics: dict[str, Any] = {
-        "rmse": round(float(np.sqrt(mse)), 4),
-        "mae": round(float(mean_absolute_error(y_test, y_pred)), 4),
-        "r2": round(float(r2_score(y_test, y_pred)), 4),
-        "mse": round(float(mse), 4),
-        "task": "regression",
+        "rmse":         round(float(np.sqrt(mse)), 4),
+        "mae":          round(float(mean_absolute_error(y_test_orig, y_pred)), 4),
+        "r2":           round(float(r2), 4),
+        "mse":          round(float(mse), 4),
+        "task":         "regression",
+        "log_transform_applied": log_applied,
         "all_model_scores": {k: round(v["score"], 4) for k, v in results.items()},
-        "cv_r2": round(float(results[best_name]["score"]), 4),
-        "cv_r2_std": round(float(results[best_name]["std"]), 4),
+        "cv_r2":        round(float(results[best_name]["score"]), 4),
+        "cv_r2_std":    round(float(results[best_name]["std"]), 4),
     }
-
+ 
     metrics["feature_importance"] = _extract_feature_importance(best_model, feature_names)
     return best_name, best_model, metrics
 
 
 
-# CLUSTERING
+# Clustering
 def _run_clustering(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
@@ -551,7 +773,7 @@ def _run_clustering(
     return best_algo, best_model, metrics
 
 
-# ANOMALY DETECTION
+# Anomaly Detection
 def _run_anomaly_detection(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
@@ -648,7 +870,7 @@ def _run_anomaly_detection(
 
     return "isolation_forest", best_model, metrics
 
-# MAIN NODE
+# Main node
 def automl_node(state: AgentState) -> AgentState:
     """
     Intent-based automatic model selection and training.
@@ -704,14 +926,25 @@ def automl_node(state: AgentState) -> AgentState:
     print(f"  Intent  : {intent}")
 
     # Task routing   
-    if intent == "regression":
-        model_name, model, metrics = _run_regression(X_train, y_train, X_test, y_test, feature_names)  # type: ignore
+    top_models = state.get("top_models", [])
+    critic_feedback = state.get("critic_feedback", [])
+    strong_regularization = any("Strong Regularization" in f or "Overfitting" in f for f in critic_feedback)
+    
+    if strong_regularization:
+        print("[automl] Critic Node'dan Strong Regularization (Finetuning) sinyali alındı!")
 
+    if intent == "classification":
+        model_name, model, metrics = _run_classification(
+            X_train, y_train, X_test, y_test, feature_names, top_models, strong_regularization
+        )
+    elif intent == "regression":
+        model_name, model, metrics = _run_regression(
+            X_train, y_train, X_test, y_test, feature_names, top_models, strong_regularization
+        )
     elif intent == "clustering":
         model_name, model, metrics = _run_clustering(
             X_train, X_test, feature_names
         )
-
     elif intent == "anomaly_detection":
         model_name, model, metrics = _run_anomaly_detection(
             X_train, X_test, feature_names
@@ -738,6 +971,15 @@ def automl_node(state: AgentState) -> AgentState:
         for feat, imp in list(fi.items())[:5]:
             print(f"  {feat}: {imp:.4f}")
 
+    # Update top_models if first run
+    if intent in ("classification", "regression") and not top_models:
+        all_scores = metrics.get("all_model_scores", {})
+        if all_scores:
+            # Sort models by score descending and take top 2
+            sorted_models = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+            top_models = [m[0] for m in sorted_models[:2]]
+            print(f"[automl] Top 2 model seçildi ve kaydedildi: {top_models}")
+
     return {
         **state,
         "intent": intent,
@@ -747,5 +989,6 @@ def automl_node(state: AgentState) -> AgentState:
         "model_params": {"intent": intent},
         "model_artifact": model,
         "metrics": metrics,
+        "top_models": top_models,
         "current_step": "automl_node",
     }

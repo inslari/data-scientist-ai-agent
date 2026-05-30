@@ -55,6 +55,11 @@ Görevin: Kullanıcının sorusuna, tespit edilen intent'e ve veritabanı zekâ 
 - intent=clustering ise: sql_query → profiling → feature_engineering → ml_training
 - Planı minimal tut — sadece gerekli adımları ekle
 - Kolon adlarını ASLA uydurma — yalnızca db_intelligence'daki kolonları kullan
+
+## Hedef Kolon (target_column) Seçimi:
+- Veritabanı özetinde "important columns" veya "candidates" olarak belirtilen kolonlara dikkat et.
+- Hedef kolon seçerken KOLON ADI'na değil, görev mantığına (Churn, Fraud vb.) bak.
+- Hatalı bir target_column seçmek tüm ML pipeline'ını çökerteceği için, veritabanında GERÇEKTEN var olan ve kullanıcının tahmin etmek istediği kolonu seç.
 """
 
 

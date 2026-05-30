@@ -79,11 +79,38 @@ def _evaluate_classification(
     except Exception:
         pass
 
+    # Optimal Threshold Calculation
+    roc_curve_data = None
+    if is_binary and y_prob_test is not None:
+        try:
+            fpr, tpr, thresholds = roc_curve(y_test, y_prob_test[:, 1])
+            # Optimal threshold (Youden's J statistic)
+            j_scores = tpr - fpr
+            optimal_idx = int(np.argmax(j_scores))
+            optimal_threshold = round(float(thresholds[optimal_idx]), 4)
+            
+            # Update predictions based on optimal threshold for better recall
+            classes = np.unique(y_test)
+            if len(classes) == 2 and np.issubdtype(classes.dtype, np.number):
+                y_pred_test = (y_prob_test[:, 1] >= optimal_threshold).astype(classes.dtype)
+                if y_prob_train is not None:
+                    y_pred_train = (y_prob_train[:, 1] >= optimal_threshold).astype(classes.dtype)
+            
+            roc_curve_data = {
+                "fpr": [round(float(x), 4) for x in fpr[::max(1, len(fpr) // 20)]],
+                "tpr": [round(float(x), 4) for x in tpr[::max(1, len(tpr) // 20)]],
+                "optimal_threshold": optimal_threshold,
+                "optimal_fpr": round(float(fpr[optimal_idx]), 4),
+                "optimal_tpr": round(float(tpr[optimal_idx]), 4),
+            }
+        except Exception:
+            pass
+
     evaluation: dict[str, Any] = {
         "task": "binary_classification" if is_binary else "multiclass_classification",
     }
 
-    # ── Test seti metrikleri ─────────────────────────────────────
+    # Test set metrics
     test_metrics = {
         "accuracy": round(float(accuracy_score(y_test, y_pred_test)), 4),
         "f1_weighted": round(float(f1_score(y_test, y_pred_test, average="weighted", zero_division=0)), 4),
@@ -114,7 +141,7 @@ def _evaluate_classification(
 
     evaluation["test_metrics"] = test_metrics
 
-    # ── Train seti metrikleri (overfitting kontrolü) ─────────────
+    # Train set metrics
     train_metrics = {
         "accuracy": round(float(accuracy_score(y_train, y_pred_train)), 4),
         "f1_weighted": round(float(f1_score(y_train, y_pred_train, average="weighted", zero_division=0)), 4),
@@ -133,11 +160,11 @@ def _evaluate_classification(
 
     evaluation["train_metrics"] = train_metrics
 
-    # ── Overfitting analizi ──────────────────────────────────────
+    # Overfitting analysis
     overfitting = _analyze_overfitting(train_metrics, test_metrics)
     evaluation["overfitting"] = overfitting
 
-    # ── Confusion matrix ─────────────────────────────────────────
+    # Confusion matrix
     classes = sorted(np.unique(np.concatenate([y_train, y_test])))
     cm = confusion_matrix(y_test, y_pred_test, labels=classes)
     evaluation["confusion_matrix"] = {
@@ -145,7 +172,7 @@ def _evaluate_classification(
         "labels": [int(c) if isinstance(c, (np.integer,)) else c for c in classes],
     }
 
-    # ── Sınıf bazlı rapor ────────────────────────────────────────
+    # Per class report
     try:
         report = classification_report(y_test, y_pred_test, output_dict=True, zero_division=0)
         per_class = {}
@@ -164,26 +191,11 @@ def _evaluate_classification(
     except Exception:
         pass
 
-    # ── ROC curve verileri (binary) ──────────────────────────────
-    if is_binary and y_prob_test is not None:
-        try:
-            fpr, tpr, thresholds = roc_curve(y_test, y_prob_test[:, 1])
-            # Optimal threshold (Youden's J statistic)
-            j_scores = tpr - fpr
-            optimal_idx = int(np.argmax(j_scores))
-            optimal_threshold = round(float(thresholds[optimal_idx]), 4)
+    # ROC curve (binary)
+    if roc_curve_data is not None:
+        evaluation["roc_curve"] = roc_curve_data
 
-            evaluation["roc_curve"] = {
-                "fpr": [round(float(x), 4) for x in fpr[::max(1, len(fpr) // 20)]],
-                "tpr": [round(float(x), 4) for x in tpr[::max(1, len(tpr) // 20)]],
-                "optimal_threshold": optimal_threshold,
-                "optimal_fpr": round(float(fpr[optimal_idx]), 4),
-                "optimal_tpr": round(float(tpr[optimal_idx]), 4),
-            }
-        except Exception:
-            pass
-
-    # ── Precision-recall curve (binary) ──────────────────────────
+    # Precision-recall curve (binary)
     if is_binary and y_prob_test is not None:
         try:
             precision_curve, recall_curve, _ = precision_recall_curve(y_test, y_prob_test[:, 1])
@@ -194,7 +206,7 @@ def _evaluate_classification(
         except Exception:
             pass
 
-    # ── Model kalibrasyonu ───────────────────────────────────────
+    # Model calibration
     if is_binary and y_prob_test is not None:
         try:
             prob_true, prob_pred = calibration_curve(y_test, y_prob_test[:, 1], n_bins=10)
@@ -208,43 +220,42 @@ def _evaluate_classification(
         except Exception:
             pass
 
-    # ── Feature importance analizi ───────────────────────────────
+    # Feature importance analysis
     fi = _extract_feature_importance(model, feature_names)
     if fi:
         evaluation["feature_importance"] = fi
         evaluation["feature_importance_summary"] = _summarize_feature_importance(fi)
 
-    # ── Bootstrap confidence intervals ───────────────────────────
-    print("  Bootstrap CI hesaplanıyor...")
+    # Bootstrap confidence intervals
+    print("Bootstrap CI hesaplanıyor...")
     evaluation["confidence_intervals"] = _bootstrap_ci_classification(
         model, X_test, y_test, is_binary, n_iterations=300
     )
 
-    # ── Error analizi ────────────────────────────────────────────
+    # Error analysis
     evaluation["error_analysis"] = _analyze_errors(
         y_test, y_pred_test, X_test, feature_names,
         y_prob=y_prob_test[:, 1] if (is_binary and y_prob_test is not None) else None,
     )
 
-    # ── SHAP değerleri ───────────────────────────────────────────
-    print("  SHAP değerleri hesaplanıyor...")
+    # SHAP values
+    print("SHAP değerleri hesaplanıyor...")
     shap_result = _compute_shap_values(model, X_test, feature_names)
     if shap_result:
         evaluation["shap_importance"] = shap_result
 
-    # ── Optimal threshold state'e taşı ───────────────────────────
+    # Optimal threshold to state
     roc_data = evaluation.get("roc_curve", {})
     if roc_data:
         evaluation["optimal_threshold"] = roc_data.get("optimal_threshold")
 
-    # ── Model güvenilirlik skoru ─────────────────────────────────
+    # Model reliability score
     evaluation["reliability_score"] = _compute_reliability_score(evaluation)
 
     return evaluation
 
 
 # Regression Evaluation
-
 def _evaluate_regression(
     model: Any,
     X_train: pd.DataFrame,
@@ -302,14 +313,14 @@ def _evaluate_regression(
         evaluation["feature_importance"] = fi
         evaluation["feature_importance_summary"] = _summarize_feature_importance(fi)
 
-    # ── Bootstrap confidence intervals ───────────────────────────
-    print("  Bootstrap CI hesaplanıyor...")
+    # Bootstrap confidence intervals
+    print("Bootstrap CI hesaplanıyor...")
     evaluation["confidence_intervals"] = _bootstrap_ci_regression(
         model, X_test, y_test, n_iterations=300
     )
 
-    # ── SHAP değerleri ───────────────────────────────────────────
-    print("  SHAP değerleri hesaplanıyor...")
+    # SHAP values
+    print("SHAP değerleri hesaplanıyor...")
     shap_result = _compute_shap_values(model, X_test, feature_names)
     if shap_result:
         evaluation["shap_importance"] = shap_result
@@ -327,10 +338,8 @@ def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 # Overfitting Analysis
-
 def _analyze_overfitting(train_metrics: dict, test_metrics: dict) -> dict:
-    """Train vs test metrik farkını analiz eder."""
-    # Ana metrik: roc_auc varsa onu kullan, yoksa accuracy
+    """Analyzes overfitting"""
     train_score = train_metrics.get("roc_auc") or train_metrics.get("roc_auc_ovr") or train_metrics.get("accuracy") or 0.0
     test_score = test_metrics.get("roc_auc") or test_metrics.get("roc_auc_ovr") or test_metrics.get("accuracy") or 0.0
 
@@ -390,7 +399,6 @@ def _overfitting_description(status: str, gap: float) -> str:
 
 
 # Feature Importance
-
 def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
     """Model'den feature importance çıkarır — model tipine göre adaptif."""
     try:
@@ -417,7 +425,7 @@ def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
 
 
 def _summarize_feature_importance(fi: dict) -> dict:
-    """Feature importance özetini çıkarır."""
+    """Feature importance summary."""
     if not fi:
         return {}
 
@@ -427,14 +435,14 @@ def _summarize_feature_importance(fi: dict) -> dict:
 
     sorted_feats = list(fi.items())
 
-    # Top 5 feature ve oranları
+    # Top 5 feature
     top5 = {k: round(v / total * 100, 2) for k, v in sorted_feats[:5]}
 
-    # Top 5'in toplam katkısı
+    # Top 5'in toplam contribution
     top5_total = sum(v for _, v in sorted_feats[:5])
     top5_pct = round(top5_total / total * 100, 2)
 
-    # Önemsiz feature'lar (katkısı %1'den az)
+    # insignificant features (less than %1)
     insignificant = [k for k, v in sorted_feats if v / total < 0.01]
 
     return {
@@ -442,12 +450,11 @@ def _summarize_feature_importance(fi: dict) -> dict:
         "top5_total_contribution_pct": top5_pct,
         "total_features": len(fi),
         "insignificant_features_count": len(insignificant),
-        "insignificant_features": insignificant[:10],  # ilk 10'unu göster
+        "insignificant_features": insignificant[:10],
     }
 
 
 # Bootstrap Confidence Intervals
-
 def _bootstrap_ci_classification(
     model: Any,
     X_test: pd.DataFrame,
@@ -456,7 +463,7 @@ def _bootstrap_ci_classification(
     n_iterations: int = 300,
     ci: float = 0.95,
 ) -> dict:
-    """Bootstrap örnekleme ile metrik güven aralıkları hesaplar (classification)."""
+    """Bootstrap samples with metric confidence intervals (classification)."""
     rng = np.random.default_rng(42)
     n = len(y_test)
     metrics_boot: dict[str, list] = {"accuracy": [], "f1_weighted": [], "roc_auc": [], "mcc": []}
@@ -505,8 +512,8 @@ def _bootstrap_ci_regression(
     y_test: np.ndarray,
     n_iterations: int = 300,
     ci: float = 0.95,
-) -> dict:
-    """Bootstrap örnekleme ile metrik güven aralıkları hesaplar (regression)."""
+    ) -> dict:
+    """Bootstrap samples with metric confidence intervals (regression)."""
     rng = np.random.default_rng(42)
     n = len(y_test)
     metrics_boot: dict[str, list] = {"rmse": [], "r2": [], "mae": []}
@@ -547,8 +554,8 @@ def _compute_shap_values(
     max_samples: int = 200,
 ) -> dict:
     """
-    SHAP değerleri ile açıklanabilir feature importance hesaplar.
-    shap paketi kurulu değilse sessizce boş dict döner.
+    Calculates feature importance, which can be described using SHAP values.
+    Returns an empty dict if the SHAP package is not installed.
     """
     try:
         import shap  # type: ignore
@@ -589,9 +596,8 @@ def _compute_shap_values(
         return {}
 
 # Helper functions for unsupervised tasks (clustering, anomaly detection)
-
 def _pass_clustering_metrics(state: AgentState) -> dict:
-    """Clustering için automl_node'dan gelen metrikleri doğrudan döndürür."""
+    """Passes clustering metrics from automl_node directly."""
     metrics = state.get("metrics", {})
     return {
         "task": "clustering",
@@ -610,7 +616,7 @@ def _pass_clustering_metrics(state: AgentState) -> dict:
 
 
 def _pass_anomaly_metrics(state: AgentState) -> dict:
-    """Anomaly detection için automl_node'dan gelen metrikleri döndürür."""
+    """Passes anomaly detection metrics from automl_node directly."""
     metrics = state.get("metrics", {})
     return {
         "task": "anomaly_detection",
@@ -635,10 +641,10 @@ def _analyze_errors(
     y_prob: np.ndarray | None = None,
 ) -> dict:
     """
-    Yanlış sınıflandırılan örneklerin derinlemesine analizi:
-    - Hata oranı ve sayısı
-    - Yüksek güven hataları (modelin emin olduğu ama yanlış tahminler)
-    - Hatalı vs doğru örnekler arası feature dağılımı farkı
+    Deep dive into misclassified samples:
+    - Error rate and number of errors
+    - High confidence errors (model was confident but still wrong)
+    - Feature distribution differences between correct and incorrect samples
     """
     errors = y_true != y_pred
     n_errors = int(errors.sum())
@@ -655,7 +661,7 @@ def _analyze_errors(
         result["note"] = "Hiç hatalı tahmin yok — mükemmel sınıflandırma."
         return result
 
-    # Confidence analizi — modelin emin olduğu ama yanıldığı örnekler
+    # Confidence analysis
     if y_prob is not None:
         error_probs = y_prob[errors]
         correct_probs = y_prob[~errors]
@@ -667,8 +673,7 @@ def _analyze_errors(
             "high_confidence_errors_pct": round(float(high_conf_errors / n_errors * 100), 2),
         }
 
-    # Feature dağılımı farkı: hatalı vs doğru örnekler — Cohen's d ile
-    # (scaled feature'larda yüzde farkı anlamsız olur, effect size scale-bağımsızdır)
+    # Feature distribution difference between correct and incorrect samples - Cohen's d
     X_errors = X_test[errors]
     X_correct = X_test[~errors]
     feature_diff = {}
@@ -676,7 +681,6 @@ def _analyze_errors(
     for col in numeric_cols[:15]:
         mean_err = float(X_errors[col].mean())
         mean_cor = float(X_correct[col].mean())
-        # Pooled standart sapma
         std_err = float(X_errors[col].std())
         std_cor = float(X_correct[col].std())
         n_err = len(X_errors)
@@ -687,7 +691,7 @@ def _analyze_errors(
         )) if (n_err + n_cor > 2) else 1.0
         cohens_d = abs(mean_err - mean_cor) / (pooled_std + 1e-9)
 
-        # Yalnızca anlamlı etkiyi raporla (small=0.2, medium=0.5, large=0.8)
+        # Only report significant effect (small=0.2, medium=0.5, large=0.8)
         if cohens_d >= 0.2:
             magnitude = (
                 "large" if cohens_d >= 0.8
@@ -709,10 +713,9 @@ def _analyze_errors(
     return result
 
 # Bias Detection
-
 def _analyze_bias(y_true: np.ndarray, y_pred: np.ndarray, X_test: pd.DataFrame, db_intelligence: dict, intent: str) -> dict:
     """
-    Demografik feature'lar (cinsiyet, yaş, vb.) üzerinde Disparate Impact ve performans farklarını ölçer.
+    Calculates Disparate Impact and performance differences over demographic features (gender, age, etc.).
     """
     demographic_keywords = ["age", "sex", "gender", "race", "ethnicity", "marital", "country", "nativity"]
     demographic_bases = [
@@ -771,11 +774,10 @@ def _analyze_bias(y_true: np.ndarray, y_pred: np.ndarray, X_test: pd.DataFrame, 
     return bias_results
 
 # Reliability Score
-
 def _compute_reliability_score(evaluation: dict) -> dict:
     """
-    Model güvenilirlik skoru hesaplar (0-100).
-    Birden fazla faktörü birleştirerek genel bir değerlendirme yapar.
+    Calculates model reliability score (0-100).
+    Combines multiple factors to provide an overall assessment.
     """
     score = 0
     max_score = 0
@@ -886,7 +888,7 @@ def _compute_reliability_score(evaluation: dict) -> dict:
     }
 
 
-# MAIN NODE
+# Main node
 def evaluation_node(state: AgentState) -> AgentState:
     """
     Evaluates the model produced by the AutoML node.

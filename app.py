@@ -343,15 +343,16 @@ def run_pipeline(user_query: str) -> AgentState:
     node_names = {
         "intent_node":              ("01","Intent Analyzer",    "Classifying intent..."),
         "db_context_node":          ("02","DB Context",         "Schema + column stats..."),
+        "target_discovery_node":    ("03","Target Discovery",   "Detecting ML target..."),
         "sql_node":                 ("03","SQL Executor",       "Running query..."),
-        "planner_node":             ("03","Analysis Planner",   "Building plan..."),
-        "execution_node":           ("04","Execution",          "Fetching + profiling..."),
-        "feature_plan_node":        ("05","Feature Planner",    "Feature strategy..."),
-        "feature_engineering_node": ("06","Feature Eng.",       "Encoding + scaling..."),
-        "automl_node":              ("07","AutoML",             "Training models..."),
-        "evaluation_node":          ("08","Evaluation",         "Metrics + SHAP..."),
-        "critic_node":              ("09","AI Critic",          "Checking quality..."),
-        "report_node":              ("10","Report Generator",   "Writing report..."),
+        "planner_node":             ("04","Analysis Planner",   "Building plan..."),
+        "execution_node":           ("05","Execution",          "Fetching + profiling..."),
+        "feature_plan_node":        ("06","Feature Planner",    "Feature strategy..."),
+        "feature_engineering_node": ("07","Feature Eng.",       "Encoding + scaling..."),
+        "automl_node":              ("08","AutoML",             "Training models..."),
+        "evaluation_node":          ("09","Evaluation",         "Metrics + SHAP..."),
+        "critic_node":              ("10","AI Critic",          "Checking quality..."),
+        "report_node":              ("11","Report Generator",   "Writing report..."),
     }
 
     completed_nodes = []
@@ -481,7 +482,8 @@ def run_pipeline(user_query: str) -> AgentState:
 
             next_node = {
                 "intent_node":              "db_context_node",
-                "db_context_node":          "sql_node" if final_state.get("intent")=="sql_query" else "planner_node",
+                "db_context_node":          "sql_node" if final_state.get("intent")=="sql_query" else "target_discovery_node",
+                "target_discovery_node":    "planner_node",
                 "planner_node":             "execution_node",
                 "execution_node":           "feature_plan_node" if final_state.get("intent") in ("classification","regression","clustering") else "automl_node",
                 "feature_plan_node":        "feature_engineering_node",

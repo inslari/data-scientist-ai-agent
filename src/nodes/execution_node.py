@@ -1,10 +1,35 @@
 from __future__ import annotations
 
+"""
+Execution Node — BigData Edition
+---------------------------------
+DuckDB tabanlı execution layer.
+
+Mimari:
+  1. MCP'den tablolar paralel çekilir (chunked streaming)
+  2. DuckDB in-memory'e yüklenir
+  3. Profiling: DuckDB üzerinde full scan (hızlı, RAM dostu)
+  4. ML sampling: stratified sample (sınıf dengesi korunur)
+  5. State'e veri değil parquet path yazılır (lazy loading)
+  6. Feature engineering parquet'ten okur (chunk by chunk)
+
+Neden DuckDB:
+  - 10M satır GROUP BY → milisaniyeler (SQLite → dakikalar)
+  - Columnar storage → aggregation için optimize
+  - Parallel query execution
+  - Parquet okuma/yazma native destek
+  - In-memory mod → kurulum gerektirmez
+"""
+
 import ast
 import asyncio
 import re
+import tempfile
+import uuid
+from pathlib import Path
 from typing import Any
 
+import duckdb
 import numpy as np
 import pandas as pd
 from mcp.client.streamable_http import streamable_http_client
@@ -13,116 +38,189 @@ from mcp.client.session import ClientSession
 from src.state import AgentState
 from src.core.config import settings
 
-MAX_ROWS = 10_000
+# ── Sabitler ────────────────────────────────────────────────
+CHUNK_SIZE        = 10_000   # MCP'den kaç satır çekileceği (per chunk)
+MAX_FETCH_ROWS    = 100_000  # Tek tablodan max çekilecek satır
+ML_SAMPLE_ROWS    = 100_000  # ML eğitimi için max satır
+PROFILE_SAMPLE    = 200_000  # Profiling için max satır (yoksa full)
+PARQUET_DIR       = Path(tempfile.gettempdir()) / "ds_agent_data"
+PARQUET_DIR.mkdir(exist_ok=True)
 
 
+# ── Relationship graph traversal ─────────────────────────────
 def _resolve_all_related_tables(
-    selected_tables: list[str],
+    selected: list[str],
     relationships: list[dict],
-    all_known_tables: list[str],
+    all_known: list[str],
 ) -> list[str]:
-    """
-    Planner'ın seçtiği tablolardan başlayarak relationship graph'ını
-    BFS (Breadth-First Search) ile traverse eder.
-
-    Örnek:
-        selected: ['orders']
-        relationships: orders→customers, orders→order_items, order_items→products
-        sonuç: ['orders', 'customers', 'order_items', 'products']
-    """
-    graph: dict[str, list[str]] = {t: [] for t in all_known_tables}
-
+    graph: dict[str, list[str]] = {t: [] for t in all_known}
     for rel in relationships:
-        src = rel.get("source_table")
-        tgt = rel.get("target_table")
+        src = rel.get("source_table"); tgt = rel.get("target_table")
         if src in graph and tgt in graph:
-            graph[src].append(tgt)
-            graph[tgt].append(src)
-
-    visited: set[str] = set(selected_tables)
-    queue: list[str] = list(selected_tables)
-
+            graph[src].append(tgt); graph[tgt].append(src)
+    visited = set(selected); queue = list(selected)
     while queue:
-        current = queue.pop(0)
-        for neighbor in graph.get(current, []):
-            if neighbor not in visited:
-                visited.add(neighbor)
-                queue.append(neighbor)
-
+        cur = queue.pop(0)
+        for nb in graph.get(cur, []):
+            if nb not in visited:
+                visited.add(nb); queue.append(nb)
     return list(visited)
 
 
 def _build_merge_order(
     tables: list[str],
     relationships: list[dict],
-    anchor_table: str,
+    anchor: str,
 ) -> list[dict]:
-    """
-    Determines the merge order starting from the anchor table.
-    Returns a list of merge operations specifying which table merges with which and on which columns.
-    """
     ops: list[dict] = []
-    merged: set[str] = {anchor_table}
-    remaining = set(tables) - merged
-    max_iter = len(tables) * 2
-
-    for _ in range(max_iter):
-        if not remaining:
-            break
+    merged = {anchor}; remaining = set(tables) - merged
+    for _ in range(len(tables) * 2):
+        if not remaining: break
         for rel in relationships:
-            src = str(rel.get("source_table", ""))
-            tgt = str(rel.get("target_table", ""))
-            src_col = str(rel.get("source_column", ""))
-            tgt_col = str(rel.get("target_column", ""))
-
-            if not (src and tgt and src_col and tgt_col):
-                continue
-
+            src = str(rel.get("source_table",""))
+            tgt = str(rel.get("target_table",""))
+            sc  = str(rel.get("source_column",""))
+            tc  = str(rel.get("target_column",""))
+            if not (src and tgt and sc and tc): continue
             if src in merged and tgt in remaining:
-                ops.append({"left": src, "right": tgt,
-                             "left_on": src_col, "right_on": tgt_col})
-                merged.add(tgt)
-                remaining.discard(tgt)
-
+                ops.append({"left":src,"right":tgt,"left_on":sc,"right_on":tc})
+                merged.add(tgt); remaining.discard(tgt)
             elif tgt in merged and src in remaining:
-                ops.append({"left": tgt, "right": src,
-                             "left_on": tgt_col, "right_on": src_col})
-                merged.add(src)
-                remaining.discard(src)
-
+                ops.append({"left":tgt,"right":src,"left_on":tc,"right_on":sc})
+                merged.add(src); remaining.discard(src)
     return ops
 
-
-
-#  Parse MCP Response to DF
-def _parse_mcp_response_to_dataframe(raw: str, table_name: str = "") -> pd.DataFrame:
+def _build_joined_sql(
+    anchor: str,
+    merge_ops: list[dict],
+    dfs: dict[str, "pd.DataFrame"],
+    fetch_limit: int,
+) -> str:
     """
-    Parses the string format SQL output from MCP and converts it into a DataFrame.
+    relationships dict'inden dinamik SQL JOIN sorgusu üretir.
+    Hiçbir tablo/kolon ismi hardcode değil.
 
-    Format:
-        Columns: col1, col2, col3
-        Returned N rows.
-        Results:
-        (val1, val2, val3)
-        ...
+    Duplicate column sorunu: SELECT t.*, a.*, m.* yaparsak
+    account_id hem transactions hem accounts'ta var → çakışır.
+    Çözüm: anchor.* + dimension kolonlarını suffix'li alias ile seç.
+    Join key'i tekrar almayız (zaten anchor'da var).
+
+    Örnek çıktı:
+        SELECT t.*, a."customer_name" AS "customer_name_accounts", ...
+        FROM "transactions" t
+        INNER JOIN "accounts" a ON t."account_id" = a."account_id"
+        LIMIT 500000
     """
+    anchor_alias = anchor[0].lower()
+    join_parts: list[str] = []
+    alias_map: dict[str, str] = {anchor: anchor_alias}
+    used_aliases: set[str] = {anchor_alias}
+
+    # Anchor kolonları
+    anchor_cols = set(dfs[anchor].columns) if anchor in dfs else set()
+    select_parts: list[str] = [f'{anchor_alias}.*']
+
+    for op in merge_ops:
+        right = op["right"]
+        left  = op["left"]
+        lo    = op["left_on"]
+        ro    = op["right_on"]
+
+        # Benzersiz alias üret
+        base_alias = right[0].lower()
+        alias = base_alias
+        counter = 2
+        while alias in used_aliases:
+            alias = f"{base_alias}{counter}"
+            counter += 1
+        used_aliases.add(alias)
+        alias_map[right] = alias
+
+        left_alias = alias_map.get(left, anchor_alias)
+
+        join_parts.append(
+            f'INNER JOIN "{right}" {alias} ON {left_alias}."{lo}" = {alias}."{ro}"'
+        )
+
+        # Dimension kolonlarını suffix'li alias ile seç (join key hariç)
+        if right in dfs:
+            for col in dfs[right].columns:
+                if col == ro:
+                    continue  # join key → zaten anchor'da var
+                select_parts.append(f'{alias}."{col}" AS "{col}_{right}"')
+
+    select_clause = ', '.join(select_parts)
+    sql = (
+        f'SELECT {select_clause} '
+        f'FROM "{anchor}" {anchor_alias} '
+        + ' '.join(join_parts)
+    )
+    return sql
+
+
+
+def _select_anchor_table(
+    dfs: dict[str, "pd.DataFrame"],
+    relationships: list[dict],
+    selected_tables: list[str],
+) -> str:
+    """
+    Fact table'ı identify ederek anchor seçer.
+
+    Database normalization teorisi:
+    ──────────────────────────────────────────────────────────────
+    Fact table     = İlişkilerde KAYNAK (source) olur, FK'leri verir.
+                     transactions.account_id → accounts.account_id
+    Dimension table= İlişkilerde HEDEF (target) olur, FK'leri alır.
+                     accounts tablosu transactions'tan FK alır.
+
+    Bu evrensel bir kuraldır — domain, dil, isim bağımsız.
+
+    Skor:
+    - Outgoing FK (source_table): +3 puan  → fact table işareti
+    - Incoming FK (target_table): -1 puan  → dimension table işareti
+    - Tie-breaker: daha fazla satıra sahip olan
+    """
+    if len(dfs) == 1:
+        return list(dfs.keys())[0]
+
+    scores: dict[str, dict] = {}
+    for table in dfs:
+        outgoing = sum(1 for r in relationships if r.get("source_table") == table)
+        incoming = sum(1 for r in relationships if r.get("target_table") == table)
+        scores[table] = {
+            "outgoing": outgoing,
+            "incoming": incoming,
+            "score":    outgoing * 3 - incoming,
+            "rows":     len(dfs[table]),
+        }
+        print(f"[execution] '{table}': outgoing_FK={outgoing}, incoming_FK={incoming}, "
+              f"score={scores[table]['score']}, rows={len(dfs[table]):,}")
+
+    # En yüksek skor → fact table → anchor
+    # Tie varsa daha fazla satıra sahip olan
+    anchor = max(scores, key=lambda t: (scores[t]["score"], scores[t]["rows"]))
+    print(f"[execution] Anchor (fact table): '{anchor}'")
+    return anchor
+
+
+
+def _parse_mcp_to_df(raw: str, table_name: str = "") -> pd.DataFrame:
     if not raw:
         raise ValueError(f"[{table_name}] MCP boş yanıt döndürdü.")
     if "Error" in raw or "SQL Error" in raw:
         raise ValueError(f"[{table_name}] MCP SQL hatası: {raw}")
 
     lines = raw.strip().splitlines()
-
     columns: list[str] = []
     for line in lines:
         if line.startswith("Columns:"):
-            columns = [c.strip() for c in line.replace("Columns:", "").split(",")]
+            columns = [c.strip() for c in line.replace("Columns:","").split(",")]
             break
-
     if not columns:
         raise ValueError(f"[{table_name}] Kolon bilgisi bulunamadı.")
 
-    rows: list[tuple] = []
+    rows = []
     for line in lines:
         line = line.strip()
         if line.startswith("(") and line.endswith(")"):
@@ -136,16 +234,13 @@ def _parse_mcp_response_to_dataframe(raw: str, table_name: str = "") -> pd.DataF
         return pd.DataFrame(columns=columns)
 
     df = pd.DataFrame(rows, columns=columns)
-    df = _infer_and_cast_dtypes(df)
-
-    return df.head(MAX_ROWS)
+    return _infer_dtypes(df)
 
 
-def _pad_or_trim(row: tuple, expected: int) -> tuple:
+def _pad_or_trim(row: tuple, n: int) -> tuple:
     lst = list(row)
-    if len(lst) < expected:
-        lst.extend([None] * (expected - len(lst)))
-    return tuple(lst[:expected])
+    lst.extend([None] * max(0, n - len(lst)))
+    return tuple(lst[:n])
 
 
 def _parse_tuple_line(line: str) -> tuple:
@@ -155,29 +250,25 @@ def _parse_tuple_line(line: str) -> tuple:
         inner = line[1:-1]
         parts = re.split(r",\s*(?=(?:[^'\"]*['\"][^'\"]*['\"])*[^'\"]*$)", inner)
         parsed = []
-        for part in parts:
-            part = part.strip()
-            if part in ("None", "NULL", "null", ""):
+        for p in parts:
+            p = p.strip()
+            if p in ("None","NULL","null",""):
                 parsed.append(None)
-            elif part.startswith(("'", '"')) and part.endswith(("'", '"')):
-                parsed.append(part[1:-1])
+            elif p.startswith(("'",'"')) and p.endswith(("'",'"')):
+                parsed.append(p[1:-1])
             else:
-                try:
-                    parsed.append(int(part))
+                try: parsed.append(int(p))
                 except ValueError:
-                    try:
-                        parsed.append(float(part))
-                    except ValueError:
-                        parsed.append(part)
+                    try: parsed.append(float(p))
+                    except ValueError: parsed.append(p)
         return tuple(parsed)
 
 
-def _infer_and_cast_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+def _infer_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
-        converted = pd.to_numeric(df[col], errors="coerce")
-        if converted.notna().sum() > 0 and converted.notna().mean() > 0.8:
-            df[col] = converted
-            continue
+        conv = pd.to_numeric(df[col], errors="coerce")
+        if conv.notna().mean() > 0.8:
+            df[col] = conv; continue
         if df[col].dtype == object:
             try:
                 sample = df[col].dropna().head(10).astype(str)
@@ -188,24 +279,84 @@ def _infer_and_cast_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# MCP async caller — tables are fetched in parallel
+# ── MCP async fetcher (chunked) ──────────────────────────────
 async def _fetch_all_tables(table_to_db: dict[str, str]) -> dict[str, str]:
+    """
+    Tabloları paralel çeker.
+    Büyük tablolar için offset-based chunking yapar.
+    """
     MCP_URL = settings.MCP_SERVER_URL
+
     async with streamable_http_client(MCP_URL) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
             async def fetch_one(table: str, db_name: str) -> tuple[str, str]:
-                query = f'SELECT * FROM "{table}" LIMIT {MAX_ROWS}'
-                result = await session.call_tool("run_sql_query", {"query": query, "db_name": db_name})
-                if getattr(result, "content", None):
-                    for item in result.content:
-                        if getattr(item, "type", "") == "text":
-                            return table, getattr(item, "text", "")
-                return table, str(result)
+                # Önce toplam satır sayısını öğren
+                try:
+                    count_result = await session.call_tool(
+                        "run_sql_query",
+                        {"query": f'SELECT COUNT(*) FROM "{table}"', "db_name": db_name}
+                    )
+                    count_text = ""
+                    if getattr(count_result, "content", None):
+                        for item in count_result.content:
+                            if getattr(item, "type", "") == "text":
+                                count_text = getattr(item, "text", "")
+                    # Parse count
+                    total_rows = _extract_count(count_text)
+                except Exception:
+                    total_rows = CHUNK_SIZE
 
-            results = await asyncio.gather(*[fetch_one(t, db) for t, db in table_to_db.items()],
-                                           return_exceptions=True)
+                print(f"[execution] '{table}': {total_rows:,} satır tespit edildi")
+
+                # Küçük tablo → direkt çek
+                if total_rows <= CHUNK_SIZE:
+                    result = await session.call_tool(
+                        "run_sql_query",
+                        {"query": f'SELECT * FROM "{table}"', "db_name": db_name}
+                    )
+                    if getattr(result, "content", None):
+                        for item in result.content:
+                            if getattr(item, "type", "") == "text":
+                                return table, getattr(item, "text", "")
+                    return table, str(result)
+
+                # Büyük tablo → chunked fetch (max MAX_FETCH_ROWS)
+                fetch_limit = min(total_rows, MAX_FETCH_ROWS)
+                chunks_text = []
+                header_written = False
+
+                for offset in range(0, fetch_limit, CHUNK_SIZE):
+                    limit = min(CHUNK_SIZE, fetch_limit - offset)
+                    query = f'SELECT * FROM "{table}" LIMIT {limit} OFFSET {offset}'
+                    result = await session.call_tool(
+                        "run_sql_query",
+                        {"query": query, "db_name": db_name}
+                    )
+                    chunk_text = ""
+                    if getattr(result, "content", None):
+                        for item in result.content:
+                            if getattr(item, "type", "") == "text":
+                                chunk_text = getattr(item, "text", "")
+
+                    if not header_written:
+                        chunks_text.append(chunk_text)
+                        header_written = True
+                    else:
+                        # Sadece veri satırlarını al (header'ı atla)
+                        data_lines = [l for l in chunk_text.splitlines()
+                                      if l.strip().startswith("(")]
+                        chunks_text.append("\n".join(data_lines))
+
+                    print(f"[execution] '{table}' chunk {offset//CHUNK_SIZE+1}: {offset+limit:,}/{fetch_limit:,}")
+
+                return table, "\n".join(chunks_text)
+
+            results = await asyncio.gather(
+                *[fetch_one(t, db) for t, db in table_to_db.items()],
+                return_exceptions=True
+            )
 
             output: dict[str, str] = {}
             for res in results:
@@ -215,123 +366,230 @@ async def _fetch_all_tables(table_to_db: dict[str, str]) -> dict[str, str]:
                 output[table] = raw
             return output
 
-    return output
+
+def _extract_count(text: str) -> int:
+    """MCP COUNT(*) sonucundan satır sayısını çıkarır."""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("(") and line.endswith(")"):
+            try:
+                val = ast.literal_eval(line)
+                if isinstance(val, tuple) and len(val) == 1:
+                    return int(val[0])
+            except Exception:
+                pass
+    return 50_000  # fallback
 
 
-
-# Merger — pandas merge, no SQL JOIN
-def _merge_all_dataframes(
-    dfs: dict[str, pd.DataFrame],
-    merge_ops: list[dict],
-    anchor_table: str,
-) -> pd.DataFrame:
-    if len(dfs) == 1:
-        return list(dfs.values())[0]
-
-    result = dfs[anchor_table].copy()
-
-    for op in merge_ops:
-        right_table = op["right"]
-        if right_table not in dfs:
-            print(f"[merge] UYARI: '{right_table}' bulunamadı, atlanıyor.")
-            continue
-
-        right_df = dfs[right_table].copy()
-
-        # Resolve overlapping columns
-        overlap = (set(result.columns) & set(right_df.columns)) - {op["left_on"], op["right_on"]}
-        if overlap:
-            right_df = right_df.rename(columns={c: f"{c}_{right_table}" for c in overlap})
-
-        before = len(result)
-        result = result.merge(right_df, left_on=op["left_on"],
-                              right_on=op["right_on"], how="left")
-        print(f"[merge] {op['left']}.{op['left_on']} → "
-              f"{right_table}.{op['right_on']} | {before} → {len(result)} satır")
-
-    return result
-
-
-# Profiler
-def _profile_dataframe(df: pd.DataFrame) -> dict:
+# ── DuckDB engine ────────────────────────────────────────────
+class DuckDBEngine:
     """
-    Generates statistical profile from actual data.
-    Complements intelligence_engine's schema-level analysis.
-    feature_engineering_node makes transformation decisions based on this report.
+    DuckDB in-memory analiz motoru.
+
+    Görevleri:
+    - DataFrame'leri DuckDB tablosuna yükle
+    - Profiling sorgularını çalıştır (full scan, hızlı)
+    - Stratified sample üret (ML eğitimi için)
+    - Parquet'e yaz (lazy loading)
     """
-    if df.empty:
-        return {"error": "Boş DataFrame, profiling yapılamadı."}
 
-    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-    categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()  # type: ignore[arg-type]
-    datetime_cols = df.select_dtypes(include="datetime").columns.tolist()
+    def __init__(self):
+        self.conn = duckdb.connect(":memory:")
+        self._tables: set[str] = set()
 
-    profile: dict[str, Any] = {
-        "shape": {"rows": len(df), "columns": len(df.columns)},
-        "summary": {
-            "numeric_columns": numeric_cols,
-            "categorical_columns": categorical_cols,
-            "datetime_columns": datetime_cols,
-            "total_missing": int(df.isnull().sum().sum()),
-            "missing_rate": round(df.isnull().mean().mean(), 4),
-            "duplicate_rows": int(df.duplicated().sum()),
-        },
-        "columns": {},
-    }
+    def load(self, name: str, df: pd.DataFrame) -> None:
+        """DataFrame'i DuckDB'ye yükle."""
+        safe_name = name.replace(".", "_").replace("-", "_")
+        self.conn.register(safe_name, df)
+        self._tables.add(safe_name)
+        print(f"[duckdb] '{safe_name}' yüklendi: {len(df):,} satır × {len(df.columns)} kolon")
 
-    for col in df.columns:
-        col_profile: dict[str, Any] = {
-            "dtype": str(df[col].dtype),
-            "null_count": int(df[col].isnull().sum()),
-            "null_rate": round(df[col].isnull().mean(), 4),
-            "unique_count": int(df[col].nunique()),
-            "unique_rate": round(df[col].nunique() / max(len(df), 1), 4),
+    def query(self, sql: str) -> pd.DataFrame:
+        """SQL sorgusu çalıştır, DataFrame döndür."""
+        return self.conn.execute(sql).df()
+
+    def profile_table(self, name: str) -> dict:
+        """
+        DuckDB üzerinde hızlı profiling.
+        Full scan yapar ama columnar olduğu için hızlı.
+        """
+        safe = name.replace(".", "_").replace("-", "_")
+        if safe not in self._tables:
+            raise ValueError(f"'{safe}' DuckDB'de yok.")
+
+        # Genel istatistikler
+        shape_df = self.conn.execute(
+            f"SELECT COUNT(*) as rows, COUNT(*) as cols FROM {safe} LIMIT 1"
+        ).df()
+
+        # Kolon bazlı istatistik
+        col_df  = self.conn.execute(f"DESCRIBE {safe}").df()
+        columns = col_df["column_name"].tolist()
+        dtypes  = dict(zip(col_df["column_name"], col_df["column_type"]))
+
+        col_profiles = {}
+        for col in columns:
+            safe_col = f'"{col}"'
+            dtype    = dtypes.get(col, "VARCHAR").upper()
+            is_num   = any(t in dtype for t in ("INT","FLOAT","DOUBLE","DECIMAL","REAL","BIGINT","HUGEINT","UBIGINT"))
+            is_date  = any(t in dtype for t in ("DATE","TIME","TIMESTAMP"))
+
+            try:
+                null_result = self.conn.execute(
+                    f"SELECT COUNT(*) as total, COUNT({safe_col}) as non_null FROM {safe}"
+                ).fetchone()
+                total     = null_result[0] if null_result else 1
+                non_null  = null_result[1] if null_result else 0
+                null_cnt  = total - non_null
+                null_rate = round(null_cnt / max(total, 1), 4)
+
+                uniq_result = self.conn.execute(
+                    f"SELECT COUNT(DISTINCT {safe_col}) FROM {safe}"
+                ).fetchone()
+                unique_cnt  = uniq_result[0] if uniq_result else 0
+                unique_rate = round(unique_cnt / max(total, 1), 4)
+
+                cp: dict[str, Any] = {
+                    "dtype":       dtype,
+                    "null_count":  null_cnt,
+                    "null_rate":   null_rate,
+                    "unique_count":unique_cnt,
+                    "unique_rate": unique_rate,
+                }
+
+                if is_num:
+                    stats = self.conn.execute(f"""
+                        SELECT
+                            MIN({safe_col}), MAX({safe_col}),
+                            AVG({safe_col}), MEDIAN({safe_col}),
+                            STDDEV({safe_col}),
+                            PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {safe_col}),
+                            PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {safe_col})
+                        FROM {safe}
+                    """).fetchone()
+                    if stats:
+                        mn,mx,avg,med,std,q1,q3 = stats
+                        iqr = (q3 or 0) - (q1 or 0)
+                        outlier_rate = 0.0
+                        if iqr > 0:
+                            out_df = self.conn.execute(f"""
+                                SELECT COUNT(*) FROM {safe}
+                                WHERE {safe_col} < {q1 - 1.5*iqr}
+                                   OR {safe_col} > {q3 + 1.5*iqr}
+                            """).fetchone()
+                            outlier_rate = round((out_df[0] if out_df else 0) / max(total, 1), 4)
+                        cp.update({
+                            "min": _sf(mn), "max": _sf(mx),
+                            "mean": _sf(avg), "median": _sf(med),
+                            "std": _sf(std), "q25": _sf(q1), "q75": _sf(q3),
+                            "has_outliers": outlier_rate,
+                        })
+
+                elif is_date:
+                    date_stats = self.conn.execute(
+                        f"SELECT MIN({safe_col}), MAX({safe_col}) FROM {safe}"
+                    ).fetchone()
+                    if date_stats:
+                        cp.update({"min_date": str(date_stats[0]), "max_date": str(date_stats[1])})
+
+                else:
+                    top_vals = self.conn.execute(f"""
+                        SELECT {safe_col}, COUNT(*) as cnt
+                        FROM {safe} WHERE {safe_col} IS NOT NULL
+                        GROUP BY {safe_col} ORDER BY cnt DESC LIMIT 5
+                    """).fetchall()
+                    cp["top_values"] = {str(r[0]): r[1] for r in top_vals}
+                    cp["cardinality"] = (
+                        "high" if unique_cnt > 50
+                        else "medium" if unique_cnt > 10
+                        else "low"
+                    )
+
+                col_profiles[col] = cp
+
+            except Exception as e:
+                col_profiles[col] = {"dtype": dtype, "error": str(e)}
+
+        # Tam satır sayısı
+        total_rows = self.conn.execute(f"SELECT COUNT(*) FROM {safe}").fetchone()[0]
+        numeric_cols   = [c for c,d in dtypes.items() if any(t in d.upper() for t in ("INT","FLOAT","DOUBLE","DECIMAL","REAL","BIGINT"))]
+        categorical_cols = [c for c,d in dtypes.items() if "VARCHAR" in d.upper() or "TEXT" in d.upper()]
+        datetime_cols  = [c for c,d in dtypes.items() if any(t in d.upper() for t in ("DATE","TIME","TIMESTAMP"))]
+
+        profile = {
+            "shape": {"rows": total_rows, "columns": len(columns)},
+            "summary": {
+                "numeric_columns":    numeric_cols,
+                "categorical_columns":categorical_cols,
+                "datetime_columns":   datetime_cols,
+                "missing_rate":       round(sum(cp.get("null_rate",0) for cp in col_profiles.values()) / max(len(col_profiles),1), 4),
+                "duplicate_rows":     0,  # DuckDB'de pahalı, skip
+            },
+            "columns": col_profiles,
         }
+        profile["recommendations"] = _generate_recommendations(profile)
+        return profile
 
-        if col in numeric_cols:
-            desc = df[col].describe()
-            col_profile.update({
-                "min": _safe_float(desc.get("min")),
-                "max": _safe_float(desc.get("max")),
-                "mean": _safe_float(desc.get("mean")),
-                "median": _safe_float(df[col].median()),
-                "std": _safe_float(desc.get("std")),
-                "q25": _safe_float(desc.get("25%")),
-                "q75": _safe_float(desc.get("75%")),
-                "skewness": _safe_float(df[col].skew()),
-                "kurtosis": _safe_float(df[col].kurt()),
-                # has_outliers now stores the outlier *rate* (0.0–1.0)
-                "has_outliers": _detect_outliers(df[col]),
-            })
+    def stratified_sample(
+        self,
+        name: str,
+        target_col: str | None,
+        n: int = ML_SAMPLE_ROWS,
+    ) -> pd.DataFrame:
+        """
+        Stratified sample üretir.
+        target_col varsa sınıf dağılımını korur.
+        """
+        safe = name.replace(".", "_").replace("-", "_")
+        total = self.conn.execute(f"SELECT COUNT(*) FROM {safe}").fetchone()[0]
 
-        elif col in categorical_cols:
-            value_counts = df[col].value_counts()
-            col_profile.update({
-                "top_values": value_counts.head(5).to_dict(),
-                "cardinality": (
-                    "high" if col_profile["unique_count"] > 50
-                    else "medium" if col_profile["unique_count"] > 10
-                    else "low"
-                ),
-            })
+        if total <= n:
+            print(f"[duckdb] '{safe}' zaten küçük ({total:,} satır), tüm veri kullanılıyor.")
+            return self.conn.execute(f"SELECT * FROM {safe}").df()
 
-        elif col in datetime_cols:
-            col_profile.update({
-                "min_date": str(df[col].min()),
-                "max_date": str(df[col].max()),
-                "date_range_days": (
-                    (df[col].max() - df[col].min()).days
-                    if df[col].notna().any() else None
-                ),
-            })
+        if target_col and target_col in self._get_columns(safe):
+            # Stratified: her sınıftan orantılı örnekle
+            classes = self.conn.execute(
+                f'SELECT DISTINCT "{target_col}" FROM {safe} WHERE "{target_col}" IS NOT NULL'
+            ).fetchall()
+            frames = []
+            for (cls,) in classes:
+                cls_count = self.conn.execute(
+                    f'SELECT COUNT(*) FROM {safe} WHERE "{target_col}" = $1', [cls]
+                ).fetchone()[0]
+                cls_sample = max(1, int(n * cls_count / total))
+                df_cls = self.conn.execute(
+                    f'SELECT * FROM {safe} WHERE "{target_col}" = $1 USING SAMPLE {cls_sample}', [cls]
+                ).df()
+                frames.append(df_cls)
+            result = pd.concat(frames, ignore_index=True)
+            print(f"[duckdb] Stratified sample: {len(result):,}/{total:,} satır")
+            return result
+        else:
+            # Random sample
+            result = self.conn.execute(
+                f"SELECT * FROM {safe} USING SAMPLE {n}"
+            ).df()
+            print(f"[duckdb] Random sample: {len(result):,}/{total:,} satır")
+            return result
 
-        profile["columns"][col] = col_profile
+    def to_parquet(self, name: str, path: Path) -> None:
+        """DuckDB tablosunu parquet'e yaz."""
+        safe = name.replace(".", "_").replace("-", "_")
+        self.conn.execute(f"COPY {safe} TO '{path}' (FORMAT PARQUET)")
+        print(f"[duckdb] '{safe}' → {path} ({path.stat().st_size//1024:,} KB)")
 
-    profile["recommendations"] = _generate_recommendations(profile)
-    return profile
+    def _get_columns(self, safe_name: str) -> list[str]:
+        try:
+            return self.conn.execute(f"DESCRIBE {safe_name}").df()["column_name"].tolist()
+        except Exception:
+            return []
+
+    def close(self):
+        self.conn.close()
 
 
-def _safe_float(val: Any) -> float | None:
+def _sf(val: Any) -> float | None:
     try:
         f = float(val)
         return None if (np.isnan(f) or np.isinf(f)) else round(f, 4)
@@ -339,247 +597,316 @@ def _safe_float(val: Any) -> float | None:
         return None
 
 
-def _detect_outliers(series: pd.Series) -> float:
-    """Returns the fraction of outlier rows (IQR method). 0.0 means no outliers."""
-    try:
-        q1, q3 = series.quantile(0.25), series.quantile(0.75)
-        iqr = q3 - q1
-        if iqr == 0:
-            return 0.0
-        mask = (series < q1 - 1.5 * iqr) | (series > q3 + 1.5 * iqr)
-        return round(float(mask.mean()), 4)
-    except Exception:
-        return 0.0
+# ── Pandas merge (küçük tablolar için fallback) ──────────────
+def _merge_dataframes(
+    dfs: dict[str, pd.DataFrame],
+    merge_ops: list[dict],
+    anchor: str,
+) -> pd.DataFrame:
+    if len(dfs) == 1:
+        return list(dfs.values())[0]
+    result = dfs[anchor].copy()
+    for op in merge_ops:
+        rt = op["right"]
+        if rt not in dfs: continue
+        rdf = dfs[rt].copy()
+        overlap = (set(result.columns) & set(rdf.columns)) - {op["left_on"], op["right_on"]}
+        if overlap:
+            rdf = rdf.rename(columns={c: f"{c}_{rt}" for c in overlap})
+        before = len(result)
+        result = result.merge(rdf, left_on=op["left_on"], right_on=op["right_on"], how="left")
+        print(f"[merge] {op['left']}.{op['left_on']} → {rt}.{op['right_on']} | {before}→{len(result)}")
+    return result
 
 
+# ── Recommendations (DuckDB profil çıktısından) ──────────────
 def _generate_recommendations(profile: dict) -> list[str]:
-    """
-    Generates feature engineering recommendations based on profile results.
-    feature_engineering_node uses this list to make transformation decisions.
-
-    Rules:
-    - missing_rate threshold: >5% (avoids noise from negligible nulls)
-    - outlier threshold: >1% of rows (avoids flagging every numeric column)
-    - skewness is reported independently even when outliers are present
-    """
     recs = []
     summary = profile.get("summary", {})
     numeric_cols = set(summary.get("numeric_columns", []))
-
-    # General quality checks 
     missing_rate = summary.get("missing_rate", 0)
-    if missing_rate > 0.05:  # raised from 0.01 → meaningful threshold
-        recs.append(
-            f"Eksik değer imputation gerekli (missing_rate: %{missing_rate * 100:.1f})"
-        )
 
+    if missing_rate > 0.05:
+        recs.append(f"Eksik değer imputation gerekli (missing_rate: %{missing_rate*100:.1f})")
     if summary.get("duplicate_rows", 0) > 0:
         recs.append(f"Duplicate satır temizlenmeli ({summary['duplicate_rows']} adet)")
 
-    # Date column detection 
-    DATE_SUFFIXES = ("_date", "_at", "_time")
-    DATE_EXACT = {"created_at", "updated_at", "timestamp", "birth_date", "order_date"}
+    DATE_SUFFIXES = ("_date","_at","_time")
+    DATE_EXACT = {"created_at","updated_at","timestamp","birth_date","order_date"}
+    OUTLIER_THRESHOLD = 0.01
 
-    OUTLIER_RATE_THRESHOLD = 0.01  # >1% of rows must be outliers to flag
-
-    # Column-level recommendations 
     for col, info in profile.get("columns", {}).items():
-        dtype = info.get("dtype", "")
-        col_lower = col.lower()
-        is_id = col_lower.endswith("_id") or col_lower == "id"
-        is_date = (
-            "datetime" in dtype
-            or col_lower in DATE_EXACT
-            or any(col_lower.endswith(s) for s in DATE_SUFFIXES)
-        )
-        is_monetary = any(k in col_lower for k in ["price", "amount", "cost", "revenue"])
+        if "error" in info: continue
+        dtype       = info.get("dtype","").upper()
+        col_lower   = col.lower()
+        is_id       = col_lower.endswith("_id") or col_lower == "id"
+        is_date_col = ("DATE" in dtype or "TIME" in dtype or
+                       col_lower in DATE_EXACT or
+                       any(col_lower.endswith(s) for s in DATE_SUFFIXES))
+        is_monetary = any(k in col_lower for k in ["price","amount","cost","revenue"])
 
-        # outlier_rate is now a float (0.0–1.0), not a bool
         outlier_rate = info.get("has_outliers", 0.0)
-        if isinstance(outlier_rate, bool):  # backward-compat guard
+        if isinstance(outlier_rate, bool):
             outlier_rate = 0.05 if outlier_rate else 0.0
-        has_significant_outliers = outlier_rate > OUTLIER_RATE_THRESHOLD
+        has_outliers = outlier_rate > OUTLIER_THRESHOLD
 
-        skew = info.get("skewness")
-        cardinality = info.get("cardinality", "")
-        null_rate = info.get("null_rate", 0)
-        unique_count = info.get("unique_count", 0)
-        unique_rate = info.get("unique_rate", 0)
+        null_rate    = info.get("null_rate", 0)
+        unique_cnt   = info.get("unique_count", 0)
+        unique_rate  = info.get("unique_rate", 0)
+        cardinality  = info.get("cardinality","")
 
-        # ID columns → drop
         if is_id:
-            recs.append(f"'{col}' ID sütun — model eğitiminden çıkarılmalı")
-            continue
-
-        # Constant columns → drop
-        if unique_count == 1:
-            recs.append(f"'{col}' sabit değerli — model eğitiminden çıkarılmalı")
-            continue
-
-        # Date columns → feature extraction
-        if is_date:
-            recs.append(
-                f"'{col}' tarih kolonu — yıl/ay/gün/haftanın_günü özelliklerine dönüştür"
-            )
-            continue
-
-        # High null rate
+            recs.append(f"'{col}' ID sütun — model eğitiminden çıkarılmalı"); continue
+        if unique_cnt == 1:
+            recs.append(f"'{col}' sabit değerli — çıkarılmalı"); continue
+        if is_date_col:
+            recs.append(f"'{col}' tarih kolonu — yıl/ay/gün özelliklerine dönüştür"); continue
         if null_rate > 0.3:
-            recs.append(
-                f"'{col}' çok yüksek null oranı (%{null_rate * 100:.0f}) — drop veya agresif imputation"
-            )
-            continue
+            recs.append(f"'{col}' çok yüksek null (%{null_rate*100:.0f}) — drop veya agresif imputation"); continue
 
-        # Numeric columns
         if col in numeric_cols:
             parts = []
-
-            if is_monetary and has_significant_outliers:
-                parts.append(f"parasal + outlier (%{outlier_rate*100:.1f}) → RobustScaler önerilir")
+            if is_monetary and has_outliers:
+                parts.append(f"parasal+outlier (%{outlier_rate*100:.1f}) → RobustScaler")
             elif is_monetary:
-                parts.append("parasal kolon → StandardScaler önerilir")
-            elif has_significant_outliers:
-                parts.append(f"outlier oranı %{outlier_rate*100:.1f} → RobustScaler veya IQR capping önerilir")
-
-            # Skewness is reported independently (even alongside outlier warning)
+                parts.append("parasal → StandardScaler")
+            elif has_outliers:
+                parts.append(f"outlier %{outlier_rate*100:.1f} → RobustScaler/IQR capping")
+            skew = info.get("skewness")
             if skew is not None and abs(skew) > 1:
-                parts.append(f"çarpık dağılım (skewness={skew:.2f}) → log/sqrt transform önerilir")
-
+                parts.append(f"çarpık (skew={skew:.2f}) → log/sqrt transform")
             if parts:
                 recs.append(f"'{col}': {' | '.join(parts)}")
-            continue
-
-        # Categorical columns
-        if dtype == "object":
+        elif "VARCHAR" in dtype or "TEXT" in dtype:
             if unique_rate > 0.95:
-                recs.append(
-                    f"'{col}' neredeyse unique — drop veya hash encoding önerilir"
-                )
+                recs.append(f"'{col}' neredeyse unique → drop/hash encoding")
             elif cardinality == "high":
-                recs.append(
-                    f"'{col}' yüksek kardinaliteli ({unique_count} unique) — target encoding önerilir"
-                )
+                recs.append(f"'{col}' yüksek kardinalite ({unique_cnt}) → target encoding")
             elif cardinality == "medium":
-                recs.append(
-                    f"'{col}' orta kardinaliteli ({unique_count} unique) — label encoding önerilir"
-                )
+                recs.append(f"'{col}' orta kardinalite ({unique_cnt}) → label encoding")
             elif cardinality == "low":
-                recs.append(
-                    f"'{col}' düşük kardinaliteli ({unique_count} unique) — one-hot encoding önerilir"
-                )
-
+                recs.append(f"'{col}' düşük kardinalite ({unique_cnt}) → one-hot encoding")
     return recs
 
 
-# Main node
+# ── Ana node ─────────────────────────────────────────────────
 async def execution_node(state: AgentState) -> AgentState:
     """
-    Executes the analysis plan created by the planner.
+    BigData-ready execution node.
 
-    Uses intelligence_engine's db_intelligence to:
-    1. Start from the tables selected by the planner
-    2. Traverse the relationship graph to discover ALL connected tables
-    3. Pull tables via MCP in parallel
-    4. Merge using Python LEFT JOIN (NOT SQL JOIN)
-    5. Generate comprehensive profiling + feature engineering recommendations
-
-    State outputs:
-        sql_results      : Merged data (records, max 10K rows)
-        profiling_report : Statistical profile + recommendations
+    1. MCP'den chunked parallel fetch
+    2. DuckDB'ye yükle
+    3. Profiling: DuckDB full scan
+    4. Parquet'e yaz → state'e path kaydet
+    5. ML için stratified sample
     """
-    analysis_plan: list[dict] = state.get("analysis_plan", [])
-    db_intelligence: dict = state.get("db_intelligence", {})
+    analysis_plan  = state.get("analysis_plan", [])
+    db_intelligence= state.get("db_intelligence", {})
 
     if not analysis_plan:
         return {**state, "error": "Analiz planı boş.", "current_step": "execution_node"}
 
-    relationships: list[dict] = db_intelligence.get("relationships", [])
-    all_known_tables: list[str] = [
-        t["table_name"] for t in db_intelligence.get("tables", [])
-    ]
+    relationships    = db_intelligence.get("relationships", [])
+    all_known_tables = [t["table_name"] for t in db_intelligence.get("tables", [])]
 
-    df: pd.DataFrame | None = None
-    sql_results: list[dict] = []
-    profiling_report: dict = {}
+    duck = DuckDBEngine()
+    sql_results:     list[dict] = []
+    profiling_report:dict       = {}
+    data_path:       str        = ""
+    merged_table:    str        = ""
 
-    for step in analysis_plan:
-        step_name = step.get("step", "")
+    try:
+        for step in analysis_plan:
+            step_name = step.get("step","")
 
-        # SQL_QUERY
-        if step_name == "sql_query":
-            try:
-                selected_tables: list[str] = step.get("table_names", [])
-
-                if not selected_tables:
-                    tables = db_intelligence.get("tables", [])
+            # SQL query
+            if step_name == "sql_query":
+                selected = step.get("table_names", [])
+                if not selected:
+                    tables = db_intelligence.get("tables",[])
                     if tables:
-                        best = max(tables, key=lambda t: t.get("analytics_potential_score", 0))
-                        selected_tables = [best["table_name"]]
-
-                if not selected_tables:
+                        best = max(tables, key=lambda t: t.get("analytics_potential_score",0))
+                        selected = [best["table_name"]]
+                if not selected:
                     raise ValueError("SQL için tablo bulunamadı.")
 
-                # Relationship graph traverse
-                all_tables = _resolve_all_related_tables(
-                    selected_tables, relationships, all_known_tables
-                )
-                
-                # Extract db_name for each table
-                tables_info = db_intelligence.get("tables", [])
+                all_tables = _resolve_all_related_tables(selected, relationships, all_known_tables)
+
+                # db_name mapping
+                tables_info = db_intelligence.get("tables",[])
                 table_to_db = {}
                 for t in all_tables:
                     db_name = "default"
-                    for t_info in tables_info:
-                        if t_info.get("table_name") == t:
-                            db_name = str(t_info.get("db_name", "default")).strip().strip('",\'”’ \t\n')
+                    for ti in tables_info:
+                        if ti.get("table_name") == t:
+                            db_name = str(ti.get("db_name","default")).strip().strip('",\'"')
                             break
                     table_to_db[t] = db_name
 
-                print(f"[execution_node] Planner seçti  : {selected_tables}")
-                print(f"[execution_node] Graph traverse  : {all_tables}")
+                print(f"[execution] Planner: {selected}")
+                print(f"[execution] Graph traverse: {all_tables}")
 
-                # Parallel table fetch
+                # Parallel chunked fetch
                 raw_results = await _fetch_all_tables(table_to_db)
 
-                # Parse → DataFrame
+                # Parse -> DuckDB
                 dfs: dict[str, pd.DataFrame] = {}
                 for table, raw in raw_results.items():
-                    dfs[table] = _parse_mcp_response_to_dataframe(raw, table)
-                    print(f"[execution_node] '{table}': {len(dfs[table])} satır")
+                    df = _parse_mcp_to_df(raw, table)
+                    dfs[table] = df
+                    duck.load(table, df)
+                    print(f"[execution] '{table}': {len(df):,} satır")
 
-                # Anchor = most rows
-                anchor = max(dfs, key=lambda t: len(dfs[t]))
-                merge_ops = _build_merge_order(all_tables, relationships, anchor)
-                df = _merge_all_dataframes(dfs, merge_ops, anchor)
+                # Multi-table merge (DuckDB SQL JOIN - fast)
+                # Multi-table: tek SQL JOIN ile MCP'den çek
+                if len(all_tables) > 1:
+                    anchor     = _select_anchor_table(dfs, relationships, all_tables)
+                    merge_ops  = _build_merge_order(all_tables, relationships, anchor)
 
-                print(f"[execution_node] Final: {len(df)} satır x {len(df.columns)} kolon")
-                sql_results = df.where(pd.notnull(df), None).to_dict(orient="records")  # type: ignore[arg-type]
+                    if merge_ops:
+                        # JOIN SQL'ini dinamik olarak oluştur (LIMIT/OFFSET hariç base SQL)
+                        base_join_sql = _build_joined_sql(anchor, merge_ops, dfs, MAX_FETCH_ROWS)
+                        print(f"[execution] DB-side JOIN Base SQL:\n  {base_join_sql[:200]}...")
 
-            except Exception as e:
-                return {**state, "error": f"SQL hatası: {str(e)}",
-                        "current_step": "execution_node"}
+                        tables_info = db_intelligence.get("tables", [])
+                        anchor_db = "default"
+                        for ti in tables_info:
+                            if ti.get("table_name") == anchor:
+                                anchor_db = str(ti.get("db_name", "default")).strip().strip('",\'')
+                                break
 
-        # PROFILING
-        elif step_name == "profiling":
-            if df is None or df.empty:
-                return {**state, "error": "Profiling için veri yok.",
-                        "current_step": "execution_node"}
-            try:
-                profiling_report = _profile_dataframe(df)
+                        # Chunked Fetch
+                        chunks_text = []
+                        header_written = False
+                        
+                        # Use a safe chunk size below MAX_DISPLAY_ROWS
+                        SAFE_CHUNK_SIZE = 10_000
+                        
+                        async with streamable_http_client(settings.MCP_SERVER_URL) as (read, write, _):
+                            async with ClientSession(read, write) as session:
+                                await session.initialize()
+                                
+                                for offset in range(0, MAX_FETCH_ROWS, SAFE_CHUNK_SIZE):
+                                    limit = min(SAFE_CHUNK_SIZE, MAX_FETCH_ROWS - offset)
+                                    chunk_sql = f"{base_join_sql} LIMIT {limit} OFFSET {offset}"
+                                    
+                                    result = await session.call_tool(
+                                        "run_sql_query",
+                                        {"query": chunk_sql, "db_name": anchor_db}
+                                    )
+                                    chunk_text = ""
+                                    if getattr(result, "content", None):
+                                        for item in result.content:
+                                            if getattr(item, "type", "") == "text":
+                                                chunk_text = getattr(item, "text", "")
+                                                
+                                    # Eğer data dönmediyse break
+                                    if "Returned 0 rows" in chunk_text or not chunk_text:
+                                        break
+                                        
+                                    if not header_written:
+                                        chunks_text.append(chunk_text)
+                                        header_written = True
+                                    else:
+                                        data_lines = [l for l in chunk_text.splitlines() if l.strip().startswith("(")]
+                                        if not data_lines:
+                                            break
+                                        chunks_text.append("\n".join(data_lines))
+                                        
+                                    print(f"[execution] JOIN chunk: {offset+limit:,}/{MAX_FETCH_ROWS:,} satır çekildi")
+
+                        raw_joined = "\n".join(chunks_text)
+                        merged_df = _parse_mcp_to_df(raw_joined, "joined")
+                        print(f"[execution] DB-side JOIN sonucu: {len(merged_df):,} satır × {len(merged_df.columns)} kolon")
+                    else:
+                        # merge_ops boş → tablolar arasında bilinen ilişki yok, anchor kullan
+                        merged_df = dfs[anchor]
+
+                    merged_name = f"merged_{uuid.uuid4().hex[:8]}"
+                    duck.load(merged_name, merged_df)
+                    merged_table = merged_name
+                else:
+                    merged_table = list(dfs.keys())[0].replace(".", "_").replace("-", "_")
+
+                print(f"[execution] Merged table: '{merged_table}'")
+
+                # Parquet'e yaz
+                parquet_path = PARQUET_DIR / f"{merged_table}.parquet"
+                duck.to_parquet(merged_table, parquet_path)
+                data_path = str(parquet_path)
+
+                # State için küçük preview (max 1000 satır)
+                preview = duck.query(f"SELECT * FROM {merged_table} LIMIT 1000")
+                sql_results = preview.where(pd.notnull(preview), None).to_dict(orient="records")
+
+            # ── PROFILING ──────────────────────────────────────
+            elif step_name == "profiling":
+                if not merged_table:
+                    raise ValueError("Profiling için tablo yok.")
+                profiling_report = duck.profile_table(merged_table)
                 shape = profiling_report["shape"]
-                print(f"[execution_node] Profiling: "
-                      f"{shape['rows']} satır x {shape['columns']} kolon | "
-                      f"{len(profiling_report.get('recommendations', []))} öneri")
-            except Exception as e:
-                return {**state, "error": f"Profiling hatası: {str(e)}",
-                        "current_step": "execution_node"}
+                print(f"[execution] Profiling: {shape['rows']:,}×{shape['columns']} | "
+                      f"{len(profiling_report.get('recommendations',[]))} öneri")
 
-        else:
-            continue
+            else:
+                continue
+
+    except Exception as e:
+        duck.close()
+        return {**state, "error": f"Execution hatası: {str(e)}", "current_step": "execution_node"}
+
+    finally:
+        duck.close()
 
     return {
         **state,
-        "sql_results": sql_results,
+        "sql_results":      sql_results,       # preview (1K satır)
+        "data_path":        data_path,          # YENİ: parquet path
         "profiling_report": profiling_report,
-        "current_step": "execution_node",
+        "current_step":     "execution_node",
     }
+
+
+def _merge_with_duckdb(
+    duck: DuckDBEngine,
+    dfs: dict[str, pd.DataFrame],
+    merge_ops: list[dict],
+    anchor: str,
+) -> pd.DataFrame:
+    """
+    DuckDB SQL JOIN ile multi-table merge.
+    Pandas merge'den çok daha hızlı büyük tablolarda.
+    """
+    if not merge_ops:
+        return dfs[anchor]
+
+    # Tüm tabloları DuckDB'de zaten var
+    # SQL JOIN zinciri oluştur
+    safe_anchor = anchor.replace(".","_").replace("-","_")
+    select_parts = [f"{safe_anchor}.*"]
+    join_parts   = []
+
+    for op in merge_ops:
+        rt   = op["right"].replace(".","_").replace("-","_")
+        lo   = op["left_on"]
+        ro   = op["right_on"]
+        left = op["left"].replace(".","_").replace("-","_")
+
+        # Overlap kolonları prefix'le
+        rdf_cols = duck._get_columns(rt)
+        safe_cols = []
+        for c in rdf_cols:
+            if c == ro:
+                continue  # join key'i tekrar alma
+            safe_cols.append(f'{rt}."{c}" AS "{c}_{rt}"')
+        select_parts.extend(safe_cols)
+        join_parts.append(f'LEFT JOIN {rt} ON {left}."{lo}" = {rt}."{ro}"')
+
+    sql = f"SELECT {', '.join(select_parts)} FROM {safe_anchor} {' '.join(join_parts)}"
+    try:
+        result = duck.query(sql)
+        print(f"[duckdb] DuckDB JOIN: {len(result):,} satır")
+        return result
+    except Exception as e:
+        print(f"[duckdb] JOIN hatası, pandas merge'e fallback: {e}")
+        return _merge_dataframes(dfs, merge_ops, anchor)
