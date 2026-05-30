@@ -14,18 +14,14 @@ from src.nodes.evaluation_node import evaluation_node
 from src.nodes.critic_node import critic_node
 from src.nodes.report_node import report_node
 from src.nodes.sql_node import sql_node
+from src.nodes.target_discovery_node import target_discovery_node
 
 # Routing functions
 def route_after_db_context(state: AgentState) -> str:
-    """
-    split for intent node after
-      sql_query  → sql_node   → END
-      others  → planner_node → ML pipeline
-    """
     intent = state.get("intent", "eda")
     if intent == "sql_query":
         return "sql_node"
-    return "planner_node"
+    return "target_discovery_node"
 
 
 def route_after_execution(state: AgentState) -> str:
@@ -78,6 +74,7 @@ def build_graph() -> StateGraph:
     graph.add_node("db_context_node",          db_context_node)
     graph.add_node("sql_node",                 sql_node)
     graph.add_node("planner_node",             planner_node)
+    graph.add_node("target_discovery_node",    target_discovery_node)
     graph.add_node("execution_node",           execution_node)
     graph.add_node("feature_plan_node",        feature_plan_node)
     graph.add_node("feature_engineering_node", feature_engineering_node)
@@ -95,10 +92,11 @@ def build_graph() -> StateGraph:
         "db_context_node",
         route_after_db_context,
         {
-            "sql_node":     "sql_node",
-            "planner_node": "planner_node",
+            "sql_node":              "sql_node",
+            "target_discovery_node": "target_discovery_node",   # planner_node yerine
         },
-    )
+)
+
 
     # sql_node → END
     graph.add_edge("sql_node", END)
@@ -131,6 +129,7 @@ def build_graph() -> StateGraph:
         }
     )
     
+    graph.add_edge("target_discovery_node", "planner_node")
     graph.add_edge("report_node",              END)
 
     return graph.compile()

@@ -34,6 +34,8 @@ dependencies = [
     "psycopg2-binary>=2.9.0",
     "pymysql>=1.1.0",
     "pyodbc>=5.1.0",
+    "duckdb>=1.5.3",
+    "imbalanced-learn>=0.14.1",
 ]
 
 [tool.pyrefly]

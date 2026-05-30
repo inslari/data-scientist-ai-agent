@@ -8,6 +8,7 @@
 venv/
 env/
 ENV/
+data/
 
 # Python Compiled Files
 __pycache__/

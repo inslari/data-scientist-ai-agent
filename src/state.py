@@ -16,6 +16,9 @@ class AgentState(TypedDict, total=False):
     db_intelligence: dict            # DatabaseIntelligenceModel dict
     relevant_tables: list[str]       # Filtered tables for planner
 
+    # Target Discovery Node output
+    target_definition: dict          # Target definition for modeling
+
     # Planner output
     analysis_plan: list[dict]        # Plan steps
 
@@ -23,6 +26,7 @@ class AgentState(TypedDict, total=False):
     feature_plan: dict               # Feature engineering plan from LLM
 
     # Execution Node output
+    data_path: str
     sql_results: list[dict]          # Raw data records
     profiling_report: dict           # Column statistics, null rates, dtypes
 
@@ -37,7 +41,8 @@ class AgentState(TypedDict, total=False):
     model_name: str                  # Selected model name
     model_params: dict               # Hyperparameters
     model_artifact: Any              # Picklable trained model
-
+    top_models: list[str]            # Top 2 Best Models
+    
     # Evaluation output
     metrics: dict                    # Model evaluation metrics
     insights: list[str]              # LLM generated insights
@@ -68,3 +73,4 @@ class AgentState(TypedDict, total=False):
     current_step: str                # Current active node
     error: Optional[str]             # Errors
     messages: list                   # LLM conversation history
+    excluded_models: list[str]       # Models excluded due to overfitting
