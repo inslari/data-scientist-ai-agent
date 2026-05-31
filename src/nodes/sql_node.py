@@ -5,7 +5,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-
+import ast
 from langchain_core.prompts import ChatPromptTemplate
 from src.core.llm import get_llm
 from src.core.config import settings
@@ -215,10 +215,11 @@ async def _async_run_query(sql: str, db_name: str) -> tuple[list[str], list[tupl
                 dl = dl.strip()
                 if not dl or dl.startswith("..."):
                     continue
-                try:
-                    rows.append(eval(dl))
-                except Exception:
-                    pass
+                if dl.startswith("(") and dl.endswith(")"):
+                    try:
+                        rows.append(ast.literal_eval(dl))
+                    except Exception:
+                        pass
             break
 
     return columns, rows

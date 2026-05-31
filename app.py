@@ -457,7 +457,7 @@ def run_pipeline(user_query: str) -> AgentState:
             elif node_name == "sql_node":
                 query_raw = chunk[node_name].get("sql_query_raw", "")
                 results = chunk[node_name].get("sql_query_results", [])
-                msg = {"name": "SQL Agent", "content": "Executed SQL query against the database.", "code": query_raw, "dataframe": pd.DataFrame(results[:5]) if results else None}
+                msg = {"name": "SQL Agent", "content": "Executed SQL query against the database.", "code": query_raw, "dataframe": pd.DataFrame(results[:50]) if results else None}
             elif node_name == "execution_node":
                 prof = chunk[node_name].get("profiling_report", {})
                 df = pd.DataFrame([{"Kolon":c,"Tip":i.get("dtype",""),"Boşluk":f"{i.get('null_rate',0):.1%}"} for c,i in prof.get("columns",{}).items()]) if prof else None
@@ -572,7 +572,9 @@ def render_sql_results(result: AgentState):
     n_rows     = len(rows)
     n_cols     = len(columns)
     tick_angle = -45 if len(labels) > 10 else 0
-    ch_height  = max(420, min(len(labels)*18, 700)) if labels else 420
+    #ch_height = max(420, min(max(len(labels) if labels else 0, len(rows) if rows else 0) * 35 + 50, 700))
+    table_height = min(len(rows) * 35 + 60, 800)
+
 
     PLOTLY_CONFIG = {
         "scrollZoom": True, "displayModeBar": True, "displaylogo": False,
@@ -664,12 +666,12 @@ def render_sql_results(result: AgentState):
                     st.markdown(render_metric_card(k.replace("_"," ").upper(), dv, color=COLORS[i%len(COLORS)]), unsafe_allow_html=True)
 
         elif chart_type == "table" or not labels:
-            if rows: st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=ch_height)
+            if rows: st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=table_height)
             else: st.info("Sonuç bulunamadı.")
 
         elif chart_type == "pie":
             if len(labels) > 12:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=ch_height)
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=table_height)
             else:
                 values = datasets[0]["data"] if datasets else []
                 fig = go.Figure(go.Pie(
@@ -679,7 +681,7 @@ def render_sql_results(result: AgentState):
                     textinfo="label+percent+value",
                     hovertemplate="<b>%{label}</b><br>%{value}<br>%{percent}<extra></extra>",
                 ))
-                fig.update_layout(**PLOTLY_LAYOUT, height=ch_height, showlegend=True,
+                fig.update_layout(**PLOTLY_LAYOUT, height=table_height, showlegend=True,
                     legend=dict(font=dict(family="JetBrains Mono",size=10), bgcolor="rgba(0,0,0,0)"))
                 st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
@@ -695,7 +697,7 @@ def render_sql_results(result: AgentState):
                     textfont=dict(family="JetBrains Mono",size=10,color=CHART_TEXT_COLOR),
                     hovertemplate="<b>%{x}</b><br>%{y:,.4f}<extra></extra>",
                 ))
-            fig.update_layout(**PLOTLY_LAYOUT, height=ch_height, bargap=0.15,
+            fig.update_layout(**PLOTLY_LAYOUT, height=table_height, bargap=0.15,
                 xaxis=dict(**{k:v for k,v in AXIS_STYLE.items() if k!="tickfont"},
                            tickangle=tick_angle,
                            tickfont=dict(family="JetBrains Mono",size=9 if len(labels)>20 else 11,color=CHART_LABEL_COLOR)),
@@ -713,7 +715,7 @@ def render_sql_results(result: AgentState):
                     line=dict(color=COLORS[i%len(COLORS)],width=2), marker=dict(size=5),
                     hovertemplate="<b>%{x}</b><br>%{y:,.4f}<extra></extra>",
                 ))
-            fig.update_layout(**PLOTLY_LAYOUT, height=ch_height,
+            fig.update_layout(**PLOTLY_LAYOUT, height=table_height,
                 xaxis=dict(**AXIS_STYLE, tickangle=tick_angle,
                            tickfont=dict(size=9 if len(labels)>20 else 11,color=CHART_LABEL_COLOR)),
                 yaxis=dict(**AXIS_STYLE),
@@ -729,7 +731,7 @@ def render_sql_results(result: AgentState):
                             line=dict(color="rgba(255,255,255,0.1)",width=1)),
                 hovertemplate="<b>%{x}</b><br>%{y:,.4f}<extra></extra>",
             ))
-            fig.update_layout(**PLOTLY_LAYOUT, height=ch_height,
+            fig.update_layout(**PLOTLY_LAYOUT, height=table_height,
                 xaxis=dict(**AXIS_STYLE,tickangle=tick_angle,
                            tickfont=dict(size=9 if len(labels)>20 else 11,color=CHART_LABEL_COLOR)),
                 yaxis=dict(**AXIS_STYLE), showlegend=False)
@@ -742,7 +744,7 @@ def render_sql_results(result: AgentState):
             for col in df.columns:
                 if pd.api.types.is_float_dtype(df[col]):
                     df[col] = df[col].map(lambda x: f"{x:,.4f}" if pd.notna(x) else "")
-            st.dataframe(df, use_container_width=True, hide_index=True, height=ch_height)
+            st.dataframe(df, use_container_width=True, hide_index=True, height=table_height)
         else:
             st.info("Sonuç bulunamadı.")
 
