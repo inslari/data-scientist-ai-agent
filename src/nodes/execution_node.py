@@ -208,8 +208,9 @@ def _select_anchor_table(
 def _parse_mcp_to_df(raw: str, table_name: str = "") -> pd.DataFrame:
     if not raw:
         raise ValueError(f"[{table_name}] MCP boş yanıt döndürdü.")
-    if "Error" in raw or "SQL Error" in raw:
-        raise ValueError(f"[{table_name}] MCP SQL hatası: {raw}")
+    if raw.strip().startswith("Error") or raw.strip().startswith("SQL Error"):
+        # raw çok uzun olabilir, hatayı basarken ilk 200 karakteri al
+        raise ValueError(f"[{table_name}] MCP SQL hatası: {raw[:200]}")
 
     lines = raw.strip().splitlines()
     columns: list[str] = []
@@ -826,7 +827,9 @@ async def execution_node(state: AgentState) -> AgentState:
                     duck.load(merged_name, merged_df)
                     merged_table = merged_name
                 else:
-                    merged_table = list(dfs.keys())[0].replace(".", "_").replace("-", "_")
+                    # Tek tablo — zaten yukarıda duck.load() ile yüklendi
+                    single_name = list(dfs.keys())[0]
+                    merged_table = single_name.replace(".", "_").replace("-", "_")
 
                 print(f"[execution] Merged table: '{merged_table}'")
 
@@ -834,8 +837,8 @@ async def execution_node(state: AgentState) -> AgentState:
                 parquet_path = PARQUET_DIR / f"{merged_table}.parquet"
                 duck.to_parquet(merged_table, parquet_path)
                 data_path = str(parquet_path)
-
-                # State için küçük preview (max 1000 satır)
+                print(f"[execution] Parquet yazıldı: {data_path}")
+                # Preview (1K satır)
                 preview = duck.query(f"SELECT * FROM {merged_table} LIMIT 1000")
                 sql_results = preview.where(pd.notnull(preview), None).to_dict(orient="records")
 
@@ -852,6 +855,9 @@ async def execution_node(state: AgentState) -> AgentState:
                 continue
 
     except Exception as e:
+        import traceback
+        print(f"\n[execution] HATA: {e}")
+        print(traceback.format_exc())
         duck.close()
         return {**state, "error": f"Execution hatası: {str(e)}", "current_step": "execution_node"}
 

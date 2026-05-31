@@ -5,7 +5,7 @@ from __future__ import annotations
 import warnings
 from pathlib import Path
 from typing import Any
-
+import re
 import duckdb
 import numpy as np
 import pandas as pd
@@ -257,6 +257,19 @@ def _clean_data(df: pd.DataFrame) -> pd.DataFrame:
     if before - len(df) > 0:
         print(f"[feature_eng] {before-len(df)} duplicate temizlendi")
 
+    # String olarak gelen fiyat/sayı kolonlarını temizle (örn: '9.99$')
+    for col in df.select_dtypes(include=["object"]).columns:
+        # Hız için tüm kolona değil, rastgele seçilmiş 1000 satıra bakıyoruz.
+        non_nulls = df[col].dropna()
+        n_sample = min(1000, len(non_nulls))
+        sample = non_nulls.sample(n=n_sample, random_state=42).astype(str) if n_sample > 0 else pd.Series(dtype=str)
+        if len(sample) > 0 and sample.str.contains(r'[\$€£]').mean() > 0.05:
+            df[col] = df[col].astype(str).str.replace(r'[^\d\.]', '', regex=True)
+            # Eğer sadece nokta kalmışsa NaN yap
+            df[col] = df[col].replace('.', np.nan)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            print(f"[feature_eng] '{col}' kolonu metin bazlı currency algılandı, numerik formata çevrildi.")
+
     for col in df.select_dtypes(include=[np.number]).columns:
         if df[col].isnull().any():
             med_val = df[col].median()
@@ -276,7 +289,7 @@ def _clean_data(df: pd.DataFrame) -> pd.DataFrame:
 
 # Target variable
 def _resolve_target(
-    df: pd.DataFrame, plan: dict
+    df: pd.DataFrame, plan: dict, intent: str = ""
 ) -> tuple[pd.DataFrame, pd.Series, str]:
     target          = plan.get("target", {})
     target_name     = target.get("column_name", "")
@@ -285,11 +298,28 @@ def _resolve_target(
 
     if not is_derived and target_name in df.columns:
         y = df[target_name].copy()
-        if y.dtype == object:
-            y = pd.Categorical(y).codes
+
+        # String/object ama sayısal mı? ($, €, virgül temizle)
+        # pandas StringDtype VE object dtype ikisini de yakala
+        is_string_like = (
+            y.dtype == object
+            or pd.api.types.is_string_dtype(y)
+            or str(y.dtype) == "string"
+        )
+        if is_string_like:
+            import re
+            cleaned = y.astype(str).str.replace(r'[^\d.\-]', '', regex=True)
+            numeric_y = pd.to_numeric(cleaned, errors='coerce')
+            if numeric_y.notna().mean() > 0.8:
+                y = numeric_y
+                print(f"[feature_eng] Hedef '{target_name}' string→numeric çevrildi (para/sayı)")
+            else:
+                y = pd.Categorical(y).codes
+                print(f"[feature_eng] Hedef '{target_name}' kategorik → codes")
+
         cols_drop = _find_related_target_cols(df, target_name)
         df = df.drop(columns=cols_drop, errors="ignore")
-        print(f"[feature_eng] Hedef: '{target_name}' | dağılım: {pd.Series(y).value_counts().to_dict()}")
+        print(f"[feature_eng] Hedef: '{target_name}' | dtype: {y.dtype}")
         return df, pd.Series(y, name=target_name), target_name
 
     if is_derived and derivation_type == "time_based":
@@ -540,6 +570,9 @@ def feature_engineering_node(state: AgentState) -> AgentState:
     try:
         df = _load_data(state)
     except Exception as e:
+        import traceback
+        print(f"\n[feature_eng] HATA: {e}")
+        print(traceback.format_exc())
         return {**state, "error": str(e), "current_step":"feature_engineering_node"}
 
     print(f"[feature_eng] Veri: {len(df):,} satır × {len(df.columns)} kolon")
@@ -561,7 +594,7 @@ def feature_engineering_node(state: AgentState) -> AgentState:
     df = _clean_data(df)
 
     # Hedef değişken
-    df, y, target_name = _resolve_target(df, feature_plan)
+    df, y, target_name = _resolve_target(df, feature_plan, intent)
 
     # Aggregation
     df, y = _aggregate_if_needed(df, y, feature_plan, meta)

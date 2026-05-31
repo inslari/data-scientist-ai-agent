@@ -313,41 +313,52 @@ def _validate_target_selection(
     target_definition: dict | None = None,
 ) -> None:
     """
-    LLM'in seçtiği hedef kolonu hem target_discovery_node önerisi hem de
-    db_intelligence semantic_type etiketlerine göre dinamik olarak validate eder.
+    LLM'in seçtiği hedef kolonu validate eder.
 
-    Algoritma:
-    1. Önce target_discovery_node'un önerisi var mı kontrol et (yüksek confidence ise kabul et)
-    2. db_intelligence'daki semantic_type='target' kolonları al (IE'nin ground truth'u)
-    3. Eğer LLM'in seçimi zaten target-etiketli ise OK
-    4. Eğer değilse: target-etiketli kolonlar arasından kullanıcı sorgusuna
-       en yakın olanı word-overlap + description scoring ile seç
-    5. Hiç target-etiketli kolon yoksa: LLM kararına saygı duy (IE kendisi hatalı)
+    Algoritma (sırasıyla):
+    1. HALÜSİNASYON KONTROLÜ: LLM'in kolonu db'de var mı? Yoksa target_discovery'ye fallback.
+    2. TARGET DISCOVERY OVERRIDE: Yüksek confidence (≥0.5) varsa target_discovery'ye güven.
+    3. SEMANTIC TYPE KONTROLÜ: Mevcut seçim semantic_type=target mı?
+    4. WORD OVERLAP FALLBACK: Hiçbiri olmazsa kullanıcı sorgusuna en yakın aday.
 
     Hardcoded isim KULLANMAZ. Her dataset için çalışır.
     plan_dict in-place değiştirilir.
     """
     current_target = plan_dict.get("target", {}).get("column_name", "")
     all_cols       = db_intelligence.get("columns", [])
+    target_def     = target_definition or {}
+    discovery_target = target_def.get("column_name", "")
+    confidence       = target_def.get("confidence", 0.0)
 
-    # check target_discovery_node 
-    if target_definition:
-        discovery_target = target_definition.get("column_name", "")
-        confidence       = target_definition.get("confidence", 0.0)
+    # ── 1. HALÜSİNASYON KONTROLÜ ─────────────────────────────
+    # LLM uydurma kolon mu seçti?
+    all_col_names = {col["column_name"] for col in all_cols}
+    if current_target and current_target not in all_col_names:
+        print(f"[feature_plan] ⚠️  LLM'in seçtiği '{current_target}' veritabanında YOK (halüsinasyon)!")
+        if discovery_target and discovery_target in all_col_names:
+            print(f"[feature_plan] ✓  target_discovery_node'un geçerli '{discovery_target}' kolonu kullanılacak.")
+            plan_dict["target"]["column_name"]     = discovery_target
+            plan_dict["target"]["is_derived"]      = False
+            plan_dict["target"]["derivation_type"] = "none"
+            current_target = discovery_target
+        else:
+            print("[feature_plan] 🚨 Geçerli bir target bulunamadı!")
+            return
 
-        if discovery_target and confidence >= 0.7:
-            # high confidence 
-            if current_target != discovery_target:
-                print(f"[feature_plan] ⚠️  LLM='{current_target}' ama target_discovery_node "
-                      f"='{discovery_target}' (confidence={confidence:.2f}). Override.")
-                plan_dict["target"]["column_name"]    = discovery_target
-                plan_dict["target"]["is_derived"]     = False
-                plan_dict["target"]["derivation_type"] = "none"
-                current_target = discovery_target
-            else:
-                print(f"[feature_plan] ✓  LLM ve target_discovery_node uyumlu: '{current_target}' "
-                      f"(confidence={confidence:.2f})")
+    # ── 2. TARGET DISCOVERY OVERRIDE (yüksek confidence) ─────
+    if discovery_target and confidence >= 0.5:
+        if current_target != discovery_target:
+            print(f"[feature_plan] ⚠️  LLM='{current_target}' ama target_discovery_node "
+                  f"='{discovery_target}' (confidence={confidence:.2f}). Override.")
+            plan_dict["target"]["column_name"]     = discovery_target
+            plan_dict["target"]["is_derived"]      = False
+            plan_dict["target"]["derivation_type"] = "none"
+            current_target = discovery_target
+        else:
+            print(f"[feature_plan] ✓  LLM ve target_discovery_node uyumlu: '{current_target}' "
+                  f"(confidence={confidence:.2f})")
 
+    # ── 3. SEMANTIC TYPE KONTROLÜ ────────────────────────────
     target_candidates = [
         col for col in all_cols
         if col.get("semantic_type") == "target"
@@ -362,17 +373,14 @@ def _validate_target_selection(
         print(f"[feature_plan] ✓  Target geçerli: '{current_target}' (semantic_type=target)")
         return
 
-    print(
-        f"[feature_plan] ⚠️  '{current_target}' kolonu semantic_type=target değil. "
-        f"Düzeltiliyor..."
-    )
-
+    # ── 4. WORD OVERLAP FALLBACK ─────────────────────────────
+    print(f"[feature_plan] ⚠️  '{current_target}' kolonu semantic_type=target değil. Düzeltiliyor...")
     best = _score_target_by_query_overlap(target_candidates, user_query)
     print(f"[feature_plan] ✓  Target override: '{current_target}' → '{best['column_name']}' "
           f"(skor: {best['_score']:.3f})")
 
-    plan_dict["target"]["column_name"]    = best["column_name"]
-    plan_dict["target"]["is_derived"]     = False
+    plan_dict["target"]["column_name"]     = best["column_name"]
+    plan_dict["target"]["is_derived"]      = False
     plan_dict["target"]["derivation_type"] = "none"
 
 

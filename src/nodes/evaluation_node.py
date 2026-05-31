@@ -199,9 +199,11 @@ def _evaluate_classification(
     if is_binary and y_prob_test is not None:
         try:
             precision_curve, recall_curve, _ = precision_recall_curve(y_test, y_prob_test[:, 1])
+            from sklearn.metrics import average_precision_score
             evaluation["precision_recall_curve"] = {
                 "precision": [round(float(x), 4) for x in precision_curve[::max(1, len(precision_curve) // 20)]],
                 "recall": [round(float(x), 4) for x in recall_curve[::max(1, len(recall_curve) // 20)]],
+                "pr_auc": round(float(average_precision_score(y_test, y_prob_test[:, 1])), 4)
             }
         except Exception:
             pass

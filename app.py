@@ -1021,6 +1021,23 @@ def render_results(result: AgentState):
                         legend=dict(font=dict(family="JetBrains Mono",size=10),bgcolor="rgba(0,0,0,0)"))
                     st.plotly_chart(fig_roc,use_container_width=True)
 
+            pr_data = ev.get("precision_recall_curve", {})
+            if pr_data:
+                cl_pr, cr_pr = st.columns(2)
+                with cl_pr:
+                    pr_auc = pr_data.get("pr_auc", 0)
+                    section_header("Precision-Recall Curve", f"PR-AUC = {pr_auc:.4f}")
+                    prec = pr_data.get("precision", [])
+                    rec = pr_data.get("recall", [])
+                    fig_pr = go.Figure()
+                    fig_pr.add_trace(go.Scatter(x=rec, y=prec, mode="lines", fill="tozeroy",
+                        line=dict(color="#f7971e", width=2), fillcolor="rgba(247,151,30,0.08)", name=f"PR-AUC={pr_auc:.4f}"))
+                    fig_pr.update_layout(**PLOTLY_LAYOUT, height=300,
+                        xaxis=dict(**AXIS_STYLE, title="Recall (True Positive Rate)"), 
+                        yaxis=dict(**AXIS_STYLE, title="Precision (Positive Predictive Value)"),
+                        legend=dict(font=dict(family="JetBrains Mono", size=10), bgcolor="rgba(0,0,0,0)"))
+                    st.plotly_chart(fig_pr, use_container_width=True)
+
             if per_class:
                 section_header("Per-Class Performance","Precision, Recall, F1 by class")
                 pc_df=pd.DataFrame(per_class).T.reset_index()

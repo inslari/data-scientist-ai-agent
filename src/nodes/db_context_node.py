@@ -20,10 +20,18 @@ async def db_context_node(state: AgentState) -> AgentState:
 
     engine   = DatabaseIntelligenceEngine()
     print(">>> DatabaseIntelligenceEngine başlatıldı. Şema analizi için LLM'e (Ollama) istek atılıyor (Bu işlem uzun sürebilir)...")
-    db_model = engine.analyze_schema(
-        schema_text=raw_schema,
-        sample_data=sample_data,
-    )
+    try:
+        db_model = engine.analyze_schema(
+            schema_text=raw_schema,
+            sample_data=sample_data,
+        )
+    except Exception as e:
+        print(f">>> LLM analizi başarısız oldu: {str(e)[:200]}")
+        print(">>> Fallback moduna geçiliyor (örnek veri olmadan tekrar deneniyor)...")
+        db_model = engine.analyze_schema(
+            schema_text=raw_schema,
+            sample_data="Örnek veri çok uzun olduğu için LLM halüsinasyonuna yol açtı, çıkarıldı.",
+        )
     print(">>> LLM analizi başarıyla tamamlandı!")
 
     intent          = state.get("intent", "eda")
@@ -69,6 +77,8 @@ async def _fetch_schema_and_samples() -> tuple[str, str]:
                         {"query": f'SELECT * FROM "{table}" LIMIT 3', "db_name": db_name}
                     )
                     r_text = getattr(r.content[0], "text", "") if r.content else ""
+                    if len(r_text) > 500:
+                        r_text = r_text[:500] + "\n... (truncated)"
                     sample_parts.append(f"Database: {db_name} | Table: {table}\n{r_text}")
                 except Exception:
                     pass

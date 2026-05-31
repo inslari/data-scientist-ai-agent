@@ -95,14 +95,40 @@ def _find_candidates(
             cand.score += 1.5
             cand.reasons.append("boolean naming")
 
-        # Low cardinality numerical → classification
-        if 0 < cand.unique_count <= 10:
-            cand.score += 1.0
-            cand.reasons.append(f"low cardinality ({cand.unique_count})")
-        elif cand.unique_count > 50 and intent == "regression":
-            cand.score += 1.0
-            cand.reasons.append("high cardinality, regression candidate")
+        if intent == "regression":
+        # Regression: yüksek kardinaliteli sayısal kolon ister
+            if cand.unique_count > 50:
+                cand.score += 3.0
+                cand.reasons.append(f"high cardinality ({cand.unique_count}) — regression")
+            elif cand.unique_count > 20:
+                cand.score += 1.5
+                cand.reasons.append(f"medium cardinality ({cand.unique_count})")
+            elif 0 < cand.unique_count <= 10:
+                # Regression için düşük kardinalite kötü — penalty
+                cand.score -= 1.0
+                cand.reasons.append(f"too few values for regression ({cand.unique_count})")
+        else:
+            # Classification: düşük kardinalite ister
+            if 0 < cand.unique_count <= 10:
+                cand.score += 1.0
+                cand.reasons.append(f"low cardinality ({cand.unique_count})")
+            elif cand.unique_count > 50:
+                cand.score -= 0.5
+                cand.reasons.append(f"high cardinality ({cand.unique_count}) — not ideal for classification")
 
+        # Ayrıca regression için sayısal kolon bonus'u ekle:
+        if intent == "regression":
+            # Description veya sample'lara bakarak sayısal mı anla
+            dtype = col_info.get("dtype", "").lower()
+            if any(t in dtype for t in ("int", "float", "double", "decimal", "numeric")):
+                cand.score += 2.0
+                cand.reasons.append("numeric dtype — good for regression")
+            # Para birimi keywords (price, cost, amount, revenue)
+            for kw in ("price", "cost", "amount", "revenue", "value", "fiyat", "tutar"):
+                if kw in col_name.lower() or kw in description.lower():
+                    cand.score += 2.0
+                    cand.reasons.append(f"monetary keyword: {kw}")
+                    break
         # User query × description overlap
         if user_query and description:
             stopwords = {
@@ -137,17 +163,18 @@ def _find_candidates(
     return candidates
 
 
+# target_discovery_node.py içindeki _ask_llm fonksiyonunu şununla replace et:
+
 def _ask_llm(
     user_query: str,
     intent: str,
     candidates: list[TargetCandidate],
     db_intelligence: dict,
 ) -> str:
-    try:
-        from openai import OpenAI
-    except ImportError:
-        print("[target_discovery] OpenAI yok, matematiksel skor kullanılıyor.")
-        return ""
+    """LLM'e final kararı sor. Hata varsa boş string döner."""
+    import os
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from src.core.llm import get_llm
 
     tables_summary = "\n".join(
         f"- {t.get('table_name')}: {t.get('description', '')}"
@@ -168,6 +195,7 @@ KURALLAR:
 - Kullanıcının sorusunun ANLAMINI dikkate al
 - Kolon AÇIKLAMASINA bak, kolon ADINA değil
 - Binary (0/1) kolonlar classification için idealdir
+- Regression için: yüksek kardinaliteli sayısal kolonlar idealdir (price, revenue, amount)
 - ID, timestamp, identifier kolonları ASLA hedef olamaz
 
 Sadece kolon adını döndür, başka bir şey yazma."""
@@ -184,20 +212,13 @@ Aday hedef kolonlar:
 En uygun hedef kolon hangisi? Sadece kolon adını yaz:"""
 
     try:
-        client = OpenAI(
-            base_url=settings.LLM_BASE_URL,
-            api_key=settings.LLM_API_KEY or "not-needed",
-        )
-        response = client.chat.completions.create(
-            model=settings.LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.0,
-            max_tokens=50,
-        )
-        result = response.choices[0].message.content.strip()
+        model_name = os.getenv("LLM_MODEL_NAME", "gpt-4o")
+        llm = get_llm(model_name=model_name, temperature=0)
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ])
+        result = response.content.strip()
         result = result.strip("'\"`*. \n")
         if " " in result:
             result = result.split()[0]
@@ -206,7 +227,6 @@ En uygun hedef kolon hangisi? Sadece kolon adını yaz:"""
     except Exception as e:
         print(f"[target_discovery] LLM hatası: {e}")
         return ""
-
 
 # Final decision (Guardrail)
 def _resolve_target(
