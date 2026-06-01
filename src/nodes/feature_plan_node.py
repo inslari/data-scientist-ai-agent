@@ -1,144 +1,14 @@
-from __future__ import annotations
-
-"""
-Feature Plan Node
------------------
-Kullanıcının sorgusunu, intent'i ve db_intelligence metadata'sını okuyarak
-feature engineering için dinamik bir plan üretir.
-
-LLM burada sadece "ne yapılacak" kararını verir:
-- Hedef değişken ne?
-- Nasıl tanımlanıyor?
-- Hangi seviyede aggregation?
-- Hangi feature grupları üretilmeli?
-"""
-
 import os
-from typing import Literal
-
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage
-from src.core.llm import get_llm
-from pydantic import BaseModel, Field
 
-from src.state import AgentState
+from ..state import AgentState
+from ..core.llm import get_llm
+from ..core.prompt_loader import create_chat_prompt
+from ..schemas.feature_plan_schemas import FeaturePlan
 
 load_dotenv(override=True)
 
-
-class TargetDefinition(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    column_name: str = Field(
-        description="Hedef değişkenin adı. Mevcut değilse türetilecek isim (örn: 'churn', 'revenue', 'segment')"
-    )
-    is_derived: bool = Field(
-        description="True ise hedef değişken veriden türetilecek, False ise zaten mevcut"
-    )
-    derivation_type: Literal["time_based", "threshold_based", "rank_based", "none"] = Field(
-        description=(
-            "time_based: tarih kolonundan türet (churn gibi). "
-            "threshold_based: sayısal eşikten türet. "
-            "rank_based: sıralamaya göre türet. "
-            "none: zaten mevcut kolon"
-        )
-    )
-    date_column: str = Field(
-        default="",
-        description="time_based için kullanılacak tarih kolonu adı"
-    )
-    threshold_days: int = Field(
-        default=0,
-        description="time_based için gün eşiği. 0 ise dinamik hesaplanır (verinin %80'lik noktası)"
-    )
-    threshold_value: float = Field(
-        default=0.0,
-        description="threshold_based için sayısal eşik değeri"
-    )
-    positive_class_description: str = Field(
-        description="Pozitif sınıfın (1) ne anlama geldiği. Örn: 'Son 180 günde sipariş vermemiş müşteri'"
-    )
-
-
-class AggregationConfig(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    required: bool = Field(
-        description="True ise veri aggregation gerektirir (müşteri bazında gibi)"
-    )
-    group_by_column: str = Field(
-        default="",
-        description="Aggregation için groupby kolonu. Örn: 'customer_id'"
-    )
-    level: Literal["customer", "product", "order", "time", "none"] = Field(
-        description="Aggregation seviyesi"
-    )
-
-
-class FeaturePlan(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    analysis_summary: str = Field(
-        description="Kullanıcının ne yapmak istediğinin tek cümlelik Türkçe özeti"
-    )
-    target: TargetDefinition
-    aggregation: AggregationConfig
-    feature_groups: list[Literal["rfm", "temporal_trend", "behavioral", "demographic", "product", "none"]] = Field(
-        description=(
-            "Üretilecek feature grupları. "
-            "rfm: Recency/Frequency/Monetary. "
-            "temporal_trend: Zamansal trend (dönem bazlı sipariş/harcama). "
-            "behavioral: Davranışsal (kategori çeşitliliği, basket size). "
-            "demographic: Demografik (yaş, hesap yaşı). "
-            "product: Ürün bazlı (kategori, rating, stok). "
-            "none: Aggregation gerekmez, ham veri kullanılır"
-        )
-    )
-    use_data_split_for_label: bool = Field(
-        description=(
-            "True ise verinin son %20'si label için, ilk %80'i feature için kullanılır. "
-            "time_based hedeflerde genellikle True olmalı."
-        )
-    )
-    math_interactions: list[str] = Field(
-        default_factory=list,
-        description=(
-            "LLM tarafından önerilen mantıksal matematiksel etkileşimler. "
-            "Örn: ['revenue / max(1, order_count)', 'price * quantity']. "
-            "Sadece sayısal kolonlar için kullanılmalıdır."
-        )
-    )
-    reasoning: str = Field(
-        description="Bu planın neden seçildiğini açıklayan Türkçe metin"
-    )
-
-
-SYSTEM_PROMPT = """Sen bir veri bilimi uzmanısın. Görevin, kullanıcının analiz isteğini ve veritabanı yapısını inceleyerek feature engineering için minimal ve doğru bir plan üretmektir.
-
-## Kurallar:
-- Yalnızca veritabanında GERÇEKTEN OLAN kolonları kullan
-- Kolon isimlerini db_intelligence'daki isimlerle birebir eşleştir
-- Hedef değişken seçerken KOLON ADI'na değil KOLON AÇIKLAMASI'na bak
-- Aggregation seviyesini analiz tipine göre belirle (churn → müşteri bazında, satış tahmini → ürün/zaman bazında)
-- time_based hedeflerde use_data_split_for_label = True olmalı
-- Gereksiz feature grubu ekleme — sadece analize katkı sağlayanları seç
-- Gerekliyse `math_interactions` alanında oran (A/B) veya çarpım (A*B) gibi mantıksal feature'lar öner.
-- Her satırın bir olay/işlem/örnek olduğu görevlerde aggregation.required = False, aggregation.level = 'none' olmalı.
-- Türkçe cevap ver
-
-## Hedef kolon seçimi:
-Veritabanı özetindeki "HEDEF KOLON ADAYLARI" bölümüne bak.
-Bu adaylar intelligence engine tarafından ML tahmin hedefi olarak etiketlenmiş kolonlardır.
-Kullanıcının sorusuna en uygun olan adayı seç. Açıklamaları dikkatlice oku.
-Eğer hiç aday yoksa, kullanıcı sorusuna en uygun binary/categorical kolonu seç.
-
-## RETRY durumunda:
-- Önceki planda neden başarısız olundu? Critic feedback'i dikkatlice oku.
-- Eğer AUC ~0.5 ise: model veriyi öğrenememiş. Daha ayırt edici feature grupları seç, math_interactions ekle.
-- Eğer Overfitting varsa: daha az feature grubu kullan.
-- Her retry'da öncekinden FARKLI bir strateji dene.
-"""
-
+FEATURE_PLAN_PROMPT = create_chat_prompt("feature_plan_system.md", "feature_plan_human.md")
 
 def feature_plan_node(state: AgentState) -> AgentState:
     """
@@ -161,7 +31,7 @@ def feature_plan_node(state: AgentState) -> AgentState:
     critic_feedback = state.get("critic_feedback", [])
     retry_count     = state.get("retry_count", 0)
 
-    target_def_initial = state.get("target_definition", {})
+    target_def_initial = state.get("target_definition") or {}
     if target_def_initial.get("column_name"):
         print(f"[feature_plan] target_discovery_node önerisi: '{target_def_initial['column_name']}' "
               f"(confidence={target_def_initial.get('confidence', 0):.2f})")
@@ -202,26 +72,22 @@ Bu öneriyi dikkate al ama kendi guardrail kontrolünü yap."""
 Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi üret.
 Önceki planla aynı yapıyı tekrarlama."""
 
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=f"""
-Kullanıcı sorusu: {user_query}
-Tespit edilen intent: {intent}
+    chain = FEATURE_PLAN_PROMPT | structured_llm
 
-Veritabanı yapısı:
-{tables_summary}{target_hint}{retry_context}
-
-Bu analiz için feature engineering planını üret.
-"""),
-    ]
-
-    plan: FeaturePlan = structured_llm.invoke(messages)
+    plan: FeaturePlan = chain.invoke({
+        "user_query": user_query,
+        "intent": intent,
+        "tables_summary": tables_summary,
+        "target_hint": target_hint,
+        "retry_context": retry_context
+    })
 
     # ── Post-processing: Dinamik target validation ────────────────────────────
     # LLM'in hedef kolon seçimini hem target_discovery_node önerisi
     # hem de db_intelligence semantic_type etiketlerine göre validate eder.
     plan_dict = plan.model_dump()
     target_def_initial = state.get("target_definition", {}) or {}
+    print(f"[DEBUG FP] target_def_initial = {target_def_initial}")
     _validate_target_selection(plan_dict, user_query, db_intelligence, target_def_initial)
     plan = FeaturePlan(**plan_dict)
     # ──────────────────────────────────────────────────────────────────────────
@@ -312,23 +178,26 @@ def _validate_target_selection(
     db_intelligence: dict,
     target_definition: dict | None = None,
 ) -> None:
-    """
-    LLM'in seçtiği hedef kolonu validate eder.
-
-    Algoritma (sırasıyla):
-    1. HALÜSİNASYON KONTROLÜ: LLM'in kolonu db'de var mı? Yoksa target_discovery'ye fallback.
-    2. TARGET DISCOVERY OVERRIDE: Yüksek confidence (≥0.5) varsa target_discovery'ye güven.
-    3. SEMANTIC TYPE KONTROLÜ: Mevcut seçim semantic_type=target mı?
-    4. WORD OVERLAP FALLBACK: Hiçbiri olmazsa kullanıcı sorgusuna en yakın aday.
-
-    Hardcoded isim KULLANMAZ. Her dataset için çalışır.
-    plan_dict in-place değiştirilir.
-    """
     current_target = plan_dict.get("target", {}).get("column_name", "")
     all_cols       = db_intelligence.get("columns", [])
     target_def     = target_definition or {}
     discovery_target = target_def.get("column_name", "")
     confidence       = target_def.get("confidence", 0.0)
+    
+    print(f"[DEBUG VALIDATE] target_definition param = {target_definition}")
+    print(f"[DEBUG VALIDATE] discovery_target = '{discovery_target}', confidence = {confidence}")
+    # ── GUARD: target_discovery karar verdiyse, DOKUNMA ──
+    if discovery_target and confidence >= 0.4:
+        # db'de var mı sadece onu kontrol et
+        col_names = [c.get("column_name", "") for c in all_cols]
+        if discovery_target in col_names:
+            plan_dict["target"]["column_name"] = discovery_target
+            print(f"[feature_plan] target_discovery karari korunuyor: '{discovery_target}' (confidence={confidence:.2f})")
+            return
+        else:
+            print(f"[feature_plan] target_discovery onerisi '{discovery_target}' db'de bulunamadi, validation devam ediyor...")
+
+
 
     # ── 1. HALÜSİNASYON KONTROLÜ ─────────────────────────────
     # LLM uydurma kolon mu seçti?

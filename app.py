@@ -7,7 +7,29 @@ Run:
     streamlit run app.py
 """
 
+
+
 from __future__ import annotations
+
+
+import builtins
+
+if not getattr(builtins.print, '_safe', False):
+    _original_print = builtins.print
+
+    def _safe_print(*args, **kwargs):
+        try:
+            _original_print(*args, **kwargs)
+        except (UnicodeEncodeError, ValueError):
+            try:
+                args = [str(a).encode('ascii', errors='replace').decode('ascii') for a in args]
+                _original_print(*args, **kwargs)
+            except ValueError:
+                pass  # closed file, skip silently
+
+    _safe_print._safe = True
+    builtins.print = _safe_print
+
 
 import asyncio
 import json
@@ -25,7 +47,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.graph import build_graph
 from src.state import AgentState
-from src.history_tracker import get_experiments
+from src.services.experiment_tracker import get_experiments
 
 st.set_page_config(
     page_title="DS Agent",
@@ -865,7 +887,7 @@ def render_results(result: AgentState):
                 st.plotly_chart(fig_ad,use_container_width=True)
             else:
                 section_header("Overfitting Analysis","Train vs Test gap")
-                ts=ovf.get("train_score",0); tss=ovf.get("test_score",0)
+                ts=ovf.get("train_score", ovf.get("train_r2", 0)); tss=ovf.get("test_score", ovf.get("test_r2", 0))
                 gap=ovf.get("gap",0); stat=ovf.get("status","unknown")
                 sc2={"normal":"#43e97b","mild_overfitting":"#f7971e","overfitting_detected":"#ff6584","underfitting":"#38b2f4"}.get(stat,"#7777aa")
                 fig_ovf = go.Figure()
@@ -991,7 +1013,7 @@ def render_results(result: AgentState):
                         textfont=dict(family="JetBrains Mono",size=10,color=CHART_TEXT_COLOR)))
                     fig_sc.update_layout(**PLOTLY_LAYOUT,height=300,xaxis=dict(**AXIS_STYLE),yaxis=dict(**AXIS_STYLE),showlegend=False)
                     st.plotly_chart(fig_sc,use_container_width=True)
-        else:
+        elif "classification" in task:
             cl,cr = st.columns(2)
             with cl:
                 section_header("Confusion Matrix","Actual vs Predicted")
@@ -1069,6 +1091,29 @@ def render_results(result: AgentState):
                                font=dict(size=11,family="JetBrains Mono",color="#43e97b" if ic else "#f7971e"),x=0))
                 st.plotly_chart(fig_cal,use_container_width=True)
 
+        elif task == "regression":
+            resid = ev.get("residual_analysis", {})
+            if resid:
+                section_header("Residual Analysis", "Error distribution metrics")
+                cols = st.columns(3)
+                resid_metrics = [
+                    ("Mean Residual", resid.get("mean_residual", 0)),
+                    ("Std Residual", resid.get("std_residual", 0)),
+                    ("Median", resid.get("median_residual", 0)),
+                    ("Max Overpredict", resid.get("max_overpredict", 0)),
+                    ("Max Underpredict", resid.get("max_underpredict", 0)),
+                    ("Skewness", resid.get("residual_skewness", 0)),
+                ]
+                for i, (m_name, m_val) in enumerate(resid_metrics):
+                    with cols[i % 3]:
+                        st.markdown(f"""
+                        <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
+                                    border-radius:8px;padding:0.8rem;margin-bottom:1rem;text-align:center;">
+                            <div style="font-family:'JetBrains Mono',monospace;font-size:0.65rem;color:#7777aa;text-transform:uppercase;letter-spacing:1px;margin-bottom:0.3rem;">{m_name}</div>
+                            <div style="font-family:'Space Grotesk',sans-serif;font-size:1.2rem;font-weight:700;color:#e8e8f0;">{m_val}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
     with tab3:
         if fi:
             section_header("Feature Importance",f"Top features · {fi_summary.get('top5_total_contribution_pct','?')}% from top 5")
@@ -1077,7 +1122,7 @@ def render_results(result: AgentState):
             fig_fi=go.Figure()
             feats=list(fi_pct.keys())[::-1]; vals=[fi_pct[f] for f in feats]
             fig_fi.add_trace(go.Bar(x=vals,y=feats,orientation="h",
-                marker_color=[f"rgba(108,99,255,{0.35+0.65*v/max(vals)})" for v in vals],marker_line_width=0,
+                marker_color=[f"rgba(108,99,255,{0.35+0.65*v/(max(vals) or 1)})" for v in vals],marker_line_width=0,
                 text=[f"{v:.1f}%" for v in vals],textposition="outside",
                 textfont=dict(family="JetBrains Mono",size=10,color=CHART_TEXT_COLOR)))
             fig_fi.update_layout(**PLOTLY_LAYOUT,height=max(300,len(feats)*28),showlegend=False,
@@ -1097,7 +1142,7 @@ def render_results(result: AgentState):
                 fig_sh=go.Figure()
                 fs=list(sp.keys())[::-1]; vs=[sp[f] for f in fs]
                 fig_sh.add_trace(go.Bar(x=vs,y=fs,orientation="h",
-                    marker_color=[f"rgba(255,101,132,{0.35+0.65*v/max(vs)})" for v in vs],marker_line_width=0,
+                    marker_color=[f"rgba(255,101,132,{0.35+0.65*v/(max(vs) or 1)})" for v in vs],marker_line_width=0,
                     text=[f"{v:.1f}%" for v in vs],textposition="outside",
                     textfont=dict(family="JetBrains Mono",size=10,color=CHART_TEXT_COLOR)))
                 fig_sh.update_layout(**PLOTLY_LAYOUT,height=max(300,len(fs)*28),showlegend=False,
