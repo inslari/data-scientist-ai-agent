@@ -13,19 +13,28 @@ MCP_URL = "http://127.0.0.1:9001/mcp"
 async def db_context_node(state: AgentState) -> AgentState:
     """Async node — LangGraph ainvoke ile uyumlu."""
     
-    print(">>> db_context_node başladı!")
+    print(">>> db_context_node basladi!")
     # Fetch schema + sample data
-    print(">>> MCP'den şema ve örnek veri çekiliyor...")
+    print(">>> MCP'den sema ve ornek veri cekiliyor...")
     raw_schema, sample_data = await _fetch_schema_and_samples()
-    print(">>> Şema başarıyla çekildi. Uzunluk:", len(raw_schema))
+    print(">>> Sema basariyla cekildi. Uzunluk:", len(raw_schema))
 
-    engine   = DatabaseIntelligenceEngine(provider=settings.DEFAULT_LLM_PROVIDER)
-    print(f">>> DatabaseIntelligenceEngine başlatıldı. Şema analizi için LLM'e ({settings.DEFAULT_LLM_PROVIDER.upper()}) istek atılıyor (Bu işlem uzun sürebilir)...")
-    db_model = engine.analyze_schema(
-        schema_text=raw_schema,
-        sample_data=sample_data,
-    )
-    print(">>> LLM analizi başarıyla tamamlandı!")
+    engine   = DatabaseIntelligenceEngine()
+    print(">>> DatabaseIntelligenceEngine baslatildi. Sema analizi icin LLM'e istek atiliyor (Bu islem uzun surebilir)...")
+    try:
+        db_model = engine.analyze_schema(
+            schema_text=raw_schema,
+            sample_data=sample_data,
+        )
+    except Exception as e:
+        print(f">>> LLM analizi basarisiz oldu: {str(e)[:200]}")
+        print(">>> Fallback moduna geciliyor (ornek veri olmadan tekrar deneniyor)...")
+        db_model = engine.analyze_schema(
+            schema_text=raw_schema,
+            sample_data="Örnek veri çok uzun olduğu için LLM halüsinasyonuna yol açtı, çıkarıldı.",
+        )
+    print(">>> LLM analizi basariyla tamamlandi!")
+
 
     intent          = state.get("intent", "eda")
     relevant_tables = _filter_tables_by_intent(db_model, intent)
@@ -70,6 +79,8 @@ async def _fetch_schema_and_samples() -> tuple[str, str]:
                         {"query": f'SELECT * FROM "{table}" LIMIT 3', "db_name": db_name}
                     )
                     r_text = getattr(r.content[0], "text", "") if r.content else ""
+                    if len(r_text) > 500:
+                        r_text = r_text[:500] + "\n... (truncated)"
                     sample_parts.append(f"Database: {db_name} | Table: {table}\n{r_text}")
                 except Exception:
                     pass

@@ -1,66 +1,8 @@
-from __future__ import annotations
-
-import json
-
-from langchain_core.messages import HumanMessage, SystemMessage
-from src.core.llm import get_llm
-from src.core.config import settings
-from pydantic import BaseModel, Field
-from typing import Optional
-from src.state import AgentState
-
-
-class AnalysisStep(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    step: str = Field(
-        description="Araç adı: sql_query | profiling | feature_engineering | ml_training | stats_analysis"
-    )
-    description: str = Field(description="Bu adımın ne yaptığını açıklayan tek cümle (Türkçe olarak yaz)")
-    table_names: list[str] = Field(default_factory=list, description="Bu adımda kullanılacak tablolar")
-    target_column: Optional[str] = Field(default=None, description="ML görevleri için hedef kolon")
-    extra_params: Optional[str] = Field(default=None, description="JSON string olarak ek parametreler")
-    order: int = Field(description="1'den başlayan yürütme sırası")
-
-
-class AnalysisPlan(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    steps: list[AnalysisStep]
-    reasoning: str = Field(description="Bu planın neden seçildiğini açıklayan Türkçe metin")
-
-
-
-SYSTEM_PROMPT = """Sen özerk bir veri bilimi ajanının Analiz Planlayıcısısın.
- 
-Görevin: Kullanıcının sorusuna, tespit edilen intent'e ve veritabanı zekâ modeline dayanarak adım adım bir yürütme planı üretmek.
-
-## Önemli Kurallar:
-- Churn tahmini için MUTLAKA 'customers' tablosunu dahil et
-- Müşteri davranışı analizinde customers + orders + order_items birlikte kullanılmalı
-- Tablo seçiminde db_intelligence'daki relationships'ı dikkate al 
-
-## Kullanılabilir adımlar (araçlar):
-- sql_query           : Veritabanından SQL ile veri çekme
-- profiling           : Çekilen verinin istatistiksel profilini çıkarma
-- feature_engineering : Dönüştürme, kodlama, ölçekleme, özellik seçimi
-- ml_training         : Makine öğrenmesi modeli eğitme (sınıflandırma/regresyon/kümeleme)
-- stats_analysis      : ML olmadan istatistiksel testler veya EDA
- 
-## Kurallar:
-- Her zaman sql_query ile başla
-- sql_query'yi her zaman profiling takip etmeli
-- intent=eda veya report ise: sql_query → profiling → stats_analysis
-- intent=classification veya regression ise: sql_query → profiling → feature_engineering → ml_training
-- intent=clustering ise: sql_query → profiling → feature_engineering → ml_training
-- Planı minimal tut — sadece gerekli adımları ekle
-- Kolon adlarını ASLA uydurma — yalnızca db_intelligence'daki kolonları kullan
-
-## Hedef Kolon (target_column) Seçimi:
-- Veritabanı özetinde "important columns" veya "candidates" olarak belirtilen kolonlara dikkat et.
-- Hedef kolon seçerken KOLON ADI'na değil, görev mantığına (Churn, Fraud vb.) bak.
-- Hatalı bir target_column seçmek tüm ML pipeline'ını çökerteceği için, veritabanında GERÇEKTEN var olan ve kullanıcının tahmin etmek istediği kolonu seç.
-"""
+from ..state import AgentState
+from ..core.llm import get_llm
+from ..core.config import settings
+from ..core.prompt_loader import create_chat_prompt
+from ..schemas.planner_schemas import AnalysisPlan
 
 
 def planner_node(state: AgentState) -> AgentState:
@@ -77,23 +19,15 @@ def planner_node(state: AgentState) -> AgentState:
 
     tables_summary = _summarize_db_intelligence(db_intelligence, relevant_tables)
 
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(
-            content=f"""
-Kullanıcı sorusu: {user_query}
-Tespit edilen intent: {intent}
-İlgili tablolar: {relevant_tables}
+    PLANNER_PROMPT = create_chat_prompt("planner_system.md", "planner_human.md")
+    chain = PLANNER_PROMPT | structured_llm
 
-Veritabanı zekâ özeti:
-{tables_summary}
-
-Minimal ve yürütülebilir bir analiz planı üret.
-"""
-        ),
-    ]
-
-    result: AnalysisPlan = structured_llm.invoke(messages)
+    result: AnalysisPlan = chain.invoke({
+        "user_query": user_query,
+        "intent": intent,
+        "relevant_tables": relevant_tables,
+        "tables_summary": tables_summary
+    })
 
     plan = sorted(
         [step.model_dump() for step in result.steps],
@@ -103,7 +37,6 @@ Minimal ve yürütülebilir bir analiz planı üret.
     return {
         **state,
         "analysis_plan": plan,
-        "messages": [m.model_dump() for m in messages],
         "current_step": "planner_node",
     }
 

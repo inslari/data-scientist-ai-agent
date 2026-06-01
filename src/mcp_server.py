@@ -141,8 +141,9 @@ def get_column_stats() -> str:
 def run_sql_query(query: str, db_name: str = "default") -> str:
     """Execute a SELECT query on the specified database and return the results. Only SELECT queries are allowed."""
     try:
-        if not query.strip().upper().startswith("SELECT"):
-            return "Error: Only SELECT queries are allowed."
+        query_upper = query.strip().upper()
+        if not (query_upper.startswith("SELECT") or query_upper.startswith("WITH") or query_upper.startswith("PRAGMA")):
+            return "Error: Only SELECT, WITH, and PRAGMA queries are allowed."
 
         try:
             provider = db_manager.get_provider(db_name)
