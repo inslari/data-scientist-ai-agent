@@ -4,6 +4,7 @@ import httpx
 import shutil
 import asyncio
 import contextlib
+import time
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -14,7 +15,8 @@ from api.database import get_db, MCPConfigModel
 from api.models import (
     MCPConfigCreate, MCPConfigUpdate, MCPConfigResponse,
     ConnectionTestRequest, ConnectionTestResponse,
-    MCPToolRequest, MCPSchemaResponse, MCPColumnStatsResponse
+    MCPToolRequest, MCPSchemaResponse, MCPColumnStatsResponse,
+    RefreshCacheResponse, MCPSampleDataRequest, MCPSampleDataResponse
 )
 
 router = APIRouter(prefix="/mcp", tags=["MCP Configuration"])
@@ -176,9 +178,9 @@ async def test_mcp_connection(req: ConnectionTestRequest, db: Session = Depends(
             return {"status": "error", "message": f"Failed to connect to MCP server: {str(e)}"}
 
 
-async def _call_mcp_tool(db_config, tool_name: str) -> str:
+async def _call_mcp_tool(db_config, tool_name: str, tool_args: dict = None) -> str:
     """
-    Verilen MCP konfigürasyonuna bağlanır ve belirtilen tool'u argümansız çalıştırır.
+    Verilen MCP konfigürasyonuna bağlanır ve belirtilen tool'u çalıştırır.
     Sonucu ham string olarak döner.
     """
     async with contextlib.AsyncExitStack() as stack:
@@ -213,7 +215,7 @@ async def _call_mcp_tool(db_config, tool_name: str) -> str:
 
         session = await stack.enter_async_context(ClientSession(read, write))
         await asyncio.wait_for(session.initialize(), timeout=10.0)
-        result = await asyncio.wait_for(session.call_tool(tool_name, {}), timeout=30.0)
+        result = await asyncio.wait_for(session.call_tool(tool_name, tool_args or {}), timeout=30.0)
 
         # Tool sonucu genellikle bir liste içinde TextContent nesnesi döner
         if result.content:
@@ -236,8 +238,19 @@ async def get_mcp_schema(req: MCPToolRequest, db: Session = Depends(get_db)):
     db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id).first()
     if not db_config:
         raise HTTPException(status_code=404, detail="MCP config not found")
+        
+    if db_config.schema_cache:
+        return {"status": "success", "data": db_config.schema_cache}
+
     try:
+        current_time = int(time.time())
         schema_text = await _call_mcp_tool(db_config, "get_schema")
+        
+        # Save to DB cache
+        db_config.schema_cache = schema_text
+        db_config.schema_cache_updated_at = current_time
+        db.commit()
+        
         return {"status": "success", "data": schema_text}
     except asyncio.TimeoutError:
         return {"status": "error", "message": "MCP tool call timed out."}
@@ -254,10 +267,121 @@ async def get_mcp_column_stats(req: MCPToolRequest, db: Session = Depends(get_db
     db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id).first()
     if not db_config:
         raise HTTPException(status_code=404, detail="MCP config not found")
+        
+    if db_config.column_stats_cache:
+        return {"status": "success", "data": db_config.column_stats_cache}
+
     try:
+        current_time = int(time.time())
         stats_text = await _call_mcp_tool(db_config, "get_column_stats")
+        
+        # Save to DB cache
+        db_config.column_stats_cache = stats_text
+        db_config.column_stats_cache_updated_at = current_time
+        db.commit()
+        
         return {"status": "success", "data": stats_text}
     except asyncio.TimeoutError:
         return {"status": "error", "message": "MCP tool call timed out."}
     except Exception as e:
         return {"status": "error", "message": f"Failed to get column stats: {str(e)}"}
+
+@router.post("/refresh-stats", response_model=RefreshCacheResponse)
+async def refresh_mcp_db_stats(req: MCPToolRequest, db: Session = Depends(get_db)):
+    """
+    Belirtilen MCP sunucusundaki şema ve kolon istatistiklerini zorla yeniler
+    ve veritabanına kaydeder.
+    """
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id).first()
+    if not db_config:
+        raise HTTPException(status_code=404, detail="MCP config not found")
+        
+    try:
+        current_time = int(time.time())
+        
+        # Şemayı çek
+        schema_text = await _call_mcp_tool(db_config, "get_schema")
+        db_config.schema_cache = schema_text
+        db_config.schema_cache_updated_at = current_time
+        
+        # Kolon istatistiklerini çek
+        stats_text = await _call_mcp_tool(db_config, "get_column_stats")
+        db_config.column_stats_cache = stats_text
+        db_config.column_stats_cache_updated_at = current_time
+        
+        db.commit()
+        
+        return {"status": "success", "message": "Cache refreshed successfully."}
+    except asyncio.TimeoutError:
+        return {"status": "error", "message": "MCP tool call timed out during refresh."}
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to refresh cache: {str(e)}"}
+
+@router.post("/sample-data", response_model=MCPSampleDataResponse)
+async def get_mcp_sample_data(req: MCPSampleDataRequest, db: Session = Depends(get_db)):
+    """
+    Belirtilen tablodan belirtilen limit kadar örnek veri döner.
+    """
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id).first()
+    if not db_config:
+        raise HTTPException(status_code=404, detail="MCP config not found")
+        
+    try:
+        import ast
+        
+        # İlk olarak standart LIMIT sentaksını deniyoruz
+        query = f'SELECT * FROM "{req.table_name}" LIMIT {req.limit}'
+        args = {"query": query}
+        
+        sample_data_text = await _call_mcp_tool(db_config, "run_sql_query", args)
+        
+        # Eğer syntax hatası dönerse ve TOP içeren MSSQL gibi bir db ihtimali varsa
+        if "SQL Error" in sample_data_text and ("syntax" in sample_data_text.lower() or "near" in sample_data_text.lower()):
+            query = f'SELECT TOP {req.limit} * FROM "{req.table_name}"'
+            args = {"query": query}
+            sample_data_text = await _call_mcp_tool(db_config, "run_sql_query", args)
+            
+        if "SQL Error" in sample_data_text or "Error:" in sample_data_text:
+            return {"status": "error", "message": sample_data_text}
+            
+        # Parse output format:
+        # Columns: id, name
+        # Returned X rows.
+        # Results:
+        # (1, 'foo')
+        # ...
+        lines = sample_data_text.split('\n')
+        columns = []
+        rows = []
+        
+        in_results = False
+        for line in lines:
+            line = line.strip()
+            if line.startswith("Columns:"):
+                col_str = line.replace("Columns:", "").strip()
+                columns = [c.strip() for c in col_str.split(',')]
+            elif line.startswith("Results:"):
+                in_results = True
+            elif in_results and line.startswith('('):
+                try:
+                    # Parse string tuple into actual tuple
+                    row_tuple = ast.literal_eval(line)
+                    if isinstance(row_tuple, tuple):
+                        row_dict = dict(zip(columns, row_tuple))
+                        rows.append(row_dict)
+                except Exception:
+                    # Fallback for unparseable lines (like datetimes or Decimals)
+                    rows.append({"raw_data": line})
+                    
+        return {
+            "status": "success", 
+            "data": {
+                "columns": columns,
+                "rows": rows
+            }
+        }
+            
+    except asyncio.TimeoutError:
+        return {"status": "error", "message": "MCP tool call timed out."}
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to get sample data: {str(e)}"}

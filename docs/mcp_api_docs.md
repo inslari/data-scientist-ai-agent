@@ -270,3 +270,93 @@ Frontend'de kullanıcıya veri hakkında istatistiksel bir özet sunmak için ku
 
 ### Hata Yanıtları
 * `404 Not Found`: Verilen `config_id` veritabanında bulunamazsa döner.
+
+---
+
+## 8. Veritabanı Önbelleğini (Cache) Yenileme
+
+Kayıtlı bir MCP sunucusuna bağlanarak şema ve kolon istatistiklerini zorla (force) yeniden çeker. Veritabanındaki kayıtlı önbelleği (cache) bu yeni verilerle ezerek günceller. Veritabanında tablo, veri veya kolon değişikliği yapıldığında arayüzün güncel veriyi görebilmesi için (örneğin bir "Verileri Güncelle" butonuna basıldığında) çağrılmalıdır.
+
+* **URL:** `/mcp/refresh-stats`
+* **Method:** `POST`
+* **Content-Type:** `application/json`
+
+### İstek Gövdesi (Request Body)
+
+```json
+{
+  "config_id": 1   // (Zorunlu) Kullanılacak MCP bağlantısının ID değeri
+}
+```
+
+### Başarılı Yanıt (200 OK)
+
+Verilerin başarılı bir şekilde çekilip veritabanına kaydedildiğini belirtir.
+
+```json
+{
+  "status": "success",
+  "message": "Cache refreshed successfully."
+}
+```
+
+### Hata Yanıtı (200 OK ama Hata Durumu)
+
+```json
+{
+  "status": "error",
+  "message": "MCP tool call timed out during refresh."
+}
+```
+
+### Hata Yanıtları
+* `404 Not Found`: Verilen `config_id` veritabanında bulunamazsa döner.
+
+---
+
+## 9. Tablodan Örnek Veri Çekme
+
+Kayıtlı bir MCP sunucusuna bağlanarak `run_sql_query` aracı yardımıyla belirtilen tablodan örnek veri (sample data) çeker. Veritabanının diline uygun olan (LIMIT veya TOP) SQL komutları otomatik denenir. Frontend'de tablo yapısını ve içerik formatını önizlemek için kullanılır.
+
+* **URL:** `/mcp/sample-data`
+* **Method:** `POST`
+* **Content-Type:** `application/json`
+
+### İstek Gövdesi (Request Body)
+
+```json
+{
+  "config_id": 1,         // (Zorunlu) Kullanılacak MCP bağlantısının ID değeri
+  "table_name": "users",  // (Zorunlu) Örnek veri çekilecek tablonun adı
+  "limit": 10             // (Opsiyonel) Çekilecek maksimum satır sayısı (Varsayılan: 10)
+}
+```
+
+### Başarılı Yanıt (200 OK)
+
+Veriler ayrııştırılarak JSON formatında (`columns` ve `rows`) döner.
+
+```json
+{
+  "status": "success",
+  "data": {
+    "columns": ["id", "name", "email", "created_at"],
+    "rows": [
+      {"id": 1, "name": "Ali", "email": "ali@example.com", "created_at": "2024-01-01"},
+      {"id": 2, "name": "Veli", "email": "veli@example.com", "created_at": "2024-01-02"}
+    ]
+  }
+}
+```
+
+### Hata Yanıtı (200 OK ama Hata Durumu)
+
+```json
+{
+  "status": "error",
+  "message": "SQL Error: no such table: users"
+}
+```
+
+### Hata Yanıtları
+* `404 Not Found`: Verilen `config_id` veritabanında bulunamazsa döner.
