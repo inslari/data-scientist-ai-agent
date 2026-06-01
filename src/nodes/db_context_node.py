@@ -3,6 +3,7 @@ from __future__ import annotations
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from src.core.config import settings
 from src.intelligence_engine import DatabaseIntelligenceEngine  # type: ignore[import-not-found]
 from src.state import AgentState  # type: ignore[import-not-found]
 
@@ -33,6 +34,7 @@ async def db_context_node(state: AgentState) -> AgentState:
             sample_data="Örnek veri çok uzun olduğu için LLM halüsinasyonuna yol açtı, çıkarıldı.",
         )
     print(">>> LLM analizi basariyla tamamlandi!")
+
 
     intent          = state.get("intent", "eda")
     relevant_tables = _filter_tables_by_intent(db_model, intent)
