@@ -26,7 +26,12 @@ class MCPConfigModel(Base):
     args = Column(JSON, nullable=True)
     url = Column(String, nullable=True)
     env = Column(JSON, nullable=True)
-
+    
+    # Cache fields
+    schema_cache = Column(String, nullable=True)
+    schema_cache_updated_at = Column(Integer, nullable=True)  # Unix timestamp
+    column_stats_cache = Column(String, nullable=True)
+    column_stats_cache_updated_at = Column(Integer, nullable=True)  # Unix timestamp
 # Tabloyu oluştur
 Base.metadata.create_all(bind=engine)
 

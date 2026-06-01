@@ -50,3 +50,17 @@ class MCPColumnStatsResponse(BaseModel):
     status: str
     data: Optional[str] = None
     message: Optional[str] = None
+
+class RefreshCacheResponse(BaseModel):
+    status: str
+    message: str
+
+class MCPSampleDataRequest(BaseModel):
+    config_id: int = Field(..., description="ID of the MCP config to use")
+    table_name: str = Field(..., description="Name of the table to get sample data from")
+    limit: int = Field(10, description="Number of rows to fetch")
+
+class MCPSampleDataResponse(BaseModel):
+    status: str
+    data: Optional[Any] = None
+    message: Optional[str] = None
