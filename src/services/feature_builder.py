@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler, StandardScaler, TargetEncoder
-
+from src.core.config import settings
 from typing import Any
 import re
 import duckdb
@@ -25,7 +25,6 @@ warnings.filterwarnings("ignore")
 CORRELATION_THRESHOLD = 0.95
 VARIANCE_THRESHOLD    = 0.01
 TEST_SIZE             = 0.2
-RANDOM_STATE          = 42
 ML_SAMPLE_ROWS        = 100_000   
 
 
@@ -678,11 +677,11 @@ def build_features(state: dict) -> dict:
     else:
         try:
             X_train, X_test, y_train, y_test = train_test_split(
-                df, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+                df, y, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED, stratify=y
             )
         except ValueError:
             X_train, X_test, y_train, y_test = train_test_split(
-                df, y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+                df, y, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED
             )
 
     y_train_arr = np.array(y_train)

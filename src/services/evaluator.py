@@ -27,7 +27,7 @@ All decisions are derived from metrics, feature_report, and feature_plan in the 
 
 import warnings
 from typing import Any
-
+from src.core.config import settings
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
@@ -84,11 +84,24 @@ def _evaluate_classification(
     if is_binary and y_prob_test is not None:
         try:
             fpr, tpr, thresholds = roc_curve(y_test, y_prob_test[:, 1])
-            # Optimal threshold (Youden's J statistic)
-            j_scores = tpr - fpr
-            optimal_idx = int(np.argmax(j_scores))
-            optimal_threshold = round(float(thresholds[optimal_idx]), 4)
+            # Optimal threshold (Youden's J statistic - Eskiden buradaydi, yorum satiri yapildi)
+            # j_scores = tpr - fpr
+            # optimal_idx = int(np.argmax(j_scores))
+            # optimal_threshold = round(float(thresholds[optimal_idx]), 4)
             
+            # Optimal threshold: F1 Skorunu maksimize ederek secelim (Dengesiz veriler icin daha iyi)
+            from sklearn.metrics import precision_recall_curve
+            precision, recall, pr_thresholds = precision_recall_curve(y_test, y_prob_test[:, 1])
+            
+            num = 2 * recall * precision
+            den = recall + precision
+            f1_scores = np.divide(num, den, out=np.zeros_like(num), where=(den!=0))
+            
+            best_pr_idx = int(np.argmax(f1_scores[:-1]))
+            optimal_threshold = round(float(pr_thresholds[best_pr_idx]), 4)
+            
+            # ROC curve uzerindeki karsilik gelen index'i bulalim (UI grafiklerinde gostermek icin)
+            optimal_idx = int(np.argmin(np.abs(thresholds - optimal_threshold)))
             # Update predictions based on optimal threshold for better recall
             classes = np.unique(y_test)
             if len(classes) == 2 and np.issubdtype(classes.dtype, np.number):
@@ -466,7 +479,7 @@ def _bootstrap_ci_classification(
     ci: float = 0.95,
 ) -> dict:
     """Bootstrap samples with metric confidence intervals (classification)."""
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(settings.RANDOM_SEED)
     n = len(y_test)
     metrics_boot: dict[str, list] = {"accuracy": [], "f1_weighted": [], "roc_auc": [], "mcc": []}
 
@@ -516,7 +529,7 @@ def _bootstrap_ci_regression(
     ci: float = 0.95,
     ) -> dict:
     """Bootstrap samples with metric confidence intervals (regression)."""
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(settings.RANDOM_SEED)
     n = len(y_test)
     metrics_boot: dict[str, list] = {"rmse": [], "r2": [], "mae": []}
 
@@ -796,33 +809,33 @@ def _compute_reliability_score(evaluation: dict) -> dict:
         auc = test_metrics.get("roc_auc", test_metrics.get("roc_auc_ovr", 0))
         if auc >= 0.95:
             score += 35
-            factors.append("Mükemmel AUC (≥0.95)")
+            factors.append("Mukemmel AUC (>=0.95)")
         elif auc >= 0.90:
             score += 30
-            factors.append("Çok iyi AUC (≥0.90)")
+            factors.append("Cok iyi AUC (>=0.90)")
         elif auc >= 0.80:
             score += 25
-            factors.append("İyi AUC (≥0.80)")
+            factors.append("Iyi AUC (>=0.80)")
         elif auc >= 0.70:
             score += 15
-            factors.append("Kabul edilebilir AUC (≥0.70)")
+            factors.append("Kabul edilebilir AUC (>=0.70)")
         else:
             score += 5
-            factors.append("Düşük AUC (<0.70)")
+            factors.append("Dusuk AUC (<0.70)")
     else:
         r2 = test_metrics.get("r2", 0)
         if r2 >= 0.90:
             score += 35
-            factors.append("Mükemmel R² (≥0.90)")
+            factors.append("Mukemmel R2 (>=0.90)")
         elif r2 >= 0.75:
             score += 25
-            factors.append("İyi R² (≥0.75)")
+            factors.append("Iyi R2 (>=0.75)")
         elif r2 >= 0.50:
             score += 15
-            factors.append("Kabul edilebilir R² (≥0.50)")
+            factors.append("Kabul edilebilir R2 (>=0.50)")
         else:
             score += 5
-            factors.append("Düşük R² (<0.50)")
+            factors.append("Dusuk R2 (<0.50)")
 
     # Overfitting status (0-25 points)
     max_score += 25
@@ -840,28 +853,50 @@ def _compute_reliability_score(evaluation: dict) -> dict:
         score += 10
         factors.append("Underfitting")
 
-    # F1 balance (precision-recall balance) (0-20 points)
+    # Balance metric: F1 for classification, MAPE for regression (0-20 points)
     max_score += 20
-    f1_w = test_metrics.get("f1_weighted", 0)
-    if f1_w >= 0.85:
-        score += 20
-        factors.append("Dengeli F1 (≥0.85)")
-    elif f1_w >= 0.75:
-        score += 15
-        factors.append("İyi F1 (≥0.75)")
-    elif f1_w >= 0.60:
-        score += 10
-        factors.append("Kabul edilebilir F1 (≥0.60)")
+    if "classification" in task:
+        f1_w = (
+            test_metrics.get("f1_weighted")
+            or test_metrics.get("f1_macro")
+            or test_metrics.get("f1_score")
+            or test_metrics.get("f1")
+            or 0
+        )
+        if f1_w >= 0.85:
+            score += 20
+            factors.append("Dengeli F1 (>=0.85)")
+        elif f1_w >= 0.75:
+            score += 15
+            factors.append("Iyi F1 (>=0.75)")
+        elif f1_w >= 0.60:
+            score += 10
+            factors.append("Kabul edilebilir F1 (>=0.60)")
+        else:
+            score += 5
+            factors.append("Dusuk F1 (<0.60)")
     else:
-        score += 5
-        factors.append("Düşük F1 (<0.60)")
+        # Regression: use MAPE
+        mape = test_metrics.get("mape", 100)
+        if mape < 10:
+            score += 20
+            factors.append("Cok dusuk MAPE (<10%)")
+        elif mape < 25:
+            score += 15
+            factors.append("Dusuk MAPE (<25%)")
+        elif mape < 50:
+            score += 10
+            factors.append("Orta MAPE (<50%)")
+        else:
+            score += 5
+            factors.append("Yuksek MAPE (>=50%)")
 
-    # Model calibration (0-20 points)
-    max_score += 20
-    if calibration:
+    # Model calibration (0-20 points, only if available and valid)
+    if calibration and isinstance(calibration, dict):
+        max_score += 20
         if calibration.get("is_well_calibrated", False):
             score += 20
-            factors.append("İyi kalibre edilmiş")
+            factors.append("Iyi kalibre edilmis")
         else:
             brier = calibration.get("brier_score", 1.0)
             if brier < 0.15:
@@ -869,13 +904,11 @@ def _compute_reliability_score(evaluation: dict) -> dict:
                 factors.append("Kabul edilebilir kalibrasyon")
             else:
                 score += 5
-                factors.append("Zayıf kalibrasyon")
-    else:
-        score += 10
-        factors.append("Kalibrasyon bilgisi yok")
+                factors.append("Zayif kalibrasyon")
+    # Calibration yoksa veya tuple ise, max_score'a hic ekleme - adil olur
 
     # Final score
-    final_score = round(score / max_score * 100, 1)
+    final_score = round(score / max_score * 100, 1) if max_score > 0 else 0
 
     grade = "A" if final_score >= 90 else \
             "B" if final_score >= 75 else \
