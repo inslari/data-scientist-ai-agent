@@ -103,7 +103,8 @@ def _load_data(state: dict) -> pd.DataFrame:
     # Load from Parquet
     conn = duckdb.connect(":memory:")
     pq   = f"read_parquet('{data_path}')"
-    total = conn.execute(f"SELECT COUNT(*) FROM {pq}").fetchone()[0]
+    res  = conn.execute(f"SELECT COUNT(*) FROM {pq}").fetchone()
+    total = res[0] if res is not None else 0
     print(f"[feature_eng] Parquet: {total:,} satir → '{data_path}'")
 
     # Target kolon suffix'li olabilir (multi-table join sonrası)
@@ -264,7 +265,7 @@ def _clean_data(df: pd.DataFrame) -> pd.DataFrame:
         print(f"[feature_eng] {before-len(df)} duplicate temizlendi")
 
     # String olarak gelen fiyat/sayı kolonlarını temizle (örn: '9.99$')
-    for col in df.select_dtypes(include=["object"]).columns:
+    for col in df.select_dtypes(include="object").columns:
         # Hız için tüm kolona değil, rastgele seçilmiş 1000 satıra bakıyoruz.
         non_nulls = df[col].dropna()
         n_sample = min(1000, len(non_nulls))
@@ -276,14 +277,14 @@ def _clean_data(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors='coerce')
             print(f"[feature_eng] '{col}' kolonu metin bazli currency algilandi, numerik formata cevrildi.")
 
-    for col in df.select_dtypes(include=[np.number]).columns:
+    for col in df.select_dtypes(include="number").columns:
         if df[col].isnull().any():
             med_val = df[col].median()
             if pd.api.types.is_integer_dtype(df[col]):
                 med_val = int(round(med_val))
             df[col] = df[col].fillna(med_val)
 
-    for col in df.select_dtypes(include=["object"]).columns:
+    for col in df.select_dtypes(include="object").columns:
         if df[col].isnull().any():
             mode = df[col].mode()
             if not mode.empty:
@@ -477,7 +478,7 @@ def _aggregate_if_needed(
 
 # ── Encoding ─────────────────────────────────────────────────
 def _encode_categorical(df: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-    cat_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    cat_cols = df.select_dtypes(include="object").columns.tolist()
     if not cat_cols: return df
     low  = [c for c in cat_cols if df[c].nunique() <= 10]
     high = [c for c in cat_cols if df[c].nunique() >  10]
@@ -497,7 +498,7 @@ def _encode_categorical(df: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
 
 # ── Scaling ──────────────────────────────────────────────────
 def _scale_features(df: pd.DataFrame, outlier_cols: list[str]) -> pd.DataFrame:
-    num = df.select_dtypes(include=[np.number]).columns.tolist()
+    num = df.select_dtypes(include="number").columns.tolist()
     if not num: return df
     robust   = [c for c in outlier_cols if c in num]
     standard = [c for c in num if c not in robust]
@@ -512,7 +513,7 @@ def _scale_features(df: pd.DataFrame, outlier_cols: list[str]) -> pd.DataFrame:
 
 # ── Feature selection ────────────────────────────────────────
 def _select_features(df: pd.DataFrame) -> pd.DataFrame:
-    num = df.select_dtypes(include=[np.number]).columns.tolist()
+    num = df.select_dtypes(include="number").columns.tolist()
     if not num: return df
     low_var = df[num].var()[lambda s: s < VARIANCE_THRESHOLD].index.tolist()
     if low_var:
@@ -521,7 +522,8 @@ def _select_features(df: pd.DataFrame) -> pd.DataFrame:
         print(f"[feature_eng] Low variance drop: {low_var}")
     if len(num) > 1:
         corr  = df[num].corr().abs()
-        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        mask  = np.triu(np.ones(corr.shape, dtype=bool), k=1)
+        upper = corr.where(mask)  # type: ignore
         hc    = [c for c in upper.columns if any(upper[c] > CORRELATION_THRESHOLD)]
         if hc:
             df = df.drop(columns=hc)
@@ -534,7 +536,7 @@ def _detect_leakage(
     df: pd.DataFrame, y: pd.Series
 ) -> tuple[pd.DataFrame, list[str]]:
     warnings_list = []
-    num = df.select_dtypes(include=[np.number]).columns.tolist()
+    num = df.select_dtypes(include="number").columns.tolist()
     for col in num:
         if df[col].nunique() > 1:
             try:
@@ -587,6 +589,9 @@ def build_features(state: dict) -> dict:
         print(traceback.format_exc())
         return {"error": str(e)}
 
+    if df.empty or len(df) < 5:
+        return {"error": f"Veri seti yüklenemedi veya çok az veri var ({len(df)} satır)."}
+
     print(f"[feature_eng] Veri: {len(df):,} satır × {len(df.columns)} kolon")
 
     # Multi-table join suffix'lerini temizle
@@ -610,6 +615,9 @@ def build_features(state: dict) -> dict:
 
     # Aggregation
     df, y = _aggregate_if_needed(df, y, feature_plan, meta)
+
+    if df.empty or len(df) < 5:
+        return {"error": f"İşlemler sonrası yetersiz veri sayısı ({len(df)} satır). Model kurulamıyor."}
 
     # Date feature extraction
     for col in meta.get_by_type("timestamp"):
@@ -693,7 +701,7 @@ def build_features(state: dict) -> dict:
     print(f"  X_train : {X_train.shape}")
     print(f"  X_test  : {X_test.shape}")
     if len(np.unique(y_train_arr)) <= 10:
-        print(f"  Train dist: {pd.Series(y_train_arr).value_counts().to_dict()}")
+        print(f"  Train dist: {pd.Series(y_train_arr).value_counts().to_dict()}")  # type: ignore
 
     feature_report = {
         "target_name":              target_name,
@@ -702,8 +710,8 @@ def build_features(state: dict) -> dict:
         "n_features":               len(X_train.columns),
         "n_train":                  len(X_train),
         "n_test":                   len(X_test),
-        "target_distribution_train":pd.Series(y_train_arr).value_counts().to_dict(),
-        "target_distribution_test": pd.Series(y_test_arr).value_counts().to_dict(),
+        "target_distribution_train": pd.Series(y_train_arr).value_counts().to_dict(),  # type: ignore
+        "target_distribution_test": pd.Series(y_test_arr).value_counts().to_dict(),  # type: ignore
         "intelligence_metadata":    meta.summary(),
         "leakage_warnings":         leakage_warnings,
         "data_source":              "parquet" if state.get("data_path") else "sql_results_preview",

@@ -1,0 +1,38 @@
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, List, Dict, Any
+
+class CSVFileResponse(BaseModel):
+    id: int
+    filename: str
+    file_path: str
+    file_size: int
+    row_count: int
+    columns_schema: Optional[List[Dict[str, str]]] = None
+    created_at: int
+    data_group_id: int
+    
+    model_config = ConfigDict(from_attributes=True)
+
+class CSVUploadResponse(BaseModel):
+    status: str
+    message: str
+    data: Optional[List[CSVFileResponse]] = None
+    errors: Optional[List[Dict[str, str]]] = None
+
+class CSVSchemaResponse(BaseModel):
+    status: str
+    data: Optional[List[Dict[str, str]]] = None
+    message: Optional[str] = None
+
+class CSVSampleDataRequest(BaseModel):
+    limit: int = Field(10, description="Number of rows to fetch")
+
+class CSVSampleDataResponse(BaseModel):
+    status: str
+    data: Optional[Any] = None
+    message: Optional[str] = None
+
+class CSVColumnStatsResponse(BaseModel):
+    status: str
+    data: Optional[Any] = None
+    message: Optional[str] = None

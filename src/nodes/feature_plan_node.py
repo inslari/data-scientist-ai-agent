@@ -25,6 +25,7 @@ def feature_plan_node(state: AgentState) -> AgentState:
     State çıktıları:
         feature_plan   : FeaturePlan dict olarak
     """
+    print("\n========================================\n[NODE START] feature_plan_node başlıyor...\n========================================")
     user_query      = state.get("user_query", "")
     intent          = state.get("intent", "classification")
     db_intelligence = state.get("db_intelligence", {})
@@ -74,7 +75,7 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
 
     chain = FEATURE_PLAN_PROMPT | structured_llm
 
-    plan: FeaturePlan = chain.invoke({
+    plan: FeaturePlan = chain.invoke({  # type: ignore[assignment]
         "user_query": user_query,
         "intent": intent,
         "tables_summary": tables_summary,
