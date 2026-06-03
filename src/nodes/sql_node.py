@@ -5,7 +5,10 @@ from ..core.llm import get_llm
 from ..core.config import settings
 from ..core.prompt_loader import create_chat_prompt
 from ..schemas.sql_schemas import SQLGenerationResult, ChartConfig
-from ..services.mcp_client import mcp_run_query
+from langchain_core.runnables import RunnableConfig
+from api.core.database import SessionLocal
+from api.routes.data_group import run_data_group_query, QueryRequest
+import ast
 from ..services.chart_utils import build_chart_payload
 
 
@@ -45,7 +48,7 @@ def _build_column_profiles(db_intelligence: dict) -> str:
     return header + "Columns:\n" + "\n".join(lines)
 
 
-def sql_node(state: AgentState) -> AgentState:
+async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """
     SQL Query Node:
       1. db_intelligence'ı state'den okur
@@ -54,8 +57,13 @@ def sql_node(state: AgentState) -> AgentState:
       4. LLM ile chart konfigürasyonu belirler
       5. State'e yazar
     """
+    print("\n========================================\n[NODE START] sql_node başlıyor...\n========================================")
     llm        = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
     user_query = state["user_query"]
+    data_group_id = config.get("configurable", {}).get("data_group_id")
+    if not data_group_id:
+        return {**state, "error": "data_group_id is missing", "current_step": "sql_node"}
+
 
     # db_intelligence taken from db_context_node
     db_intelligence  = state.get("db_intelligence", {})
@@ -99,7 +107,32 @@ def sql_node(state: AgentState) -> AgentState:
 
     # 4. Execute the query
     try:
-        columns, rows = mcp_run_query(sql, target_db_name)
+        db = SessionLocal()
+        try:
+            req = QueryRequest(query=sql)
+            res = await run_data_group_query(data_group_id, req, db)
+            raw_text = str(res.get("result", "")) if res.get("status") == "success" else ""
+            
+            lines = raw_text.strip().splitlines()
+            columns = []
+            rows = []
+            for i, line in enumerate(lines):
+                if line.startswith("Columns:"):
+                    columns = [c.strip() for c in line.replace("Columns:", "").split(",")]
+                elif line.startswith("Results:") or line.startswith("("):
+                    data_lines = lines[i + 1:] if line.startswith("Results:") else lines[i:]
+                    for dl in data_lines:
+                        dl = dl.strip()
+                        if not dl or dl.startswith("..."):
+                            continue
+                        if dl.startswith("(") and dl.endswith(")"):
+                            try:
+                                rows.append(ast.literal_eval(dl))
+                            except Exception:
+                                pass
+                    break
+        finally:
+            db.close()
     except Exception as e:
         return {**state, "error": f"SQL çalıştırma hatası: {e}", "current_step": "sql_node"}
 
@@ -129,15 +162,14 @@ def sql_node(state: AgentState) -> AgentState:
         })
     except Exception as e:
         chart_cfg = ChartConfig(
-            chart_type="table",
-            x_column=columns[0] if columns else "",
-            y_column="",
-            title="Sorgu Sonuçları",
-            summary=f"Görselleştirme belirlenemedi: {e}",
+            type="table",
+            x=columns[0] if columns else "",
+            y="",
+            title="Sorgu Sonuçları"
         )
 
     # 5. Payload + state
-    chart_payload    = build_chart_payload(columns, rows, chart_cfg)
+    chart_payload    = build_chart_payload(chart_cfg.model_dump(), rows, columns)
     results_as_dicts = [dict(zip(columns, row)) for row in rows]
 
     return {
@@ -145,8 +177,8 @@ def sql_node(state: AgentState) -> AgentState:
         "sql_query_raw":     sql,
         "sql_query_columns": columns,
         "sql_query_results": results_as_dicts,
-        "sql_query_chart":   chart_payload,
-        "sql_query_summary": chart_cfg.summary,
+        "sql_query_chart":   chart_payload or {},
+        "sql_query_summary": "",
         "sql_query_warning": approximation_warning if is_approximation else "",
         "current_step":      "sql_node",
     }

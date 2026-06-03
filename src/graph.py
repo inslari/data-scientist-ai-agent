@@ -47,8 +47,11 @@ def route_after_critic(state: AgentState) -> str:
     return state.get("next_retry_node", "report_node")
 
 
+from typing import Optional
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
 # Graph
-def build_graph() -> StateGraph:
+def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
     """
     Data Scientist Agent — LangGraph pipeline.
 
@@ -132,4 +135,4 @@ def build_graph() -> StateGraph:
     graph.add_edge("target_discovery_node", "planner_node")
     graph.add_edge("report_node",              END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)

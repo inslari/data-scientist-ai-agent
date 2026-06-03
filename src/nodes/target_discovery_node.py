@@ -6,6 +6,7 @@ def target_discovery_node(state: AgentState) -> AgentState:
     Node: Hedef değişkeni belirler.
     Mantık src.services.target_discovery içine taşındı.
     """
+    print("\n========================================\n[NODE START] target_discovery_node başlıyor...\n========================================")
     result = discover_target(state)
     
     if result.get("error"):

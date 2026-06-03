@@ -1,6 +1,6 @@
 import json
 
-def build_chart_payload(chart_cfg: dict, rows: list, columns: list) -> str | None:
+def build_chart_payload(chart_cfg: dict, rows: list, columns: list) -> dict | None:
     """JSON payload for Streamlit ECharts."""
     try:
         ctype = chart_cfg.get("type", "bar").lower()
@@ -42,7 +42,7 @@ def build_chart_payload(chart_cfg: dict, rows: list, columns: list) -> str | Non
                 "yAxis": {"type": "value", "name": y_col},
                 "series": [{"data": y_data, "type": ctype}],
             }
-        return json.dumps(option)
+        return option
     except Exception as e:
         print(f"Error building chart payload: {e}")
         return None

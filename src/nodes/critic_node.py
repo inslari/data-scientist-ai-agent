@@ -11,6 +11,7 @@ def critic_node(state: AgentState) -> AgentState:
     Evaluates the final model performance and checks for critical issues.
     If issues are found and retries are available, it sends feedback back to the pipeline.
     """
+    print("\n========================================\n[NODE START] critic_node başlıyor...\n========================================")
     print(f"\n{'='*60}")
     print(f"[critic_node] BAŞLIYOR — Model Değerlendirmesi ve Self-Correction")
     print(f"{'='*60}")
@@ -27,7 +28,9 @@ def critic_node(state: AgentState) -> AgentState:
         return {**state, "current_step": "critic_node"}
         
     if not evaluation_report:
-        return {**state, "current_step": "critic_node", "error": "Evaluation report bulunamadı"}
+        existing_error = state.get("error")
+        error_msg = existing_error if existing_error else "Evaluation report bulunamadı"
+        return {**state, "current_step": "critic_node", "error": error_msg}
 
     task = evaluation_report.get("task", "")
     test_metrics = evaluation_report.get("test_metrics", {})

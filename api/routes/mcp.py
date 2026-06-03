@@ -11,8 +11,10 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client, StdioServerParameters, get_default_environment
 from mcp.client.streamable_http import streamable_http_client
 
-from api.database import get_db, MCPConfigModel
-from api.models import (
+from api.core.database import get_db
+from api.models.mcp import MCPConfigModel
+from api.models.data_group import DataGroupModel
+from api.schemas.mcp import (
     MCPConfigCreate, MCPConfigUpdate, MCPConfigResponse,
     ConnectionTestRequest, ConnectionTestResponse,
     MCPToolRequest, MCPSchemaResponse, MCPColumnStatsResponse,
@@ -29,6 +31,15 @@ def create_mcp_config(config: MCPConfigCreate, db: Session = Depends(get_db)):
     db_config = db.query(MCPConfigModel).filter(MCPConfigModel.name == config.name).first()
     if db_config:
         raise HTTPException(status_code=400, detail="An MCP config with this name already exists")
+        
+    data_group = DataGroupModel(
+        name=config.name,
+        source_type="mcp",
+        created_at=int(time.time())
+    )
+    db.add(data_group)
+    db.commit()
+    db.refresh(data_group)
     
     new_config = MCPConfigModel(
         name=config.name,
@@ -36,7 +47,8 @@ def create_mcp_config(config: MCPConfigCreate, db: Session = Depends(get_db)):
         command=config.command,
         args=config.args,
         url=config.url,
-        env=config.env
+        env=config.env,
+        data_group_id=data_group.id
     )
     db.add(new_config)
     db.commit()
@@ -155,7 +167,6 @@ async def test_mcp_connection(req: ConnectionTestRequest, db: Session = Depends(
                     "inputSchema": t.inputSchema
                 })
                 
-
             print(tool_names)   
             # Sistemin çalışması için zorunlu olan araçların kontrolü
             required_tools = {"get_schema", "get_column_stats", "run_sql_query"}
@@ -176,7 +187,6 @@ async def test_mcp_connection(req: ConnectionTestRequest, db: Session = Depends(
             
         except Exception as e:
             return {"status": "error", "message": f"Failed to connect to MCP server: {str(e)}"}
-
 
 async def _call_mcp_tool(db_config, tool_name: str, tool_args: dict = None) -> str:
     """
@@ -228,7 +238,6 @@ async def _call_mcp_tool(db_config, tool_name: str, tool_args: dict = None) -> s
             return "\n".join(parts)
         return ""
 
-
 @router.post("/schema", response_model=MCPSchemaResponse)
 async def get_mcp_schema(req: MCPToolRequest, db: Session = Depends(get_db)):
     """
@@ -256,7 +265,6 @@ async def get_mcp_schema(req: MCPToolRequest, db: Session = Depends(get_db)):
         return {"status": "error", "message": "MCP tool call timed out."}
     except Exception as e:
         return {"status": "error", "message": f"Failed to get schema: {str(e)}"}
-
 
 @router.post("/column-stats", response_model=MCPColumnStatsResponse)
 async def get_mcp_column_stats(req: MCPToolRequest, db: Session = Depends(get_db)):
