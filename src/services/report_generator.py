@@ -464,6 +464,16 @@ def generate_report(state: AgentState) -> dict:
     """
     print("\n[report] Başlıyor...")
 
+    # Check for pipeline errors first
+    if state.get("error"):
+        error_msg = state.get("error")
+        print(f"[report] UYARI: Pipeline hatası algılandı: {error_msg}")
+        return {
+            **state,
+            "report": f"# ❌ Analiz Tamamlanamadı\n\nVeri işleme sürecinde kritik bir hata meydana geldi ve analiz durduruldu:\n\n**Hata Nedeni:** {error_msg}\n\n*Lütfen daha büyük veya daha tutarlı bir veri seti ile tekrar deneyin.*",
+            "current_step": "report_node",
+        }
+
     # control evaluation report
     ev = state.get("evaluation_report", {})
     if not ev:
@@ -471,7 +481,7 @@ def generate_report(state: AgentState) -> dict:
         print(f"[report] UYARI: {error_msg}")
         return {
             **state,
-            "report": f"# Rapor Üretilemedi\n\n{error_msg}",
+            "report": f"# ❌ Rapor Üretilemedi\n\n{error_msg}\n\nBu durum genellikle modelin kurulamamasından kaynaklanır.",
             "current_step": "report_node",
         }
 

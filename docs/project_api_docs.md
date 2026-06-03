@@ -2,136 +2,100 @@
 
 Bu dökümantasyon, kullanıcıların yaptığı veri analizlerini, yazdıkları query'leri ve seçtikleri veri gruplarını (DataGroup) bir araya getirip kaydetmelerini sağlayan **Project** API uç noktalarını açıklamaktadır.
 
+Ayrıca bu güncellemeyle beraber; Projeleri **Arka Planda Çalıştırma** (Background Task) ve LLM'in analizini adım adım canlı (polling) olarak çekebileceğiniz **Steps** uç noktaları da eklenmiştir.
+
 ---
 
 ## 1. Yeni Proje Oluşturma
 
-Yeni bir proje kaydı yaratır.
-
 * **URL:** `/projects`
 * **Method:** `POST`
-* **Content-Type:** `application/json`
 
 ### İstek (Request) Body
-Tüm alanlar `title` hariç isteğe bağlıdır (opsiyonel).
 ```json
 {
   "title": "Gelir Tahmin Analizi",
-  "description": "2023 verileriyle yapılan denemeler",
-  "query": "Predict the income level of individuals in this dataset...",
+  "description": "2023 verileri",
+  "query": "Predict the income level...",
   "data_group_id": 2
 }
 ```
 
-### Başarılı Yanıt (200 OK)
+### Yanıt (200 OK)
+Dönen yanıtta yeni eklenen `status` ("idle"), `report` (null) ve `error` (null) alanlarını görebilirsiniz.
 ```json
 {
-  "title": "Gelir Tahmin Analizi",
-  "description": "2023 verileriyle yapılan denemeler",
-  "query": "Predict the income level of individuals in this dataset...",
-  "data_group_id": 2,
   "id": 1,
-  "created_at": 1700000000,
-  "updated_at": 1700000000,
-  "data_group": null
+  "title": "Gelir Tahmin Analizi",
+  "status": "idle",
+  "report": null,
+  "error": null,
+  ...
 }
 ```
 
 ---
 
-## 2. Tüm Projeleri Listeleme
+## 2. Projeyi Çalıştırma (Run AI Graph)
 
-Sistemdeki kayıtlı tüm projeleri getirir.
+Seçili projeye ait Yapay Zeka analiz sürecini arka planda başlatır.
 
-* **URL:** `/projects`
+* **URL:** `/projects/{id}/run` (Opsiyonel olarak: `/projects/{id}/run?force_restart=true`)
+* **Method:** `POST`
+
+**Parametreler:**
+* `force_restart` (boolean, opsiyonel): Eğeri `true` gönderilirse, önceden var olan tüm `steps` (adım) kayıtları ve checkpointler silinir. Proje tamamen sıfırdan, en baştan çalışmaya başlar. Varsayılan olarak `false`'tur (proje failed durumundaysa kaldığı yerden devam eder).
+
+### Başarılı Yanıt (200 OK)
+Süreci başlattığınıza dair projenin o anki durumunu (status: "running") döner. İşlem arkada asenkron olarak 1-5 dakika kadar sürebilir. İstemci kitlenmez.
+```json
+{
+  "id": 1,
+  "status": "running",
+  ...
+}
+```
+
+---
+
+## 3. Adım Adım İlerleme Çekme (Polling)
+
+Proje "running" durumundayken, her bir AI Agent nodu (SQL Node, ML Node vb.) bittikçe sonuçlarını bu uç noktadan anlık olarak saniye saniye çekebilirsiniz. Eğer proje "completed" ise eski adımların tamamını liste olarak döner.
+
+* **URL:** `/projects/{id}/steps`
 * **Method:** `GET`
 
 ### Başarılı Yanıt (200 OK)
-Dizi (array) halinde tüm projeleri döner.
 ```json
 [
   {
     "id": 1,
-    "title": "Gelir Tahmin Analizi",
-    "description": "...",
-    "query": "...",
-    "data_group_id": 2,
-    "created_at": 1700000000,
-    "updated_at": 1700000000,
-    "data_group": null
+    "project_id": 1,
+    "node_name": "intent_node",
+    "step_data": {
+      "intent": "classification"
+    },
+    "created_at": 1700000005
+  },
+  {
+    "id": 2,
+    "project_id": 1,
+    "node_name": "sql_node",
+    "step_data": {
+      "sql_query_raw": "SELECT * FROM adult_income LIMIT 10",
+      "sql_query_results": [{"age": 25, "income": "<=50K"}]
+    },
+    "created_at": 1700000010
   }
 ]
 ```
 
----
-
-## 3. Tekil Proje Detayı Getirme
-
-Belirli bir projenin tüm detaylarını (varsa `data_group` içeriğiyle beraber) getirir.
-
-* **URL:** `/projects/{id}`
-* **Method:** `GET`
-
-### Başarılı Yanıt (200 OK)
-JSON Objesi döner.
-
-### Hata Yanıtı (404 Not Found)
-* Belirtilen ID'ye sahip bir proje bulunamazsa döner.
+**Tavsiye Edilen Kullanım:** `/projects/{id}/run` işlemine istek attıktan sonra frontend tarafında `setInterval` ile her saniye `/projects/{id}/steps` uç noktasına istek atarak ekrandaki "Chat" akışını güncelleyebilirsiniz. Proje `status`'ü "completed" veya "failed" olduğunda interval'ı durdurabilirsiniz. (Bunun için bir defa da `/projects/{id}` çekip durumu kontrol etmeniz gerekebilir).
 
 ---
 
-## 4. Proje Güncelleme
+## 4. Tüm Projeleri Listeleme / Detay Getirme / Silme
 
-Var olan bir projenin bilgilerini günceller. Sadece değiştirmek istediğiniz alanları göndermeniz yeterlidir.
-
-* **URL:** `/projects/{id}`
-* **Method:** `PUT`
-* **Content-Type:** `application/json`
-
-### İstek (Request) Body
-Tüm alanlar opsiyoneldir. Sadece güncellenecek olanları gönderin.
-```json
-{
-  "query": "Bu sefer yeni bir analiz metni..."
-}
-```
-
-### Başarılı Yanıt (200 OK)
-Güncellenmiş projenin JSON detayını döner.
-```json
-{
-  "id": 1,
-  "title": "Gelir Tahmin Analizi",
-  "description": "2023 verileriyle yapılan denemeler",
-  "query": "Bu sefer yeni bir analiz metni...",
-  "data_group_id": 2,
-  "created_at": 1700000000,
-  "updated_at": 1700000150,
-  "data_group": null
-}
-```
-
----
-
-## 5. Proje Silme
-
-Belirli bir projeyi veritabanından kalıcı olarak siler.
-
-* **URL:** `/projects/{id}`
-* **Method:** `DELETE`
-
-### Başarılı Yanıt (200 OK)
-```json
-{
-  "status": "success",
-  "message": "Project with id 1 deleted successfully"
-}
-```
-
-### Hata Yanıtı (404 Not Found)
-* Belirtilen ID'ye sahip bir proje bulunamazsa döner.
-
----
-
-> [!NOTE]
-> Projenin bağlı olduğu `DataGroup` silinirse (örneğin MCP bağlantısı veya CSV silinirse), projeler **silinmez**. Sadece projenin içerisindeki `data_group_id` alanı otomatik olarak `null` değerine düşer (SET NULL kuralı). Böylece yaptığınız analizler ve girdiğiniz query metinleri kaybolmaz.
+* **Tümünü Listele:** `GET /projects`
+* **Tekil Detay:** `GET /projects/{id}`
+* **Silme:** `DELETE /projects/{id}` (Eğer proje silinirse ona ait `steps` kayıtları da CASCADE mantığıyla otomatik olarak silinir).

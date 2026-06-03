@@ -1,12 +1,14 @@
+from langchain_core.runnables import RunnableConfig
 from src.state import AgentState
 from src.services.data_executor import execute_data_operations
 
-async def execution_node(state: AgentState) -> AgentState:
+async def execution_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """
     Node 3: Planı (SQL sorguları dahil) yürütür ve veriyi Pandas DataFrame'e çeker.
     Tüm yürütme mantığı `src.services.data_executor` içerisine taşındı.
     """
-    result = await execute_data_operations(state)
+    print("\n========================================\n[NODE START] execution_node başlıyor...\n========================================")
+    result = await execute_data_operations(state, config)
     
     if result.get("error"):
         return {

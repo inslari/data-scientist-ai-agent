@@ -908,7 +908,18 @@ def evaluate_model(state: AgentState) -> dict:
     State çıktıları:
         evaluation_report : Kapsamlı değerlendirme raporu
     """
-    model = state.get("model_artifact")
+    model_artifact = state.get("model_artifact")
+    model = None
+    if isinstance(model_artifact, str) and model_artifact.endswith('.pkl'):
+        import joblib
+        import os
+        if os.path.exists(model_artifact):
+            try:
+                model = joblib.load(model_artifact)
+            except Exception as e:
+                print(f"[evaluator] Model diskten yuklenemedi: {e}")
+    else:
+        model = model_artifact
     X_train_raw = state.get("X_train", [])
     X_test_raw = state.get("X_test", [])
     y_train_raw = state.get("y_train", [])

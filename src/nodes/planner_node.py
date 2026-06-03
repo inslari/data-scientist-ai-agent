@@ -9,6 +9,7 @@ def planner_node(state: AgentState) -> AgentState:
     """
     Node 3: Takes the database intelligence and user query as input and produces an analysis plan.
     """
+    print("\n========================================\n[NODE START] planner_node başlıyor...\n========================================")
     llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
     structured_llm = llm.with_structured_output(AnalysisPlan)
 
@@ -22,7 +23,7 @@ def planner_node(state: AgentState) -> AgentState:
     PLANNER_PROMPT = create_chat_prompt("planner_system.md", "planner_human.md")
     chain = PLANNER_PROMPT | structured_llm
 
-    result: AnalysisPlan = chain.invoke({
+    result: AnalysisPlan = chain.invoke({  # type: ignore[assignment]
         "user_query": user_query,
         "intent": intent,
         "relevant_tables": relevant_tables,

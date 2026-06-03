@@ -7,6 +7,7 @@ def report_node(state: AgentState) -> AgentState:
     kapsamlı bir Markdown raporu üretir.
     Prompt mantığı `src.prompts` altına, üretim mantığı `src.services.report_generator` altına taşındı.
     """
+    print("\n========================================\n[NODE START] report_node başlıyor...\n========================================")
     print(f"[DEBUG REPORT] State keys available: {[k for k, v in state.items() if v]}")
     result = generate_report(state)
     
@@ -20,6 +21,6 @@ def report_node(state: AgentState) -> AgentState:
         
     return {
         **state,
-        "report": result.get("report"),
+        "report": result.get("report", ""),
         "current_step": "report_node",
     }

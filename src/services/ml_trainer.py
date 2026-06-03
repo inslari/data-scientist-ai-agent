@@ -488,6 +488,11 @@ def _run_classification(
         best_model.fit(X_train_bal, y_train_bal)
     
     y_prob = None
+    try:
+        y_pred = best_model.predict(X_test)
+    except Exception:
+        y_pred = np.zeros(len(X_test)) # Fallback if predict fails
+        
     optimal_threshold = 0.5  # default
 
     try:
@@ -980,6 +985,18 @@ def train_model(state: AgentState) -> dict:
             top_models = [m[0] for m in sorted_models[:2]]
             print(f"[automl] Top 2 model seçildi ve kaydedildi: {top_models}")
 
+    # Save model to disk to avoid LangGraph serialization errors
+    import joblib
+    import os
+    import uuid
+    os.makedirs("data/models", exist_ok=True)
+    model_path = f"data/models/model_{uuid.uuid4().hex}.pkl"
+    try:
+        joblib.dump(model, model_path)
+    except Exception as e:
+        print(f"[automl] UYARI: Model diske kaydedilemedi: {e}")
+        model_path = None
+
     return {
         **state,
         "intent": intent,
@@ -987,7 +1004,7 @@ def train_model(state: AgentState) -> dict:
         "y_test": y_test.tolist() if isinstance(y_test, np.ndarray) else y_test,
         "model_name": model_name,
         "model_params": {"intent": intent},
-        "model_artifact": model,
+        "model_artifact": model_path,
         "metrics": metrics,
         "top_models": top_models,
         "current_step": "automl_node",

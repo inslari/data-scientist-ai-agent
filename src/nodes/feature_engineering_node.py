@@ -6,6 +6,7 @@ def feature_engineering_node(state: AgentState) -> AgentState:
     Node 5: Makine Öğrenmesi için Veri Hazırlığı.
     Tüm feature engineering mantığı `src.services.feature_builder` içerisine taşındı.
     """
+    print("\n========================================\n[NODE START] feature_engineering_node başlıyor...\n========================================")
 
     print(f"[DEBUG FE] data_path = '{state.get('data_path')}'")
     print(f"[DEBUG FE] sql_results len = {len(state.get('sql_results') or [])}")
@@ -19,7 +20,8 @@ def feature_engineering_node(state: AgentState) -> AgentState:
             "current_step": "feature_engineering_node",
         }
         
-    return {
+    from src.utils.type_utils import clean_np
+    return clean_np({
         **state,
         "X_train": result.get("X_train"),
         "X_test": result.get("X_test"),
@@ -30,4 +32,4 @@ def feature_engineering_node(state: AgentState) -> AgentState:
         "feature_report": result.get("feature_report"),
         "target_definition": result.get("target_definition", state.get("target_definition")),
         "current_step": "feature_engineering_node",
-}
+    })
