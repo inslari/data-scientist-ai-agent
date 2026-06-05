@@ -72,20 +72,52 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
 
     try:
         db_providers_info = ", ".join([f"{k} ({v.provider_display_name})" for k, v in db_manager.get_all_providers().items()])
-        SQL_GEN_PROMPT = create_chat_prompt("sql_generation.md", "Kullanici sorusu: {user_query}")
-        sql_chain  = SQL_GEN_PROMPT | llm.with_structured_output(SQLGenerationResult)
-        sql_result: SQLGenerationResult = sql_chain.invoke({  # type: ignore[assignment]
-            "schema":          raw_schema,
-            "column_profiles": column_profiles,
-            "user_query":      user_query,
-            "db_providers":    db_providers_info,
-        })
-        sql                  = sql_result.sql.strip()
-        target_db_name       = str(sql_result.db_name).strip().strip('",\'”’ \t\n')
-        data_warning         = sql_result.data_warning or ""
-        is_approximation     = sql_result.is_approximation
-        approximation_warning = sql_result.approximation_warning or ""
+        from src.agents.sql_agent import sql_agent
+        
+        prompt_content = f"""
+        User Query: {user_query}
+        
+        Schema Context:
+        {raw_schema}
+        
+        Column Profiles:
+        {column_profiles}
+        
+        DB Providers Available:
+        {db_providers_info}
+        """
+        
+        agent_result = sql_agent.invoke(
+            {"messages": [{"role": "user", "content": prompt_content}]},
+            config=config
+        )
+        
+        sql = ""
+        target_db_name = "default"
+        data_warning = ""
+        is_approximation = False
+        approximation_warning = ""
+        
+        for msg in reversed(agent_result["messages"]):
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tool_call in msg.tool_calls:
+                    if tool_call["name"] == "submit_final_sql":
+                        args = tool_call["args"]
+                        sql = args.get("sql_query", "").strip()
+                        target_db_name = args.get("db_name", "default").strip()
+                        data_warning = args.get("data_warning", "")
+                        is_approximation = args.get("is_approximation", False)
+                        approximation_warning = args.get("approximation_warning", "")
+                        break
+            if sql:
+                break
+
+        if not sql:
+             raise ValueError("Agent did not submit a final SQL query via tool.")
+             
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {**state, "error": f"SQL üretim hatası: {e}", "current_step": "sql_node"}
 
     # If no valid columns found, return warning
