@@ -14,6 +14,7 @@ Supported tasks:
 No domain or column names are hardcoded.
 """
 
+from src.core.config import settings
 import time
 import warnings
 from typing import Any
@@ -202,7 +203,8 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
         scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring, n_jobs=-1)
         return scores.mean()
 
-    study = optuna.create_study(direction="maximize")
+    sampler = optuna.samplers.TPESampler(seed=settings.RANDOM_SEED)
+    study = optuna.create_study(direction="maximize", sampler=sampler)
     try:
         study.optimize(objective, n_trials=20, timeout=15)
         best_params = study.best_params
@@ -210,17 +212,17 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
         
         # Best model Instantiate
         if model_name == "random_forest":
-            return RandomForestClassifier(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
+            return RandomForestClassifier(**best_params, random_state=settings.RANDOM_SEED, n_jobs=-1)
         elif model_name == "extra_trees":
-            return ExtraTreesClassifier(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
+            return ExtraTreesClassifier(**best_params, random_state=settings.RANDOM_SEED, n_jobs=-1)
         elif model_name == "gradient_boosting":
-            return GradientBoostingClassifier(**best_params, random_state=RANDOM_STATE)
+            return GradientBoostingClassifier(**best_params, random_state=settings.RANDOM_SEED)
         elif model_name == "xgboost":
             from xgboost import XGBClassifier
-            return XGBClassifier(**best_params, random_state=RANDOM_STATE, eval_metric="logloss", verbosity=0, n_jobs=-1)
+            return XGBClassifier(**best_params, random_state=setting.RANDOM_SEED, eval_metric="logloss", verbosity=0, n_jobs=-1)
         elif model_name == "lightgbm":
             from lightgbm import LGBMClassifier
-            return LGBMClassifier(**best_params, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1)
+            return LGBMClassifier(**best_params, random_state=setting.RANDOM_SEED, verbose=-1, n_jobs=-1)
     except Exception as e:
         print(f"[automl] Optuna tuning başarısız oldu, default modele dönülüyor: {e}")
         
@@ -277,25 +279,25 @@ def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.n
 
         scores = cross_val_score(model, X_train, y_train, cv=cv, scoring="r2", n_jobs=-1)
         return scores.mean()
-
-    study = optuna.create_study(direction="maximize")
+    sampler = optuna.samplers.TPESampler(seed= settings.RANDOM_SEED)
+    study = optuna.create_study(direction="maximize", sampler=sampler)
     try:
         study.optimize(objective, n_trials=20, timeout=15)
         best_params = study.best_params
         print(f"[automl] Optuna tamamlandı. En iyi parametreler: {best_params}")
         
         if model_name == "random_forest":
-            return RandomForestRegressor(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
+            return RandomForestRegressor(**best_params, random_state=settings.RANDOM_SEED, n_jobs=-1)
         elif model_name == "extra_trees":
-            return ExtraTreesRegressor(**best_params, random_state=RANDOM_STATE, n_jobs=-1)
+            return ExtraTreesRegressor(**best_params, random_state=settings.RANDOM_SEED, n_jobs=-1)
         elif model_name == "gradient_boosting":
-            return GradientBoostingRegressor(**best_params, random_state=RANDOM_STATE)
+            return GradientBoostingRegressor(**best_params, random_state=settings.RANDOM_SEED)
         elif model_name == "xgboost":
             from xgboost import XGBRegressor
-            return XGBRegressor(**best_params, random_state=RANDOM_STATE, verbosity=0, n_jobs=-1)
+            return XGBRegressor(**best_params, random_state=settings.RANDOM_SEED, verbosity=0, n_jobs=-1)
         elif model_name == "lightgbm":
             from lightgbm import LGBMRegressor
-            return LGBMRegressor(**best_params, random_state=RANDOM_STATE, verbose=-1, n_jobs=-1)
+            return LGBMRegressor(**best_params, random_state=settings.RANDOM_SEED, verbose=-1, n_jobs=-1)
     except Exception as e:
         print(f"[automl] Optuna tuning başarısız oldu, default modele dönülüyor: {e}")
         

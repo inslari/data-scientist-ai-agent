@@ -74,7 +74,7 @@ async def run_data_group_query(group_id: int, req: QueryRequest, db: Session = D
             con = duckdb.connect(database=':memory:')
             for csv_file in db_group.csv_files:
                 table_name = os.path.splitext(csv_file.filename)[0].replace(" ", "_").lower()
-                con.execute(f"CREATE VIEW {table_name} AS SELECT * FROM read_csv_auto('{csv_file.file_path}')")
+                con.execute(f'CREATE VIEW "{table_name}" AS SELECT * FROM read_csv_auto(\'{csv_file.file_path}\')')
                 
             # Run query
             result_df = con.execute(req.query).df()

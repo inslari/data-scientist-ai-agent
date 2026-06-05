@@ -15,6 +15,7 @@ from src.nodes.critic_node import critic_node
 from src.nodes.report_node import report_node
 from src.nodes.sql_node import sql_node
 from src.nodes.target_discovery_node import target_discovery_node
+from src.nodes.leakage_detector_node import leakage_detector_node
 
 # Routing functions
 def route_after_db_context(state: AgentState) -> str:
@@ -85,6 +86,7 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
     graph.add_node("evaluation_node",          evaluation_node)
     graph.add_node("critic_node",              critic_node)
     graph.add_node("report_node",              report_node)
+    graph.add_node("leakage_detector_node",    leakage_detector_node)
 
     # START → intent_node → db_context_node
     graph.add_edge(START, "intent_node")
@@ -117,7 +119,8 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
         },
     )
 
-    graph.add_edge("feature_plan_node",        "feature_engineering_node")
+    graph.add_edge("feature_plan_node", "leakage_detector_node")
+    graph.add_edge("leakage_detector_node", "feature_engineering_node")
     graph.add_edge("feature_engineering_node", "automl_node")
     graph.add_edge("automl_node",              "evaluation_node")
     graph.add_edge("evaluation_node",          "critic_node")
