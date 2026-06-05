@@ -66,6 +66,8 @@ class AgentState(TypedDict, total=False):
     critic_feedback: list[str]       # Feedback from the critic node
     next_retry_node: str             # Node to route to after critic
     
+    # Leakage Detection
+    domain_leakage_report: dict
     # Audit Trail / Tracking
     experiment_logs: list[dict]      # Logs of completed ML experiments
 

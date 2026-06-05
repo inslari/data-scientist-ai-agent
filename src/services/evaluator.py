@@ -460,12 +460,50 @@ def _summarize_feature_importance(fi: dict) -> dict:
     # insignificant features (less than %1)
     insignificant = [k for k, v in sorted_feats if v / total < 0.01]
 
+    # ── Importance-based leakage detection ──
+    leakage_suspects = []
+
+    # Tek feature aşırı baskın
+    if sorted_feats:
+        top1_feat, top1_val = sorted_feats[0]
+        top1_pct = top1_val / total * 100
+        if top1_pct >= 70:
+            leakage_suspects.append({
+                "column": top1_feat,
+                "reason": f"tek basina %{top1_pct:.1f} importance - cok yuksek leakage suphesi",
+                "severity": "high",
+            })
+        elif top1_pct >= 50:
+            leakage_suspects.append({
+                "column": top1_feat,
+                "reason": f"tek basina %{top1_pct:.1f} importance - leakage suphesi",
+                "severity": "medium",
+            })
+
+    # Top 2 toplam aşırı baskın
+    if len(sorted_feats) >= 2:
+        top2_total = sorted_feats[0][1] + sorted_feats[1][1]
+        top2_pct = top2_total / total * 100
+        if top2_pct >= 90 and top1_pct < 70:  # tek feature degil ama ikisi cok baskin
+            top2_feats = [sorted_feats[0][0], sorted_feats[1][0]]
+            leakage_suspects.append({
+                "column": " + ".join(top2_feats),
+                "reason": f"ilk 2 feature toplam %{top2_pct:.1f} importance - leakage suphesi",
+                "severity": "medium",
+            })
+
+    if leakage_suspects:
+        print(f"\n[evaluation] LEAKAGE SUPHESI (importance-based):")
+        for s in leakage_suspects:
+            print(f"  - {s['column']}: {s['reason']}")
+
     return {
         "top5_features": top5,
         "top5_total_contribution_pct": top5_pct,
         "total_features": len(fi),
         "insignificant_features_count": len(insignificant),
         "insignificant_features": insignificant[:10],
+        "leakage_suspects": leakage_suspects,
     }
 
 

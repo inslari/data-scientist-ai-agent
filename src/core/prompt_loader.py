@@ -27,3 +27,8 @@ def create_chat_prompt(system_filename: str, human_template: str) -> ChatPromptT
         ("system", system_msg),
         ("human", human_msg)
     ])
+
+def load_prompt(filename: str) -> str:
+    """Reads a prompt template from the src/prompts directory."""
+    prompt_path = Path(__file__).resolve().parent.parent / "prompts" / filename
+    return prompt_path.read_text(encoding="utf-8")

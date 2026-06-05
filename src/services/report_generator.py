@@ -51,6 +51,8 @@ def _build_context(state: AgentState) -> str:
     lines: list[str] = []
     intent = state.get("intent", "unknown")
 
+
+    print(f"[DEBUG REPORT CONTEXT] domain_leakage_report = {state.get('domain_leakage_report')}")
     # ── Kullanıcı Sorusu ─────────────────────────────────────────────
     lines.append(f"## Kullanıcı Sorusu\n{state.get('user_query', 'Belirtilmemiş')}\n")
 
@@ -105,7 +107,30 @@ def _build_context(state: AgentState) -> str:
             f"- Eğitim seti: {fr.get('n_train')} satır\n"
             f"- Test seti: {fr.get('n_test')} satır\n"
         )
-
+    
+    # Domain Leakage Report
+    domain_leakage = state.get("domain_leakage_report", {})
+    if domain_leakage:
+        concerns = domain_leakage.get("concerns", [])
+        assessment = domain_leakage.get("overall_assessment", "")
+        
+        if concerns:
+            lines.append("\n## Leakage Suphesi (Domain Analizi)")
+            lines.append(f"Genel degerlendirme: {assessment}\n")
+            for c in concerns:
+                severity_marker = {
+                    "high": "[YUKSEK SUPHE]",
+                    "medium": "[ORTA SUPHE]",
+                    "low": "[DUSUK SUPHE]",
+                }.get(c.get("confidence", "low"), "[SUPHE]")
+                lines.append(
+                    f"  {severity_marker} '{c.get('column_name')}' "
+                    f"({c.get('relationship_type')}): {c.get('reasoning')}"
+                )
+            lines.append("")
+        elif assessment:
+            lines.append(f"\n## Leakage Kontrolu\n{assessment}\n")
+    
     # ── Task-specific Evaluation Context ────────────────────────────
     ev = state.get("evaluation_report", {})
     metrics = state.get("metrics", {})
@@ -245,9 +270,17 @@ def _build_context(state: AgentState) -> str:
             if fi_sum:
                 lines.append(
                     f"\n### Feature Importance\n"
-                    f"  - Top 5 toplam katkı: %{fi_sum.get('top5_total_contribution_pct')}\n"
-                    f"  - Önemsiz feature: {fi_sum.get('insignificant_features_count', 0)} adet"
+                    f"  - Top 5 toplam katki: %{fi_sum.get('top5_total_contribution_pct')}\n"
+                    f"  - Onemsiz feature: {fi_sum.get('insignificant_features_count', 0)} adet"
                 )
+                
+                # Importance-based leakage uyarisi
+                suspects = fi_sum.get("leakage_suspects", [])
+                if suspects:
+                    lines.append("\n### Leakage Suphesi (Feature Importance)")
+                    for s in suspects:
+                        severity_emoji = "[YUKSEK]" if s["severity"] == "high" else "[ORTA]"
+                        lines.append(f"  {severity_emoji} {s['column']}: {s['reason']}")
 
             bias = ev.get("bias_analysis", {})
             if bias:
@@ -265,8 +298,12 @@ def _build_context(state: AgentState) -> str:
                 f"  - Skor: {rel.get('score')}/100 | Grade: {rel.get('grade')}\n"
                 f"  - Faktörler: {', '.join(rel.get('factors', []))}"
             )
-
-    return "\n".join(lines)
+    
+    final_context = "\n".join(lines)
+    print(f"[DEBUG REPORT CONTEXT] domain_leakage_report = {state.get('domain_leakage_report')}")
+    print(f"[DEBUG REPORT CONTEXT] 'leakage' kelimesi context'te geciyor mu: {'leakage' in final_context.lower()}")
+    print(f"[DEBUG REPORT CONTEXT] context length: {len(final_context)} chars")
+    return final_context
 
 
 # System Prompts — task-specific

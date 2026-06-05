@@ -86,6 +86,7 @@ def critic_node(state: AgentState) -> AgentState:
             print(f"[critic_node] Max retries ({max_retries}) aşıldı. Mevcut modelle devam ediliyor.")
             
     print(f"[critic_node] Model kabul edildi veya retry hakkı kalmadı.")
+    print(f"[DEBUG FE OUT] domain_leakage_report var mi: {state.get('domain_leakage_report') is not None}")
     return {
         **state,
         "current_step": "critic_node",

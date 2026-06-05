@@ -22,6 +22,7 @@ def evaluation_node(state: AgentState) -> AgentState:
         }
         
     from src.utils.type_utils import clean_np
+    print(f"[DEBUG FE OUT] domain_leakage_report var mi: {state.get('domain_leakage_report') is not None}")
     return clean_np({
         **state,
         "metrics": result.get("metrics", state.get("metrics")),

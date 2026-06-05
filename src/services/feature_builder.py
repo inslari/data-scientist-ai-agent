@@ -531,22 +531,82 @@ def _select_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── Data leakage detection ───────────────────────────────────
+# ── Data leakage detection (Adım 1: identifier + kesin korelasyon) ──
 def _detect_leakage(
-    df: pd.DataFrame, y: pd.Series
-) -> tuple[pd.DataFrame, list[str]]:
-    warnings_list = []
-    num = df.select_dtypes(include="number").columns.tolist()
-    for col in num:
-        if df[col].nunique() > 1:
+    df: pd.DataFrame,
+    y: pd.Series,
+    meta=None,  # ColumnMetadata, identifier tespiti için
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Leakage tespiti — iki seviyeli:
+      KESİN  → otomatik drop (identifier, ~birebir korelasyon)
+      ŞÜPHELİ → drop etme, uyarı listesine ekle
+
+    Dönüş:
+      df              : temizlenmiş dataframe
+      leakage_report  : {"dropped": [...], "suspected": [...]}
+    """
+    dropped = []      # otomatik atılanlar (kesin)
+    suspected = []    # şüpheli, kullanıcıya raporlanacak
+    n_rows = len(df)
+    print(f"\n[leakage] === BASLIYOR ===")
+    print(f"[leakage] df shape: {df.shape}, y dtype: {y.dtype}")
+
+    # y'yi numeric'e çevir (korelasyon için), başarısızsa korelasyon atla
+    try:
+        y_num = pd.to_numeric(y, errors="coerce").astype(float)
+        y_valid = y_num.notna().mean() > 0.8
+    except Exception:
+        y_valid = False
+        y_num = None
+
+    for col in list(df.columns):
+        # ── KESİN 1: Identifier semantic_type ──
+        if meta is not None:
+            sem = meta.columns.get(col, {}).get("semantic_type", "")
+            if sem == "identifier":
+                df = df.drop(columns=[col], errors="ignore")
+                dropped.append({"column": col, "reason": "identifier (semantic_type)"})
+                print(f"[leakage] KESIN drop: '{col}' (identifier)")
+                continue
+
+        # ── KESİN 2: Aşırı yüksek kardinalite (ID-benzeri) ──
+        nunique = df[col].nunique()
+        if n_rows > 0 and nunique / n_rows > 0.95:
+            df = df.drop(columns=[col], errors="ignore")
+            dropped.append({"column": col, "reason": f"asiri kardinalite ({nunique}/{n_rows})"})
+            print(f"[leakage] KESIN drop: '{col}' (kardinalite orani {nunique/n_rows:.2f})")
+            continue
+
+    # ── Korelasyon tabanlı (yalnızca numeric + y numeric ise) ──
+    if y_valid:
+        num_cols = df.select_dtypes(include="number").columns.tolist()
+        print(f"[leakage DEBUG] numeric cols: {num_cols}")
+        print(f"[leakage DEBUG] y_num NaN orani: {y_num.isna().mean():.2f}")
+        for col in num_cols:
+            if df[col].nunique() <= 1:
+                continue
             try:
-                corr = abs(df[col].corr(y))
-                if corr > 0.95:
-                    warnings_list.append(f"'{col}' hedef ile %{corr*100:.1f} korele — leakage riski, çıkarıldı")
-                    df = df.drop(columns=[col])
-                    print(f"[feature_eng] Leakage: '{col}' (corr={corr:.3f})")
-            except Exception:
-                pass
-    return df, warnings_list
+                col_vals = pd.to_numeric(df[col], errors="coerce").astype(float)
+                corr = abs(col_vals.corr(y_num))
+                print(f"[leakage DEBUG] '{col}' corr = {corr}")
+            except Exception as e:
+                print(f"[leakage DEBUG] '{col}' corr hatasi: {e}")
+                continue
+            if pd.isna(corr):
+                continue
+
+            if corr > 0.999:
+                # KESİN: birebir kopya (örn. target'in kendisi/duplikası)
+                df = df.drop(columns=[col], errors="ignore")
+                dropped.append({"column": col, "reason": f"birebir korelasyon ({corr:.4f})"})
+                print(f"[leakage] KESIN drop: '{col}' (corr={corr:.4f})")
+            elif corr > 0.85:
+                # ŞÜPHELİ: yüksek ama kesin değil → drop etme, uyar
+                suspected.append({"column": col, "reason": f"yuksek korelasyon ({corr:.3f})"})
+                print(f"[leakage] SUPHELI: '{col}' (corr={corr:.3f}) — droplanmadi, uyari verildi")
+
+    return df, {"dropped": dropped, "suspected": suspected}
 
 
 # ── MAIN NODE ────────────────────────────────────────────────
@@ -675,7 +735,7 @@ def build_features(state: dict) -> dict:
     df = df.apply(pd.to_numeric, errors="coerce").fillna(0)
 
     # Leakage detection
-    df, leakage_warnings = _detect_leakage(df, y)
+    df, leakage_report = _detect_leakage(df, y, meta)
 
     # 14. Train/test split
     if intent in ("clustering","anomaly_detection"):
@@ -712,9 +772,10 @@ def build_features(state: dict) -> dict:
         "target_distribution_train": pd.Series(y_train_arr).value_counts().to_dict(),  # type: ignore
         "target_distribution_test": pd.Series(y_test_arr).value_counts().to_dict(),  # type: ignore
         "intelligence_metadata":    meta.summary(),
-        "leakage_warnings":         leakage_warnings,
         "data_source":              "parquet" if state.get("data_path") else "sql_results_preview",
         "total_rows_available":     None,  # execution_node profiling'den alınabilir
+        "leakage_dropped":          leakage_report["dropped"],
+        "leakage_suspected":        leakage_report["suspected"],
     }
 
     return {
