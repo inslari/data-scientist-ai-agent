@@ -51,8 +51,38 @@ def _build_context(state: AgentState) -> str:
     lines: list[str] = []
     intent = state.get("intent", "unknown")
 
+    # ── Quality Gate (raporun başına gelecek) ──
+    qg = state.get("quality_gate") or {}
+    print(f"[DEBUG REPORT QG] quality_gate var mi: {bool(qg)}")
+    print(f"[DEBUG REPORT QG] status: {qg.get('status', 'YOK')}")
+    if qg:
+        status = qg.get("status", "unknown").upper()
+        severity = qg.get("severity", "ok")
+        summary = qg.get("summary", "")
+        
+        badge = {
+            "pass": "✅ MODEL GÜVENİLİR",
+            "warn": "⚠️ DİKKAT — MODELDE ŞÜPHELİ DURUMLAR VAR",
+            "fail": "🛑 MODEL YETERSİZ — ÜRETİME ALINMAMALI",
+        }.get(qg.get("status"), "")
+        
+        lines.append(f"# {badge}\n")
+        lines.append(f"**Karar:** {summary}\n")
+        
+        failures = qg.get("failures", [])
+        if failures:
+            lines.append("## Kritik Sorunlar (FAIL)")
+            for f in failures:
+                lines.append(f"  - {f['message']}")
+            lines.append("")
+        
+        warnings = qg.get("warnings", [])
+        if warnings:
+            lines.append("## Uyarılar (WARN)")
+            for w in warnings:
+                lines.append(f"  - {w['message']}")
+            lines.append("")
 
-    print(f"[DEBUG REPORT CONTEXT] domain_leakage_report = {state.get('domain_leakage_report')}")
     # ── Kullanıcı Sorusu ─────────────────────────────────────────────
     lines.append(f"## Kullanıcı Sorusu\n{state.get('user_query', 'Belirtilmemiş')}\n")
 
@@ -308,12 +338,39 @@ def _build_context(state: AgentState) -> str:
 
 # System Prompts — task-specific
 
+# System Prompts — task-specific
+
 SYSTEM_PROMPT = """You are an expert Data Scientist. You will be provided with the complete outputs of an ML pipeline.
 Your task is to analyze these outputs and write a comprehensive, clear, and professional analysis report.
 
 CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
 
-Write the report strictly using the following Markdown structure:
+## MANDATORY REPORT HEADER (HIGHEST PRIORITY)
+
+If the context begins with a "Quality Gate Badge" line (a heading starting with ✅, ⚠️, or 🛑), you MUST:
+1. Make this badge line the VERY FIRST line of your report (as a # H1 heading)
+2. Include the "Karar:" summary line right after it
+3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM
+4. THEN proceed with the normal report structure below
+
+Example correct beginning:
+# ⚠️ DİKKAT — MODELDE ŞÜPHELİ DURUMLAR VAR
+**Karar:** Model çalışıyor ancak N dikkat edilmesi gereken durum var. Sonuçları kullanmadan önce kontrol edin.
+
+## Uyarılar (WARN)
+- Yüksek şüpheli leakage: Sales. Tahminler güvenilir olmayabilir.
+- 2 feature anormal yüksek importance'a sahip.
+- MAPE yüksek (%79.8). Tahmin hataları büyük olabilir.
+
+## 📊 Analiz Raporu — [Title]
+> Model: ... | Intent: ... | Tarih: ...
+
+DO NOT skip the Quality Gate badge. DO NOT rephrase it. Copy it verbatim from context.
+If no badge exists in context, skip this header section entirely.
+
+---
+
+Write the rest of the report strictly using the following Markdown structure:
 
 # 📊 Analiz Raporu — [Title]
 
@@ -373,11 +430,25 @@ RULES:
 - Preserve the exact Markdown formatting (headers, bullet points, bold text).
 """
 
+
 SYSTEM_PROMPT_CLUSTERING = """You are an expert Data Scientist specializing in unsupervised learning and customer segmentation.
 
 CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
 
-Write the report strictly using the following Markdown structure:
+## MANDATORY REPORT HEADER (HIGHEST PRIORITY)
+
+If the context begins with a "Quality Gate Badge" line (a heading starting with ✅, ⚠️, or 🛑), you MUST:
+1. Make this badge line the VERY FIRST line of your report (as a # H1 heading)
+2. Include the "Karar:" summary line right after it
+3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM
+4. THEN proceed with the normal clustering report structure below
+
+DO NOT skip the Quality Gate badge. DO NOT rephrase it. Copy it verbatim from context.
+If no badge exists in context, skip this header section entirely.
+
+---
+
+Write the rest of the report strictly using the following Markdown structure:
 
 # 📊 Kümeleme Analizi Raporu — [Başlık]
 
@@ -429,11 +500,25 @@ RULES:
 - Keep the tone professional, authoritative, and fluent.
 """
 
+
 SYSTEM_PROMPT_ANOMALY = """You are an expert Data Scientist specializing in anomaly detection and fraud/outlier analysis.
 
 CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
 
-Write the report strictly using the following Markdown structure:
+## MANDATORY REPORT HEADER (HIGHEST PRIORITY)
+
+If the context begins with a "Quality Gate Badge" line (a heading starting with ✅, ⚠️, or 🛑), you MUST:
+1. Make this badge line the VERY FIRST line of your report (as a # H1 heading)
+2. Include the "Karar:" summary line right after it
+3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM
+4. THEN proceed with the normal anomaly report structure below
+
+DO NOT skip the Quality Gate badge. DO NOT rephrase it. Copy it verbatim from context.
+If no badge exists in context, skip this header section entirely.
+
+---
+
+Write the rest of the report strictly using the following Markdown structure:
 
 # 📊 Anomali Tespiti Raporu — [Başlık]
 
