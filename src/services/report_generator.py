@@ -51,7 +51,7 @@ def _build_context(state: AgentState) -> str:
     lines: list[str] = []
     intent = state.get("intent", "unknown")
 
-    # ── Quality Gate (raporun başına gelecek) ──
+    # quality gate
     qg = state.get("quality_gate") or {}
     print(f"[DEBUG REPORT QG] quality_gate var mi: {bool(qg)}")
     print(f"[DEBUG REPORT QG] status: {qg.get('status', 'YOK')}")
@@ -83,10 +83,10 @@ def _build_context(state: AgentState) -> str:
                 lines.append(f"  - {w['message']}")
             lines.append("")
 
-    # ── Kullanıcı Sorusu ─────────────────────────────────────────────
+    # user query
     lines.append(f"## Kullanıcı Sorusu\n{state.get('user_query', 'Belirtilmemiş')}\n")
 
-    # ── Intent ──────────────────────────────────────────────
+    # intent
     confidence = state.get("intent_confidence", 0)
     tables = state.get("relevant_tables", [])
     lines.append(
@@ -95,7 +95,7 @@ def _build_context(state: AgentState) -> str:
         f"- Tablolar: {', '.join(tables) if tables else 'Yok'}\n"
     )
 
-    # ── Analysis Plan ─────────────────────────────────────────────
+    # analysis plan
     plan = state.get("analysis_plan", [])
     if plan:
         lines.append("## Analiz Planı")
@@ -103,7 +103,7 @@ def _build_context(state: AgentState) -> str:
             lines.append(f"  {step.get('order', '?')}. [{step.get('step')}] {step.get('description', '')}")
         lines.append("")
 
-    # ── Veri Profili ─────────────────────────────────────────────
+    # data profiling
     profiling = state.get("profiling_report", {})
     if profiling:
         shape = profiling.get("shape", {})
@@ -118,7 +118,7 @@ def _build_context(state: AgentState) -> str:
                 lines.append(f"  - {r}")
         lines.append("")
 
-    # ── Feature Plan ─────────────────────────────────────────────
+    # feature plan
     fp = state.get("feature_plan", {})
     if fp:
         lines.append(
@@ -128,7 +128,7 @@ def _build_context(state: AgentState) -> str:
             f"- Feature grupları: {', '.join(fp.get('feature_groups', []))}\n"
         )
 
-    # ── Feature Engineering Sonucu ─────────────────────────────────
+    # feat engineering result
     fr = state.get("feature_report", {})
     if fr:
         lines.append(
@@ -138,7 +138,7 @@ def _build_context(state: AgentState) -> str:
             f"- Test seti: {fr.get('n_test')} satır\n"
         )
     
-    # Domain Leakage Report
+    # domain leakage
     domain_leakage = state.get("domain_leakage_report", {})
     if domain_leakage:
         concerns = domain_leakage.get("concerns", [])
@@ -158,16 +158,24 @@ def _build_context(state: AgentState) -> str:
                     f"({c.get('relationship_type')}): {c.get('reasoning')}"
                 )
             lines.append("")
+            
+            # high confidence drop info
+            high_dropped = [c for c in concerns if c.get("confidence") == "high"]
+            if high_dropped:
+                cols = [c['column_name'] for c in high_dropped]
+                lines.append(f"**OTOMATIK DROP EDILDI (high confidence leakage):** {', '.join(cols)}")
+                lines.append("Bu feature'lar otomatik olarak modelden cikarildi. Asagidaki metrikler bu feature'lar olmadan egitilen modeli yansitir — yani gercek performans, leakage'li sahte yuksek skor degil.\n")
+                
         elif assessment:
             lines.append(f"\n## Leakage Kontrolu\n{assessment}\n")
     
-    # ── Task-specific Evaluation Context ────────────────────────────
+    # task-specific evaluation
     ev = state.get("evaluation_report", {})
     metrics = state.get("metrics", {})
     model_name = state.get("model_name", "unknown")
 
     if intent == "clustering":
-        # ── Clustering Specific ──────────────────────────────────────
+        # clustering
         cluster_dist = ev.get("cluster_distribution", {})
         algo_scores = ev.get("all_algorithm_scores", {})
         lines.append("## Kümeleme Sonuçları")
@@ -200,7 +208,7 @@ def _build_context(state: AgentState) -> str:
             lines.append("")
 
     elif intent == "anomaly_detection":
-        # ── Anomaly Detection Specific ──────────────────────────────
+        # anomaly detection specific
         cont_scan = ev.get("contamination_scan", {})
         fi_anom = ev.get("feature_importance", {})
         n_anom = ev.get("n_anomalies", 0)
@@ -232,7 +240,7 @@ def _build_context(state: AgentState) -> str:
             lines.append("")
 
     else:
-        # ── Supervised (classification / regression) ──────────────────
+        # supervised (clustering - regression)
         if metrics:
             lines.append(f"## AutoML Sonuçları\n- Seçilen model: {model_name}")
             for k, v in metrics.items():
@@ -335,8 +343,6 @@ def _build_context(state: AgentState) -> str:
     print(f"[DEBUG REPORT CONTEXT] context length: {len(final_context)} chars")
     return final_context
 
-
-# System Prompts — task-specific
 
 # System Prompts — task-specific
 
