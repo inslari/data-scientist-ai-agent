@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from src.state import AgentState
+from src.services.quality_gate import evaluate_quality_gate 
 
 # Retry gap
 RETRY_OVERFITTING_GAP = 0.15
@@ -25,12 +26,18 @@ def critic_node(state: AgentState) -> AgentState:
     # We only critique supervised ML tasks.
     if intent not in ("classification", "regression"):
         print("[critic_node] Unsupervised veya rapor görevi. Critique atlanıyor.")
+        print(f"[DEBUG CRITIC OUT] quality_gate var mi: {bool(quality_gate)}")
+        print(f"[DEBUG CRITIC OUT] quality_gate status: {quality_gate.get('status') if quality_gate else 'YOK'}")
         return {**state, "current_step": "critic_node"}
         
     if not evaluation_report:
         existing_error = state.get("error")
         error_msg = existing_error if existing_error else "Evaluation report bulunamadı"
+        print(f"[DEBUG CRITIC OUT] quality_gate var mi: {bool(quality_gate)}")
+        print(f"[DEBUG CRITIC OUT] quality_gate status: {quality_gate.get('status') if quality_gate else 'YOK'}")
         return {**state, "current_step": "critic_node", "error": error_msg}
+
+    quality_gate = evaluate_quality_gate(state)
 
     task = evaluation_report.get("task", "")
     test_metrics = evaluation_report.get("test_metrics", {})
@@ -74,21 +81,26 @@ def critic_node(state: AgentState) -> AgentState:
         if retry_count < max_retries:
             print(f"[critic_node] RETRY TETİKLENDİ ({retry_count + 1}/{max_retries}). Yönlendirme: {action_needed}")
             new_feedback = current_feedback + issues
+            print(f"[DEBUG CRITIC OUT] quality_gate var mi: {bool(quality_gate)}")
+            print(f"[DEBUG CRITIC OUT] quality_gate status: {quality_gate.get('status') if quality_gate else 'YOK'}")
             return {
                 **state,
                 "retry_count": retry_count + 1,
                 "critic_feedback": new_feedback,
                 "current_step": "critic_node",
                 # We use a special field for routing
-                "next_retry_node": action_needed
+                "next_retry_node": action_needed,
+                "quality_gate": quality_gate,
             }
         else:
             print(f"[critic_node] Max retries ({max_retries}) aşıldı. Mevcut modelle devam ediliyor.")
-            
-    print(f"[critic_node] Model kabul edildi veya retry hakkı kalmadı.")
-    print(f"[DEBUG FE OUT] domain_leakage_report var mi: {state.get('domain_leakage_report') is not None}")
+
+    print(f"[DEBUG CRITIC OUT] quality_gate var mi: {bool(quality_gate)}")
+    print(f"[DEBUG CRITIC OUT] quality_gate status: {quality_gate.get('status') if quality_gate else 'YOK'}")
+    
     return {
         **state,
         "current_step": "critic_node",
-        "next_retry_node": "report_node"
+        "next_retry_node": "report_node",
+        "quality_gate": quality_gate,
     }

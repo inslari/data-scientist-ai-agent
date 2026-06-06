@@ -68,6 +68,10 @@ class AgentState(TypedDict, total=False):
     
     # Leakage Detection
     domain_leakage_report: dict
+
+    # Quality Gate
+    quality_gate: dict
+
     # Audit Trail / Tracking
     experiment_logs: list[dict]      # Logs of completed ML experiments
 

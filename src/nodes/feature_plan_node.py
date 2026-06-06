@@ -50,8 +50,6 @@ def feature_plan_node(state: AgentState) -> AgentState:
     llm = get_llm(model_name=model_name, temperature=0)
     structured_llm = llm.with_structured_output(FeaturePlan)
 
-    
-    # retry_context'ten önce ekle
     target_hint = ""
     if target_def_initial.get("column_name"):
         target_hint = f"""
@@ -61,6 +59,19 @@ target_discovery_node şu kolonu önerdi: '{target_def_initial['column_name']}'
 Confidence: {target_def_initial.get('confidence', 0):.2f}
 Bu öneriyi dikkate al ama kendi guardrail kontrolünü yap."""
 
+    # Leakage hint: domain leakage suspect'leri math interaction'dan uzak tut
+    leakage_hint = ""
+    domain_leakage = state.get("domain_leakage_report") or {}
+    concerns = domain_leakage.get("concerns", [])
+    if concerns:
+        suspect_cols = [c["column_name"] for c in concerns]
+        leakage_hint = f"""
+    
+⚠️ LEAKAGE UYARISI:
+Şu kolonlar target ile şüpheli ilişki içinde (leakage riski): {', '.join(suspect_cols)}
+Bu kolonları math_interactions önerilerinde KULLANMA. 
+Bunlardan türetilmiş yeni feature'lar da leakage taşır."""
+    
     # Retry bağlamı: critic feedback'i prompt'a ekle
     retry_context = ""
     if retry_count > 0 and critic_feedback:
@@ -80,7 +91,8 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
         "intent": intent,
         "tables_summary": tables_summary,
         "target_hint": target_hint,
-        "retry_context": retry_context
+        "retry_context": retry_context,
+        "leakage_hint": leakage_hint
     })
 
     # ── Post-processing: Dinamik target validation ────────────────────────────

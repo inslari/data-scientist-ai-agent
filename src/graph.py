@@ -17,6 +17,7 @@ from src.nodes.sql_node import sql_node
 from src.nodes.target_discovery_node import target_discovery_node
 from src.nodes.leakage_detector_node import leakage_detector_node
 
+
 # Routing functions
 def route_after_db_context(state: AgentState) -> str:
     intent = state.get("intent", "eda")
@@ -33,7 +34,7 @@ def route_after_execution(state: AgentState) -> str:
     """
     intent = state.get("intent", "eda")
     if intent in ("classification", "regression", "clustering"):
-        return "feature_plan_node"
+        return "leakage_detector_node"
     if intent == "anomaly_detection":
         return "automl_node"
     return "report_node"
@@ -62,14 +63,15 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
                └─ db_context_node          
                     ├─ [sql_query] → sql_node → END
                     └─ [other] → planner_node
-                                      → execution_node
-                                           ├─ [classification/regression/clustering]
-                                           │    → feature_plan_node → feature_engineering_node
-                                           │         → automl_node → evaluation_node → critic_node
-                                           │              ├─ [retry] → feature_plan_node / automl_node
-                                           │              └─ [pass]  → report_node → END
-                                           └─ [eda/anomaly_detection/report]
-                                                → automl_node → evaluation_node → critic_node → report_node → END
+                                      → target_discovery_node
+                                           → execution_node
+                                                ├─ [classification/regression/clustering]
+                                                │    → leakage_detector_node → feature_plan_node → feature_engineering_node
+                                                │         → automl_node → evaluation_node → critic_node
+                                                │              ├─ [retry] → leakage_detector_node / feature_plan_node / automl_node
+                                                │              └─ [pass]  → report_node → END
+                                                └─ [eda/anomaly_detection/report]
+                                                     → automl_node → evaluation_node → critic_node → report_node → END
     """
     graph = StateGraph(AgentState)
 
@@ -113,14 +115,14 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
         "execution_node",
         route_after_execution,
         {
-            "feature_plan_node": "feature_plan_node",
+            "leakage_detector_node": "leakage_detector_node",
             "automl_node":       "automl_node",
             "report_node":       "report_node",
         },
     )
 
-    graph.add_edge("feature_plan_node", "leakage_detector_node")
-    graph.add_edge("leakage_detector_node", "feature_engineering_node")
+    graph.add_edge("leakage_detector_node", "feature_plan_node")
+    graph.add_edge("feature_plan_node", "feature_engineering_node")
     graph.add_edge("feature_engineering_node", "automl_node")
     graph.add_edge("automl_node",              "evaluation_node")
     graph.add_edge("evaluation_node",          "critic_node")

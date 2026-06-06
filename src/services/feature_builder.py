@@ -530,6 +530,64 @@ def _select_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _apply_domain_leakage_drops(
+    df: pd.DataFrame,
+    domain_leakage_report: dict,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Domain leakage detector'ın high-confidence suspect'lerini drop eder.
+
+    Güvenlik şartları:
+    - Sadece confidence='high' olanlar drop edilir
+    - Drop sonrası en az 2 feature kalmalı (boş feature set'i önle)
+    - Drop edilenler audit için raporlanır
+
+    Dönüş:
+        df              : drop sonrası dataframe
+        domain_dropped  : drop edilen feature'ların listesi (dict)
+    """
+    domain_dropped = []
+
+    if not domain_leakage_report:
+        return df, domain_dropped
+
+    concerns = domain_leakage_report.get("concerns", []) or []
+    high_confidence = [c for c in concerns if c.get("confidence") == "high"]
+
+    if not high_confidence:
+        return df, domain_dropped
+
+    # Drop adayları df'de olanlar
+    drop_candidates = [
+        c for c in high_confidence
+        if c.get("column_name") in df.columns
+    ]
+
+    if not drop_candidates:
+        return df, domain_dropped
+
+    # Güvenlik: drop sonrası en az 2 feature kalmalı
+    remaining_after_drop = len(df.columns) - len(drop_candidates)
+    if remaining_after_drop < 2:
+        print(f"[leakage] Domain drop iptal: drop sonrasi {remaining_after_drop} feature kalacak (min 2 gerekli)")
+        return df, domain_dropped
+
+    # Drop uygula
+    cols_to_drop = [c["column_name"] for c in drop_candidates]
+    df = df.drop(columns=cols_to_drop, errors="ignore")
+
+    for c in drop_candidates:
+        domain_dropped.append({
+            "column": c["column_name"],
+            "reason": f"domain leakage (high confidence): {c.get('reasoning', '')[:120]}",
+            "relationship_type": c.get("relationship_type", "unknown"),
+        })
+        print(f"[leakage] DOMAIN DROP: '{c['column_name']}' "
+              f"({c.get('relationship_type')}, high) - "
+              f"{c.get('reasoning', '')[:80]}")
+
+    return df, domain_dropped
+
 # ── Data leakage detection ───────────────────────────────────
 # ── Data leakage detection (Adım 1: identifier + kesin korelasyon) ──
 def _detect_leakage(
@@ -736,6 +794,12 @@ def build_features(state: dict) -> dict:
 
     # Leakage detection
     df, leakage_report = _detect_leakage(df, y, meta)
+
+    domain_leakage_report = state.get("domain_leakage_report") or {}
+    df, domain_dropped = _apply_domain_leakage_drops(df, domain_leakage_report)
+
+    # Birleştir: domain dropped'ı leakage_report'a ekle
+    leakage_report["dropped"].extend(domain_dropped)
 
     # 14. Train/test split
     if intent in ("clustering","anomaly_detection"):

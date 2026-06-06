@@ -51,12 +51,42 @@ def _build_context(state: AgentState) -> str:
     lines: list[str] = []
     intent = state.get("intent", "unknown")
 
+    # quality gate
+    qg = state.get("quality_gate") or {}
+    print(f"[DEBUG REPORT QG] quality_gate var mi: {bool(qg)}")
+    print(f"[DEBUG REPORT QG] status: {qg.get('status', 'YOK')}")
+    if qg:
+        status = qg.get("status", "unknown").upper()
+        severity = qg.get("severity", "ok")
+        summary = qg.get("summary", "")
+        
+        badge = {
+            "pass": "✅ MODEL GÜVENİLİR",
+            "warn": "⚠️ DİKKAT — MODELDE ŞÜPHELİ DURUMLAR VAR",
+            "fail": "🛑 MODEL YETERSİZ — ÜRETİME ALINMAMALI",
+        }.get(qg.get("status"), "")
+        
+        lines.append(f"# {badge}\n")
+        lines.append(f"**Karar:** {summary}\n")
+        
+        failures = qg.get("failures", [])
+        if failures:
+            lines.append("## Kritik Sorunlar (FAIL)")
+            for f in failures:
+                lines.append(f"  - {f['message']}")
+            lines.append("")
+        
+        warnings = qg.get("warnings", [])
+        if warnings:
+            lines.append("## Uyarılar (WARN)")
+            for w in warnings:
+                lines.append(f"  - {w['message']}")
+            lines.append("")
 
-    print(f"[DEBUG REPORT CONTEXT] domain_leakage_report = {state.get('domain_leakage_report')}")
-    # ── Kullanıcı Sorusu ─────────────────────────────────────────────
+    # user query
     lines.append(f"## Kullanıcı Sorusu\n{state.get('user_query', 'Belirtilmemiş')}\n")
 
-    # ── Intent ──────────────────────────────────────────────
+    # intent
     confidence = state.get("intent_confidence", 0)
     tables = state.get("relevant_tables", [])
     lines.append(
@@ -65,7 +95,7 @@ def _build_context(state: AgentState) -> str:
         f"- Tablolar: {', '.join(tables) if tables else 'Yok'}\n"
     )
 
-    # ── Analysis Plan ─────────────────────────────────────────────
+    # analysis plan
     plan = state.get("analysis_plan", [])
     if plan:
         lines.append("## Analiz Planı")
@@ -73,7 +103,7 @@ def _build_context(state: AgentState) -> str:
             lines.append(f"  {step.get('order', '?')}. [{step.get('step')}] {step.get('description', '')}")
         lines.append("")
 
-    # ── Veri Profili ─────────────────────────────────────────────
+    # data profiling
     profiling = state.get("profiling_report", {})
     if profiling:
         shape = profiling.get("shape", {})
@@ -88,7 +118,7 @@ def _build_context(state: AgentState) -> str:
                 lines.append(f"  - {r}")
         lines.append("")
 
-    # ── Feature Plan ─────────────────────────────────────────────
+    # feature plan
     fp = state.get("feature_plan", {})
     if fp:
         lines.append(
@@ -98,7 +128,7 @@ def _build_context(state: AgentState) -> str:
             f"- Feature grupları: {', '.join(fp.get('feature_groups', []))}\n"
         )
 
-    # ── Feature Engineering Sonucu ─────────────────────────────────
+    # feat engineering result
     fr = state.get("feature_report", {})
     if fr:
         lines.append(
@@ -108,7 +138,7 @@ def _build_context(state: AgentState) -> str:
             f"- Test seti: {fr.get('n_test')} satır\n"
         )
     
-    # Domain Leakage Report
+    # domain leakage
     domain_leakage = state.get("domain_leakage_report", {})
     if domain_leakage:
         concerns = domain_leakage.get("concerns", [])
@@ -128,16 +158,24 @@ def _build_context(state: AgentState) -> str:
                     f"({c.get('relationship_type')}): {c.get('reasoning')}"
                 )
             lines.append("")
+            
+            # high confidence drop info
+            high_dropped = [c for c in concerns if c.get("confidence") == "high"]
+            if high_dropped:
+                cols = [c['column_name'] for c in high_dropped]
+                lines.append(f"**OTOMATIK DROP EDILDI (high confidence leakage):** {', '.join(cols)}")
+                lines.append("Bu feature'lar otomatik olarak modelden cikarildi. Asagidaki metrikler bu feature'lar olmadan egitilen modeli yansitir — yani gercek performans, leakage'li sahte yuksek skor degil.\n")
+                
         elif assessment:
             lines.append(f"\n## Leakage Kontrolu\n{assessment}\n")
     
-    # ── Task-specific Evaluation Context ────────────────────────────
+    # task-specific evaluation
     ev = state.get("evaluation_report", {})
     metrics = state.get("metrics", {})
     model_name = state.get("model_name", "unknown")
 
     if intent == "clustering":
-        # ── Clustering Specific ──────────────────────────────────────
+        # clustering
         cluster_dist = ev.get("cluster_distribution", {})
         algo_scores = ev.get("all_algorithm_scores", {})
         lines.append("## Kümeleme Sonuçları")
@@ -170,7 +208,7 @@ def _build_context(state: AgentState) -> str:
             lines.append("")
 
     elif intent == "anomaly_detection":
-        # ── Anomaly Detection Specific ──────────────────────────────
+        # anomaly detection specific
         cont_scan = ev.get("contamination_scan", {})
         fi_anom = ev.get("feature_importance", {})
         n_anom = ev.get("n_anomalies", 0)
@@ -202,7 +240,7 @@ def _build_context(state: AgentState) -> str:
             lines.append("")
 
     else:
-        # ── Supervised (classification / regression) ──────────────────
+        # supervised (clustering - regression)
         if metrics:
             lines.append(f"## AutoML Sonuçları\n- Seçilen model: {model_name}")
             for k, v in metrics.items():
@@ -313,7 +351,32 @@ Your task is to analyze these outputs and write a comprehensive, clear, and prof
 
 CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
 
-Write the report strictly using the following Markdown structure:
+## MANDATORY REPORT HEADER (HIGHEST PRIORITY)
+
+If the context begins with a "Quality Gate Badge" line (a heading starting with ✅, ⚠️, or 🛑), you MUST:
+1. Make this badge line the VERY FIRST line of your report (as a # H1 heading)
+2. Include the "Karar:" summary line right after it
+3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM
+4. THEN proceed with the normal report structure below
+
+Example correct beginning:
+# ⚠️ DİKKAT — MODELDE ŞÜPHELİ DURUMLAR VAR
+**Karar:** Model çalışıyor ancak N dikkat edilmesi gereken durum var. Sonuçları kullanmadan önce kontrol edin.
+
+## Uyarılar (WARN)
+- Yüksek şüpheli leakage: Sales. Tahminler güvenilir olmayabilir.
+- 2 feature anormal yüksek importance'a sahip.
+- MAPE yüksek (%79.8). Tahmin hataları büyük olabilir.
+
+## 📊 Analiz Raporu — [Title]
+> Model: ... | Intent: ... | Tarih: ...
+
+DO NOT skip the Quality Gate badge. DO NOT rephrase it. Copy it verbatim from context.
+If no badge exists in context, skip this header section entirely.
+
+---
+
+Write the rest of the report strictly using the following Markdown structure:
 
 # 📊 Analiz Raporu — [Title]
 
@@ -373,11 +436,25 @@ RULES:
 - Preserve the exact Markdown formatting (headers, bullet points, bold text).
 """
 
+
 SYSTEM_PROMPT_CLUSTERING = """You are an expert Data Scientist specializing in unsupervised learning and customer segmentation.
 
 CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
 
-Write the report strictly using the following Markdown structure:
+## MANDATORY REPORT HEADER (HIGHEST PRIORITY)
+
+If the context begins with a "Quality Gate Badge" line (a heading starting with ✅, ⚠️, or 🛑), you MUST:
+1. Make this badge line the VERY FIRST line of your report (as a # H1 heading)
+2. Include the "Karar:" summary line right after it
+3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM
+4. THEN proceed with the normal clustering report structure below
+
+DO NOT skip the Quality Gate badge. DO NOT rephrase it. Copy it verbatim from context.
+If no badge exists in context, skip this header section entirely.
+
+---
+
+Write the rest of the report strictly using the following Markdown structure:
 
 # 📊 Kümeleme Analizi Raporu — [Başlık]
 
@@ -429,11 +506,25 @@ RULES:
 - Keep the tone professional, authoritative, and fluent.
 """
 
+
 SYSTEM_PROMPT_ANOMALY = """You are an expert Data Scientist specializing in anomaly detection and fraud/outlier analysis.
 
 CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
 
-Write the report strictly using the following Markdown structure:
+## MANDATORY REPORT HEADER (HIGHEST PRIORITY)
+
+If the context begins with a "Quality Gate Badge" line (a heading starting with ✅, ⚠️, or 🛑), you MUST:
+1. Make this badge line the VERY FIRST line of your report (as a # H1 heading)
+2. Include the "Karar:" summary line right after it
+3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM
+4. THEN proceed with the normal anomaly report structure below
+
+DO NOT skip the Quality Gate badge. DO NOT rephrase it. Copy it verbatim from context.
+If no badge exists in context, skip this header section entirely.
+
+---
+
+Write the rest of the report strictly using the following Markdown structure:
 
 # 📊 Anomali Tespiti Raporu — [Başlık]
 

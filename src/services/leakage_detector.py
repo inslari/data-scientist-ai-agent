@@ -20,11 +20,15 @@ def _build_human_message(state: dict) -> str:
 
     # db_intelligence'tan kolon bilgilerini al
     columns_info = db_intel.get("columns", [])
+    for c in columns_info:
+        if c.get("table_name") == target_table:
+            print(f"[DEBUG] {c.get('column_name')}: semantic_type={c.get('semantic_type')}")
     # Sadece target'in tablosundaki kolonları al (büyük olasılıkla feature'lar buradan)
     relevant_cols = [
         c for c in columns_info
         if c.get("table_name", "") == target_table
         and c.get("column_name", "") != target_col
+        and c.get("semantic_type") != "target"
     ]
 
     feature_lines = []
