@@ -82,6 +82,14 @@ def update_mcp_config(config_id: int, config_update: MCPConfigUpdate, db: Sessio
         
     db.commit()
     db.refresh(db_config)
+
+    # MCP bağlantı bilgisi değişti — db_intelligence cache'ini temizle
+    # (yeni bağlantının schema'ı farklı olabilir)
+    from api.routes.data_group import _clear_db_cache
+    data_group = db.query(DataGroupModel).filter(DataGroupModel.id == db_config.data_group_id).first()
+    if data_group:
+        _clear_db_cache(db, data_group)
+
     return db_config
 
 @router.delete("/config/{config_id}")
@@ -318,6 +326,12 @@ async def refresh_mcp_db_stats(req: MCPToolRequest, db: Session = Depends(get_db
         db_config.column_stats_cache_updated_at = current_time
         
         db.commit()
+        
+        # MCP veritabanı refresh edildi — db_intelligence cache'ini de temizle
+        from api.routes.data_group import _clear_db_cache
+        data_group = db.query(DataGroupModel).filter(DataGroupModel.id == db_config.data_group_id).first()
+        if data_group:
+            _clear_db_cache(db, data_group)
         
         return {"status": "success", "message": "Cache refreshed successfully."}
     except asyncio.TimeoutError:

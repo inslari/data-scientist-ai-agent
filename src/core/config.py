@@ -46,6 +46,7 @@ class Settings:
     # LLM Configuration
     DEFAULT_LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai")
     DEFAULT_LLM_MODEL: str = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
+    INTELLIGENCE_ENGINE_PROVIDER: str = os.getenv("INTELLIGENCE_ENGINE_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))
     INTELLIGENCE_ENGINE_MODEL: str = os.getenv("INTELLIGENCE_ENGINE_MODEL", "gpt-4o")
     DEFAULT_TEMPERATURE: float = 0.0
 

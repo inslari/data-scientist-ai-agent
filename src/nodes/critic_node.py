@@ -26,15 +26,11 @@ def critic_node(state: AgentState) -> AgentState:
     # We only critique supervised ML tasks.
     if intent not in ("classification", "regression"):
         print("[critic_node] Unsupervised veya rapor görevi. Critique atlanıyor.")
-        print(f"[DEBUG CRITIC OUT] quality_gate var mi: {bool(quality_gate)}")
-        print(f"[DEBUG CRITIC OUT] quality_gate status: {quality_gate.get('status') if quality_gate else 'YOK'}")
         return {**state, "current_step": "critic_node"}
         
     if not evaluation_report:
         existing_error = state.get("error")
         error_msg = existing_error if existing_error else "Evaluation report bulunamadı"
-        print(f"[DEBUG CRITIC OUT] quality_gate var mi: {bool(quality_gate)}")
-        print(f"[DEBUG CRITIC OUT] quality_gate status: {quality_gate.get('status') if quality_gate else 'YOK'}")
         return {**state, "current_step": "critic_node", "error": error_msg}
 
     quality_gate = evaluate_quality_gate(state)

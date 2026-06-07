@@ -1,10 +1,12 @@
 import json
 import os
+import re
 from typing import List, Optional, Any
 from pydantic import BaseModel, Field
 
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import BaseOutputParser
 from src.core.llm import get_llm
 from src.core.config import settings
 from langchain_core.output_parsers import PydanticOutputParser
@@ -59,7 +61,69 @@ class DatabaseIntelligenceModel(BaseModel):
     schema_graph: SchemaGraph
     global_insights: List[str] = Field(description="Short observations about dataset structure")
 
+
+def _unwrap_llm_json(data: dict) -> dict:
+    """
+    Some LLMs wrap list items with their class name as a key, e.g.:
+        "tables": [{"TableUnderstanding": {...}}, ...]
+    This function unwraps those to:
+        "tables": [{...}, ...]
+    Also handles the top-level wrapper key like {"DatabaseIntelligenceModel": {...}}.
+    """
+    # Unwrap top-level model key if present
+    if len(data) == 1:
+        only_key = next(iter(data))
+        if only_key not in ("tables", "columns", "relationships", "capabilities", "schema_graph", "global_insights"):
+            data = data[only_key]
+
+    list_fields = ("tables", "columns", "relationships")
+    for field in list_fields:
+        if field in data and isinstance(data[field], list):
+            unwrapped = []
+            for item in data[field]:
+                if isinstance(item, dict) and len(item) == 1:
+                    only_key = next(iter(item))
+                    # If the single key looks like a class name (PascalCase), unwrap it
+                    if only_key[0].isupper() and isinstance(item[only_key], dict):
+                        unwrapped.append(item[only_key])
+                    else:
+                        unwrapped.append(item)
+                else:
+                    unwrapped.append(item)
+            data[field] = unwrapped
+    return data
+
+
+class _UnwrappingPydanticParser(BaseOutputParser):
+    """
+    Custom LangChain output parser that:
+    1. Extracts JSON from the LLM response (handles markdown code fences)
+    2. Unwraps class-name wrapper keys that some LLMs add
+    3. Validates and returns the Pydantic model instance
+    """
+    pydantic_object: type
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def parse(self, text: str):
+        # Strip markdown code fences if present
+        text = text.strip()
+        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if json_match:
+            text = json_match.group(1)
+        
+        data = json.loads(text)
+        data = _unwrap_llm_json(data)
+        return self.pydantic_object.model_validate(data)
+
+    def get_format_instructions(self) -> str:
+        inner = PydanticOutputParser(pydantic_object=self.pydantic_object)
+        return inner.get_format_instructions()
+
+
 class DatabaseIntelligenceEngine:
+
     def __init__(self, llm=None, provider: Optional[str] = None):
         """
         Initialize the intelligence engine.
@@ -220,20 +284,20 @@ For each column, assign semantic_type using this strict decision tree:
 # OUTPUT FORMAT
 {format_instructions}
 """
-        structured_llm = self.llm.with_structured_output(DatabaseIntelligenceModel)
+        parser = PydanticOutputParser(pydantic_object=DatabaseIntelligenceModel)
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
             ("human", "Please analyze the provided schema and return the structured JSON.")
         ])
         
-        chain = prompt | structured_llm
+        chain = prompt | self.llm | _UnwrappingPydanticParser(pydantic_object=DatabaseIntelligenceModel)
         
         response = chain.invoke({
             "schema_text": schema_text or "No schema provided.",
             "sample_data": sample_data or "No sample data provided.",
             "foreign_keys": foreign_keys or "No explicit foreign keys provided.",
-            "format_instructions": "Return a structured JSON object according to the schema."
+            "format_instructions": parser.get_format_instructions()
         })
         
         return response

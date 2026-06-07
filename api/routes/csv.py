@@ -139,6 +139,14 @@ def delete_csv_file(file_id: int, db: Session = Depends(get_db)):
             
     db.delete(db_file)
     db.commit()
+
+    # CSV silindiğinde data_group'un schema cache'ini temizle
+    # (bir sonraki chat sorgusunda yeniden analiz yapılacak)
+    from api.routes.data_group import _clear_db_cache
+    data_group = db.query(DataGroupModel).filter(DataGroupModel.id == db_file.data_group_id).first()
+    if data_group:
+        _clear_db_cache(db, data_group)
+
     return {"status": "success", "message": f"CSV file with id {file_id} deleted successfully"}
 
 @router.post("/{file_id}/schema", response_model=CSVSchemaResponse)

@@ -41,5 +41,10 @@ def get_llm(
             actual_model_name = "gemini-1.5-pro"
         return ChatGoogleGenerativeAI(model=actual_model_name, temperature=actual_temperature)
         
+    elif actual_provider == "ollama":
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(model=actual_model_name, temperature=actual_temperature)
+        
     else:
-        raise ValueError(f"Unsupported LLM provider: {actual_provider}. Supported providers: openai, anthropic, google")
+        raise ValueError(f"Unsupported LLM provider: {actual_provider}. Supported providers: openai, anthropic, google, ollama")
