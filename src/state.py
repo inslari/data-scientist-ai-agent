@@ -72,6 +72,8 @@ class AgentState(TypedDict, total=False):
     # Quality Gate
     quality_gate: dict
 
+    # Retry History
+    retry_history: list[dict]
     # Audit Trail / Tracking
     experiment_logs: list[dict]      # Logs of completed ML experiments
 
