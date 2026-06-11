@@ -206,10 +206,34 @@ def _select_anchor_table(
 
 
 def _parse_mcp_to_df(raw: str, table_name: str = "") -> pd.DataFrame:
+    # ─── DEBUG (geçici, sorun çözülünce silinecek) ───
+    print(f"\n[DEBUG _parse] table: '{table_name}'")
+    print(f"[DEBUG _parse] raw type: {type(raw).__name__}")
+    if raw is None:
+        print(f"[DEBUG _parse] raw is None")
+    elif isinstance(raw, str):
+        print(f"[DEBUG _parse] raw length: {len(raw)}")
+        print(f"[DEBUG _parse] raw ilk 400 char:")
+        print(raw[:400])
+        print(f"[DEBUG _parse] raw son 200 char:")
+        print(raw[-200:] if len(raw) > 200 else "(zaten yukarıda)")
+        # Columns satırı var mı?
+        has_columns_line = any(l.startswith("Columns:") for l in raw.strip().splitlines())
+        print(f"[DEBUG _parse] 'Columns:' satırı var mı: {has_columns_line}")
+        # İlk 5 satırın preview'i
+        lines_preview = raw.strip().splitlines()[:5]
+        print(f"[DEBUG _parse] ilk 5 satır:")
+        for i, l in enumerate(lines_preview):
+            print(f"  [{i}] {l[:150]}")
+    else:
+        print(f"[DEBUG _parse] beklenmeyen tip, str(raw)[:300]:")
+        print(str(raw)[:300])
+    print(f"[DEBUG _parse] === END ===\n")
+    # ─── /DEBUG ───
+
     if not raw:
         raise ValueError(f"[{table_name}] MCP boş yanıt döndürdü.")
     if raw.strip().startswith("Error") or raw.strip().startswith("SQL Error"):
-        # raw çok uzun olabilir, hatayı basarken ilk 200 karakteri al
         raise ValueError(f"[{table_name}] MCP SQL hatası: {raw[:200]}")
 
     lines = raw.strip().splitlines()

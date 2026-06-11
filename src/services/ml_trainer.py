@@ -116,8 +116,14 @@ def _get_regression_models() -> dict:
 def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
     try:
         est = model
-        if hasattr(model, "named_steps"):
+        # imblearn Pipeline desteği: ("smote", ...), ("clf", actual_model)
+        if hasattr(model, "named_steps") and "clf" in model.named_steps:
+            est = model.named_steps["clf"]
+        elif hasattr(model, "named_steps"):
             est = list(model.named_steps.values())[-1]
+        # sklearn Pipeline içindeyse son adımı al
+        if hasattr(est, "named_steps"):
+            est = list(est.named_steps.values())[-1]
         if hasattr(est, "feature_importances_"):
             imp = dict(zip(feature_names, est.feature_importances_.tolist()))
             return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
@@ -146,7 +152,7 @@ def _prep_data(X_train_raw, X_test_raw, y_train_raw, y_test_raw):
 
 
 # Optuna tuning
-def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, is_binary: bool, strong_regularization: bool = False) -> Any:
+def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, is_binary: bool, strong_regularization: bool = False, is_imbalanced: bool = False) -> Any:
     """Tunes the selected model using Optuna. If strong_regularization is True, shrinks the search space to prevent overfitting."""
     reg_msg = " (STRONG REGULARIZATION)" if strong_regularization else ""
     print(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor{reg_msg} (15 sn limiti)...")
@@ -200,7 +206,9 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
         else:
             raise optuna.exceptions.TrialPruned()
 
-        scores = cross_val_score(model, X_train, y_train, cv=cv, scoring=scoring, n_jobs=-1)
+        # Imbalanced ise SMOTE pipeline ile sar (her fold'da ayrı SMOTE, leakage-free)
+        cv_model = _wrap_with_smote(model, y_train) if is_imbalanced else model
+        scores = cross_val_score(cv_model, X_train, y_train, cv=cv, scoring=scoring, n_jobs=-1)
         return scores.mean()
 
     sampler = optuna.samplers.TPESampler(seed=settings.RANDOM_SEED)
@@ -219,10 +227,10 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
             return GradientBoostingClassifier(**best_params, random_state=settings.RANDOM_SEED)
         elif model_name == "xgboost":
             from xgboost import XGBClassifier
-            return XGBClassifier(**best_params, random_state=setting.RANDOM_SEED, eval_metric="logloss", verbosity=0, n_jobs=-1)
+            return XGBClassifier(**best_params, random_state=settings.RANDOM_SEED, eval_metric="logloss", verbosity=0, n_jobs=-1)
         elif model_name == "lightgbm":
             from lightgbm import LGBMClassifier
-            return LGBMClassifier(**best_params, random_state=setting.RANDOM_SEED, verbose=-1, n_jobs=-1)
+            return LGBMClassifier(**best_params, random_state=settings.RANDOM_SEED, verbose=-1, n_jobs=-1)
     except Exception as e:
         print(f"[automl] Optuna tuning başarısız oldu, default modele dönülüyor: {e}")
         
@@ -313,33 +321,31 @@ def _get_class_weights(y: np.ndarray) -> dict:
     return dict(zip(classes.tolist(), weights.tolist()))
  
  
-def _apply_smote(X: pd.DataFrame, y: np.ndarray) -> tuple[pd.DataFrame, np.ndarray]:
+def _wrap_with_smote(model, y: np.ndarray):
     """
-    Oversamples minority class with SMOTE.
-    Applies only to imbalanced datasets (minority/majority < 0.3).
+    İmbalanced binary ise modeli [SMOTE -> model] imblearn Pipeline'ı ile sarar.
+    SMOTE CV sırasında her fold'un SADECE train kısmına uygulanır (leakage yok),
+    final fit'te sadece eğitim verisine uygulanır, predict'te baypas edilir.
+    Dengeli veya multi-class ise modeli olduğu gibi döndürür.
     """
     classes, counts = np.unique(y, return_counts=True)
     if len(classes) != 2:
-        return X, y  # only for binary
- 
+        return model
     minority_ratio = counts.min() / counts.max()
     if minority_ratio > 0.3:
-        print(f"[automl] Sınıf dengeli ({minority_ratio:.2f}), SMOTE atlandı.")
-        return X, y
- 
+        return model
+    k = min(5, counts.min() - 1)
+    if k < 1:
+        return model  # azınlık çok az, SMOTE yapılamaz
     try:
+        from imblearn.pipeline import Pipeline as ImbPipeline
         from imblearn.over_sampling import SMOTE
-        sm = SMOTE(random_state=RANDOM_STATE, k_neighbors=min(5, counts.min()-1))
-        X_res, y_res = sm.fit_resample(X, y)
-        print(f"[automl] SMOTE: {len(X)} → {len(X_res)} satır "
-              f"(minority: {counts.min()} → {np.sum(y_res==classes[np.argmin(counts)])})")
-        return pd.DataFrame(X_res, columns=X.columns), y_res
+        return ImbPipeline([
+            ("smote", SMOTE(random_state=RANDOM_STATE, k_neighbors=k)),
+            ("clf", model),
+        ])
     except ImportError:
-        print("[automl] imbalanced-learn yok, class_weight kullanılacak.")
-        return X, y
-    except Exception as e:
-        print(f"[automl] SMOTE hatası: {e}, class_weight kullanılacak.")
-        return X, y
+        return model
  
  
 def _get_classification_models_balanced(class_weights: dict) -> dict:
@@ -413,11 +419,8 @@ def _run_classification(
  
     if is_imbalanced:
         print(f"[automl] Dengesiz sınıf tespit edildi: {dict(zip(classes.tolist(), counts.tolist()))}")
-        print(f"[automl] Minority ratio: {minority_ratio:.3f} → SMOTE + class_weight uygulanıyor")
- 
-    # SMOTE apply (train set)
-    X_train_bal, y_train_bal = _apply_smote(X_train, y_train) if is_imbalanced else (X_train, y_train)
- 
+        print(f"[automl] Minority ratio: {minority_ratio:.3f} → SMOTE pipeline (fold-içi, leakage-free)")
+
     # Class weights hesapla
     class_weights = _get_class_weights(y_train)
  
@@ -442,14 +445,17 @@ def _run_classification(
     for name, model in models.items():
         start = time.time()
         try:
-            # GradientBoosting için sample_weight with CV
+            # SMOTE'u pipeline içine al: her fold'un sadece train kısmına uygulanır (leakage-free)
+            wrapped = _wrap_with_smote(model, y_train) if is_imbalanced else model
+
+            # GradientBoosting SMOTE pipeline desteklemiyor (sample_weight ile yapılır)
             if name == "gradient_boosting" and is_imbalanced:
                 fold_scores = []
-                for train_idx, val_idx in cv.split(X_train_bal, y_train_bal):
-                    X_fold_train = X_train_bal.iloc[train_idx]
-                    y_fold_train = y_train_bal[train_idx]
-                    X_fold_val   = X_train_bal.iloc[val_idx]
-                    y_fold_val   = y_train_bal[val_idx]
+                for train_idx, val_idx in cv.split(X_train, y_train):
+                    X_fold_train = X_train.iloc[train_idx]
+                    y_fold_train = y_train[train_idx]
+                    X_fold_val   = X_train.iloc[val_idx]
+                    y_fold_val   = y_train[val_idx]
                     sw = compute_sample_weight("balanced", y_fold_train)
                     model_clone = GradientBoostingClassifier(n_estimators=200, random_state=RANDOM_STATE)
                     model_clone.fit(X_fold_train, y_fold_train, sample_weight=sw)
@@ -459,16 +465,16 @@ def _run_classification(
                 scores_std  = np.std(fold_scores)
             else:
                 scores = cross_val_score(
-                    model, X_train_bal, y_train_bal,
+                    wrapped, X_train, y_train,
                     cv=cv, scoring=scoring, n_jobs=-1
                 )
                 scores_mean = scores.mean()
                 scores_std  = scores.std()
- 
+
             elapsed = time.time() - start
             results[name] = {"score": scores_mean, "std": scores_std, "time": elapsed}
             print(f"[automl] {name:25s} ROC-AUC: {scores_mean:.4f} ± {scores_std:.4f} ({elapsed:.1f}s)")
- 
+
         except Exception as e:
             print(f"[automl] {name:25s} HATA: {e}")
  
@@ -478,16 +484,20 @@ def _run_classification(
     best_name = max(results, key=lambda k: results[k]["score"])
     print(f"\n[automl] Baseline en iyi: {best_name} (ROC-AUC: {results[best_name]['score']:.4f})")
  
-    # Optuna tuning
-    tuned_model = _tune_model_classification(best_name, X_train_bal, y_train_bal, is_binary, strong_regularization)
+    # Optuna tuning — temiz X_train/y_train alır, SMOTE pipeline içinde otomatik uygulanır
+    tuned_model = _tune_model_classification(best_name, X_train, y_train, is_binary, strong_regularization, is_imbalanced)
     best_model  = tuned_model if tuned_model is not None else models[best_name]
- 
+
+    # Tuned modelı da SMOTE pipeline ile sar: final fit de leakage-free
+    if is_imbalanced and best_name != "gradient_boosting":
+        best_model = _wrap_with_smote(best_model, y_train)
+
     # Final training
     if best_name == "gradient_boosting" and is_imbalanced:
-        sw_final = compute_sample_weight("balanced", y_train_bal)
-        best_model.fit(X_train_bal, y_train_bal, sample_weight=sw_final)
+        sw_final = compute_sample_weight("balanced", y_train)
+        best_model.fit(X_train, y_train, sample_weight=sw_final)
     else:
-        best_model.fit(X_train_bal, y_train_bal)
+        best_model.fit(X_train, y_train)
     
     y_prob = None
     try:
@@ -500,14 +510,12 @@ def _run_classification(
     try:
         y_prob = best_model.predict_proba(X_test)
         if y_prob is not None and is_binary:
-            
-        
             # F1-score maximize threshold
             precisions, recalls, pr_thresholds = precision_recall_curve(y_test, y_prob[:, 1])
             f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-9)
             best_f1_idx = np.argmax(f1_scores)
             optimal_threshold = float(pr_thresholds[best_f1_idx]) if best_f1_idx < len(pr_thresholds) else 0.5
-        
+
             y_pred = (y_prob[:, 1] >= optimal_threshold).astype(int)
             print(f"[automl] Optimal threshold (F1-max): {optimal_threshold:.4f}")
     except Exception as e:
@@ -525,7 +533,7 @@ def _run_classification(
         "cv_roc_auc_std":      round(float(results[best_name]["std"]), 4),
         "imbalance_handled":   is_imbalanced,
         "minority_ratio":      round(float(minority_ratio), 4),
-        "smote_applied":       is_imbalanced and len(X_train_bal) > len(X_train),
+        "smote_applied":       is_imbalanced,
         "optimal_threshold":   round(optimal_threshold, 4),
     }
  

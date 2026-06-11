@@ -29,6 +29,7 @@ class QueryRequest(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
+import re
 import duckdb
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
@@ -49,7 +50,8 @@ async def get_data_group_schema_logic(group_id: int, db: Session):
     elif db_group.source_type == "csv":
         schema_lines = []
         for csv_file in db_group.csv_files:
-            table_name = os.path.splitext(csv_file.filename)[0].replace(" ", "_").lower()
+            table_name = os.path.splitext(csv_file.filename)[0].lower()
+            table_name = re.sub(r'[^a-z0-9_]', '_', table_name)
             schema_lines.append(f"Table: {table_name}")
             schema_lines.append(f"Description: CSV file with {csv_file.row_count} rows")
             schema_lines.append("Columns:")
@@ -75,7 +77,8 @@ async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Sessi
         try:
             con = duckdb.connect(database=':memory:')
             for csv_file in db_group.csv_files:
-                table_name = os.path.splitext(csv_file.filename)[0].replace(" ", "_").lower()
+                table_name = os.path.splitext(csv_file.filename)[0].lower()
+                table_name = re.sub(r'[^a-z0-9_]', '_', table_name)
                 con.execute(f'CREATE VIEW "{table_name}" AS SELECT * FROM read_csv_auto(\'{csv_file.file_path}\')')
                 
             result_df = con.execute(req.query).df()
