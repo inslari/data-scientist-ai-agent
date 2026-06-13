@@ -69,6 +69,9 @@ class AgentState(TypedDict, total=False):
     # Leakage Detection
     domain_leakage_report: dict
 
+    # Entity Resolution
+    entity_resolution: dict          # EntityResolution raporu (action, signals, stats)
+
     # Quality Gate
     quality_gate: dict
 

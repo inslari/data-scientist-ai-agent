@@ -1,8 +1,8 @@
-Kullanıcı sorusu: {user_query}
-Tespit edilen intent: {intent}
-İlgili tablolar: {relevant_tables}
+User query: {user_query}
+Detected intent: {intent}
+Relevant tables: {relevant_tables}
 
-Veritabanı zekâ özeti:
+Database intelligence summary:
 {tables_summary}
 
-Minimal ve yürütülebilir bir analiz planı üret.
+Produce a minimal and executable analysis plan.

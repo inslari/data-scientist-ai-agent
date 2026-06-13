@@ -409,8 +409,15 @@ def _find_best_target_candidate(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Seri
 
 # ── Aggregation ──────────────────────────────────────────────
 def _aggregate_if_needed(
-    df: pd.DataFrame, y: pd.Series, plan: dict, meta: ColumnMetadata
+    df: pd.DataFrame, y: pd.Series, plan: dict, meta: ColumnMetadata,
+    entity_resolution: dict | None = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
+    # Entity resolution zaten aggregate ettiyse, tekrar aggregate ETME
+    if entity_resolution and entity_resolution.get("action") == "aggregate":
+        print("[feature_eng] Entity resolution zaten aggregate etti → "
+              "feature_builder aggregation atlanıyor (çift aggregation önlendi)")
+        return df, y
+
     agg_config = plan.get("aggregation", {})
     if not agg_config.get("required", False):
         return df, y
@@ -541,6 +548,7 @@ def _apply_domain_leakage_drops(
     - Sadece confidence='high' olanlar drop edilir
     - Drop sonrası en az 2 feature kalmalı (boş feature set'i önle)
     - Drop edilenler audit için raporlanır
+    - Ana kolon df'de olmasa bile türev kolonları (_year, _month vb.) drop edilir
 
     Dönüş:
         df              : drop sonrası dataframe
@@ -557,34 +565,52 @@ def _apply_domain_leakage_drops(
     if not high_confidence:
         return df, domain_dropped
 
-    # Drop adayları df'de olanlar
-    drop_candidates = [
-        c for c in high_confidence
-        if c.get("column_name") in df.columns
+    leaky_col_names = {c.get("column_name") for c in high_confidence}
+
+    # Türev kolonları da tespit et (örn: ref_date → ref_date_year, ref_date_month, ref_date_dayofweek)
+    derived_suffixes = ("_year", "_month", "_dayofweek", "_day", "_hour", "_week", "_quarter")
+    derived_to_drop = [
+        col for col in df.columns
+        if any(
+            col == f"{leaky}{suf}"
+            for leaky in leaky_col_names
+            for suf in derived_suffixes
+        )
     ]
 
-    if not drop_candidates:
+    # Ana kolonlar + türevler: df'de olanları al
+    all_cols_to_drop = list((leaky_col_names | set(derived_to_drop)) & set(df.columns))
+
+    if not all_cols_to_drop:
         return df, domain_dropped
 
     # Güvenlik: drop sonrası en az 2 feature kalmalı
-    remaining_after_drop = len(df.columns) - len(drop_candidates)
+    remaining_after_drop = len(df.columns) - len(all_cols_to_drop)
     if remaining_after_drop < 2:
         print(f"[leakage] Domain drop iptal: drop sonrasi {remaining_after_drop} feature kalacak (min 2 gerekli)")
         return df, domain_dropped
 
     # Drop uygula
-    cols_to_drop = [c["column_name"] for c in drop_candidates]
-    df = df.drop(columns=cols_to_drop, errors="ignore")
+    df = df.drop(columns=all_cols_to_drop, errors="ignore")
 
-    for c in drop_candidates:
+    for c in high_confidence:
+        col_name = c.get("column_name", "")
         domain_dropped.append({
-            "column": c["column_name"],
+            "column": col_name,
             "reason": f"domain leakage (high confidence): {c.get('reasoning', '')[:120]}",
             "relationship_type": c.get("relationship_type", "unknown"),
         })
-        print(f"[leakage] DOMAIN DROP: '{c['column_name']}' "
+        print(f"[leakage] DOMAIN DROP: '{col_name}' "
               f"({c.get('relationship_type')}, high) - "
               f"{c.get('reasoning', '')[:80]}")
+
+    for derived_col in derived_to_drop:
+        domain_dropped.append({
+            "column": derived_col,
+            "reason": "domain leakage (türev — parent kolon high confidence leaky)",
+            "relationship_type": "temporal_derived",
+        })
+        print(f"[leakage] DOMAIN DROP (türev): '{derived_col}' — leaky parent: {leaky_col_names}")
 
     return df, domain_dropped
 
@@ -731,14 +757,28 @@ def build_features(state: dict) -> dict:
     df, y, target_name = _resolve_target(df, feature_plan, intent)
 
     # Aggregation
-    df, y = _aggregate_if_needed(df, y, feature_plan, meta)
+    entity_resolution = state.get("entity_resolution") or {}
+    df, y = _aggregate_if_needed(df, y, feature_plan, meta, entity_resolution=entity_resolution)
 
     if df.empty or len(df) < 5:
         return {"error": f"İşlemler sonrası yetersiz veri sayısı ({len(df)} satır). Model kurulamıyor."}
 
-    # Date feature extraction
+    # Domain leakage raporunu erken oku — timestamp türevi üretmeden önce lazım
+    domain_leakage_report = state.get("domain_leakage_report") or {}
+    leaky_cols_high = {
+        c.get("column_name")
+        for c in (domain_leakage_report.get("concerns") or [])
+        if c.get("confidence") == "high"
+    }
+    if leaky_cols_high:
+        print(f"[feature_eng] High-confidence leaky kolonlar (türev üretilmeyecek): {leaky_cols_high}")
+
+    # Date feature extraction — leaky olan timestamp kolonları atlanır
     for col in meta.get_by_type("timestamp"):
         if col in df.columns:
+            if col in leaky_cols_high:
+                print(f"[feature_eng] SKIP türev: '{col}' domain leakage (high) — year/month/dayofweek üretilmiyor")
+                continue
             try:
                 dt = pd.to_datetime(df[col], errors="coerce")
                 df[f"{col}_year"]      = dt.dt.year
@@ -795,7 +835,6 @@ def build_features(state: dict) -> dict:
     # Leakage detection
     df, leakage_report = _detect_leakage(df, y, meta)
 
-    domain_leakage_report = state.get("domain_leakage_report") or {}
     df, domain_dropped = _apply_domain_leakage_drops(df, domain_leakage_report)
 
     # Birleştir: domain dropped'ı leakage_report'a ekle

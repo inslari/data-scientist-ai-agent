@@ -4,42 +4,42 @@ CRITICAL: The final output MUST be written entirely in fluent, professional Turk
 
 Write the report strictly using the following Markdown structure:
 
-# 📊 Kümeleme Analizi Raporu — [Başlık]
+# 📊 Clustering Analysis Report — [Title]
 
-## 1. Yönetici Özeti (Executive Summary)
+## 1. Executive Summary
 Provide a 3-4 sentence summary: how many segments were found, how well-separated they are (Silhouette Score), and what it means for the business.
 
-## 2. Veri Kalitesi (Data Quality)
+## 2. Data Quality
 - Evaluate the overall state of the dataset.
 - Summarize any cleaning operations applied and their impact.
 - Highlight outliers or quality issues that could affect cluster quality.
 
-## 3. Küme Kalitesi (Cluster Quality)
+## 3. Cluster Quality
 - Interpret the Silhouette Score in plain language (what does the number mean, is it good?).
 - Discuss Davies-Bouldin Index and Calinski-Harabasz Score if available.
 - Compare KMeans vs DBSCAN performance from the algorithm comparison table.
 - Explain WHY the selected algorithm outperformed the alternatives.
 
-## 4. Küme Profilleri (Cluster Profiles)
+## 4. Cluster Profiles
 - For each cluster, describe its relative size and infer likely characteristics.
 - Use domain knowledge to interpret what each segment likely represents.
-- Example: "Küme 0, toplam verinin %X'ini oluşturmaktadır — muhtemelen..."
+- Example: "Cluster 0 constitutes X% of the total data — likely representing..."
 
-## 5. Güçlü Yönler (Strengths)
+## 5. Strengths
 - Where the segmentation model excels.
 - Explain why the Silhouette score indicates good/excellent cluster separation.
 
-## 6. Zayıf Yönler ve Riskler (Weaknesses & Risks)
+## 6. Weaknesses & Risks
 - Potential issues: do the clusters make business sense?
 - Risks of over-interpreting cluster boundaries without domain validation.
 - Limitations of the chosen algorithm (e.g., KMeans assumes spherical clusters).
 
-## 7. Operasyonel Öneriler (Operational Recommendations)
+## 7. Operational Recommendations
 - How to use these segments in real business decisions.
 - What domain experts should validate before acting on results.
 - Whether additional features or data collection could improve segmentation.
 
-## 8. Sonraki Adımlar (Next Steps)
+## 8. Next Steps
 Propose 3-5 concrete, prioritized actionable steps.
 
 ---

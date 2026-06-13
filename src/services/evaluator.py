@@ -47,7 +47,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.calibration import calibration_curve
-
+from src.services.leakage_detector import detect_target_lock
 from ..state import AgentState
 from ..history_tracker import log_experiment
 
@@ -145,6 +145,8 @@ def _evaluate_classification(
         except Exception:
             pass
 
+
+
     # Log loss
     if y_prob_test is not None:
         try:
@@ -236,10 +238,21 @@ def _evaluate_classification(
             pass
 
     # Feature importance analysis
+    # Feature importance analysis
     fi = _extract_feature_importance(model, feature_names)
     if fi:
         evaluation["feature_importance"] = fi
         evaluation["feature_importance_summary"] = _summarize_feature_importance(fi)
+
+        # Target-lock (censorship/survival) leakage kontrolü
+        
+        target_lock_concerns = detect_target_lock(X_test, y_test, feature_importance=fi)
+        if target_lock_concerns:
+            evaluation["target_lock_leakage"] = target_lock_concerns
+            print(f"[evaluation] Target-lock leakage suphesi: "
+                  f"{len(target_lock_concerns)} feature")
+            for c in target_lock_concerns:
+                print(f"  - {c['feature']} (imp={c['importance']}): {c['reason']}")
 
     # Bootstrap confidence intervals
     print("Bootstrap CI hesaplanıyor...")

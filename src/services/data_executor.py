@@ -40,12 +40,48 @@ from src.core.config import settings
 
 # ── Sabitler ────────────────────────────────────────────────
 CHUNK_SIZE        = 10_000   # MCP'den kaç satır çekileceği (per chunk)
-MAX_FETCH_ROWS    = 100_000  # Tek tablodan max çekilecek satır
-ML_SAMPLE_ROWS    = 100_000  # ML eğitimi için max satır
-PROFILE_SAMPLE    = 200_000  # Profiling için max satır (yoksa full)
+MAX_FETCH_ROWS    = 300_000  # Tek tablodan max çekilecek satır
+ML_SAMPLE_ROWS    = 300_000  # ML eğitimi için max satır
+PROFILE_SAMPLE    = 300_000  # Profiling için max satır (yoksa full)
 PARQUET_DIR       = Path(tempfile.gettempdir()) / "ds_agent_data"
 PARQUET_DIR.mkdir(exist_ok=True)
 
+
+
+def _coerce_scalar(p: str):
+    """
+    Repr wrapper'larını gerçek değere indirger:
+      np.int64(0)        -> 0
+      np.float64(1.5)    -> 1.5
+      Decimal('10.5')    -> 10.5
+      Timestamp('...')   -> '...' (string, parquet datetime'a çevirir)
+      Period('2017-09')  -> '2017-09'
+      <NA>/nan/None/null -> None
+    Wrapper yoksa int -> float -> string sırasıyla dener.
+    """
+    s = p.strip()
+
+    # Genel wrapper: AnyName('...') veya AnyName(123) -> içindeki değer
+    m = re.match(r"[\w.]+\(\s*['\"]?(.+?)['\"]?\s*\)$", s)
+    if m:
+        s = m.group(1).strip()
+
+    # Null varyantları
+    if s.lower() in ("nan", "na", "<na>", "none", "null", ""):
+        return None
+
+    # Kalan tırnakları temizle
+    if len(s) >= 2 and s[0] in "'\"" and s[-1] in "'\"":
+        s = s[1:-1]
+
+    # Sayıya çevir
+    try:
+        return int(s)
+    except ValueError:
+        try:
+            return float(s)
+        except ValueError:
+            return s
 
 # ── Relationship graph traversal ─────────────────────────────
 def _resolve_all_related_tables(
@@ -206,10 +242,34 @@ def _select_anchor_table(
 
 
 def _parse_mcp_to_df(raw: str, table_name: str = "") -> pd.DataFrame:
+    # ─── DEBUG (geçici, sorun çözülünce silinecek) ───
+    print(f"\n[DEBUG _parse] table: '{table_name}'")
+    print(f"[DEBUG _parse] raw type: {type(raw).__name__}")
+    if raw is None:
+        print(f"[DEBUG _parse] raw is None")
+    elif isinstance(raw, str):
+        print(f"[DEBUG _parse] raw length: {len(raw)}")
+        print(f"[DEBUG _parse] raw ilk 400 char:")
+        print(raw[:400])
+        print(f"[DEBUG _parse] raw son 200 char:")
+        print(raw[-200:] if len(raw) > 200 else "(zaten yukarıda)")
+        # Columns satırı var mı?
+        has_columns_line = any(l.startswith("Columns:") for l in raw.strip().splitlines())
+        print(f"[DEBUG _parse] 'Columns:' satırı var mı: {has_columns_line}")
+        # İlk 5 satırın preview'i
+        lines_preview = raw.strip().splitlines()[:5]
+        print(f"[DEBUG _parse] ilk 5 satır:")
+        for i, l in enumerate(lines_preview):
+            print(f"  [{i}] {l[:150]}")
+    else:
+        print(f"[DEBUG _parse] beklenmeyen tip, str(raw)[:300]:")
+        print(str(raw)[:300])
+    print(f"[DEBUG _parse] === END ===\n")
+    # ─── /DEBUG ───
+
     if not raw:
         raise ValueError(f"[{table_name}] MCP boş yanıt döndürdü.")
     if raw.strip().startswith("Error") or raw.strip().startswith("SQL Error"):
-        # raw çok uzun olabilir, hatayı basarken ilk 200 karakteri al
         raise ValueError(f"[{table_name}] MCP SQL hatası: {raw[:200]}")
 
     lines = raw.strip().splitlines()
@@ -258,10 +318,7 @@ def _parse_tuple_line(line: str) -> tuple:
             elif p.startswith(("'",'"')) and p.endswith(("'",'"')):
                 parsed.append(p[1:-1])
             else:
-                try: parsed.append(int(p))
-                except ValueError:
-                    try: parsed.append(float(p))
-                    except ValueError: parsed.append(p)
+                parsed.append(_coerce_scalar(p))
         return tuple(parsed)
 
 
