@@ -1,7 +1,7 @@
-Kullanıcı sorusu: {user_query}
-Tespit edilen intent: {intent}
+User query: {user_query}
+Detected intent: {intent}
 
-Veritabanı yapısı:
+Database structure:
 {tables_summary}{target_hint}{leakage_hint}{retry_context}
 
-Bu analiz için feature engineering planını üret.
+Produce a feature engineering plan for this analysis.

@@ -89,6 +89,38 @@ def evaluate_quality_gate(state: dict) -> dict:
             "details": importance_suspects,
         })
 
+    # Target-lock (censorship/survival) leakage
+    # Target-lock (veri sızıntısı) kontrolü
+    checks_performed.append("target_lock_leakage")
+    target_lock = evaluation_report.get("target_lock_leakage", []) or []
+    high_lock = [c for c in target_lock if c.get("confidence") == "high"]
+    low_lock = [c for c in target_lock if c.get("confidence") == "low"]
+
+    if high_lock:
+        feats = ", ".join(c["feature"] for c in high_lock)
+        warnings.append({
+            "code": "target_lock_leakage_high",
+            "message": (
+                f"Olası veri sızıntısı: {feats}. "
+                f"Bu özellikler belirli aralıklarda sonucu neredeyse kesin belirliyor — "
+                f"yani model 'tahmin' etmek yerine cevabı doğrudan görüyor olabilir. "
+                f"Gerçek kullanımda bu bilgi elde olmayabilir; bu özelliklerin çıkarılması önerilir."
+            ),
+            "details": high_lock,
+        })
+    if low_lock:
+        feats = ", ".join(c["feature"] for c in low_lock)
+        warnings.append({
+            "code": "target_lock_signal_low",
+            "message": (
+                f"Güçlü belirleyici özellik: {feats}. "
+                f"Sonuçla güçlü ama tutarlı bir ilişkisi var — bu genelde normaldir, "
+                f"sızıntı değil gerçek bir sinyaldir. Yine de gerçek kullanımda bu bilginin "
+                f"elde olacağından emin olun."
+            ),
+            "details": low_lock,
+        })
+
     # Düşük reliability
     checks_performed.append("reliability_score")
     rel_score = reliability.get("score", 100) or 100

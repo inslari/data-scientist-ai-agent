@@ -40,12 +40,48 @@ from src.core.config import settings
 
 # ── Sabitler ────────────────────────────────────────────────
 CHUNK_SIZE        = 10_000   # MCP'den kaç satır çekileceği (per chunk)
-MAX_FETCH_ROWS    = 100_000  # Tek tablodan max çekilecek satır
-ML_SAMPLE_ROWS    = 100_000  # ML eğitimi için max satır
-PROFILE_SAMPLE    = 200_000  # Profiling için max satır (yoksa full)
+MAX_FETCH_ROWS    = 300_000  # Tek tablodan max çekilecek satır
+ML_SAMPLE_ROWS    = 300_000  # ML eğitimi için max satır
+PROFILE_SAMPLE    = 300_000  # Profiling için max satır (yoksa full)
 PARQUET_DIR       = Path(tempfile.gettempdir()) / "ds_agent_data"
 PARQUET_DIR.mkdir(exist_ok=True)
 
+
+
+def _coerce_scalar(p: str):
+    """
+    Repr wrapper'larını gerçek değere indirger:
+      np.int64(0)        -> 0
+      np.float64(1.5)    -> 1.5
+      Decimal('10.5')    -> 10.5
+      Timestamp('...')   -> '...' (string, parquet datetime'a çevirir)
+      Period('2017-09')  -> '2017-09'
+      <NA>/nan/None/null -> None
+    Wrapper yoksa int -> float -> string sırasıyla dener.
+    """
+    s = p.strip()
+
+    # Genel wrapper: AnyName('...') veya AnyName(123) -> içindeki değer
+    m = re.match(r"[\w.]+\(\s*['\"]?(.+?)['\"]?\s*\)$", s)
+    if m:
+        s = m.group(1).strip()
+
+    # Null varyantları
+    if s.lower() in ("nan", "na", "<na>", "none", "null", ""):
+        return None
+
+    # Kalan tırnakları temizle
+    if len(s) >= 2 and s[0] in "'\"" and s[-1] in "'\"":
+        s = s[1:-1]
+
+    # Sayıya çevir
+    try:
+        return int(s)
+    except ValueError:
+        try:
+            return float(s)
+        except ValueError:
+            return s
 
 # ── Relationship graph traversal ─────────────────────────────
 def _resolve_all_related_tables(
@@ -282,10 +318,7 @@ def _parse_tuple_line(line: str) -> tuple:
             elif p.startswith(("'",'"')) and p.endswith(("'",'"')):
                 parsed.append(p[1:-1])
             else:
-                try: parsed.append(int(p))
-                except ValueError:
-                    try: parsed.append(float(p))
-                    except ValueError: parsed.append(p)
+                parsed.append(_coerce_scalar(p))
         return tuple(parsed)
 
 

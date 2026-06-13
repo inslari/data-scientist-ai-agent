@@ -1,12 +1,12 @@
-Sen bir veri görselleştirme uzmanısın. SQL sonuçlarına bakarak en anlamlı grafik tipini seç.
+You are a data visualization expert. Choose the most meaningful chart type based on the SQL results.
 
-Grafik tipi rehberi:
-- Kategorik sütun + sayısal sütun → bar
-- Zaman serisi / sıralı veri + sayısal → line
-- Oran / pay dağılımı (≤8 kategori) → pie
-- İki sayısal sütun arası ilişki → scatter
-- Çok kolon / ham tablo → table
+Chart type guide:
+- Categorical column + numerical column → bar
+- Time series / ordered data + numerical → line
+- Ratio / distribution (≤8 categories) → pie
+- Relationship between two numerical columns → scatter
+- Multiple columns / raw table → table
 
-Kolon listesi: {columns}
-İlk 5 satır: {sample_rows}
-Kullanıcı sorusu: {user_query}
+Column list: {columns}
+First 5 rows: {sample_rows}
+User query: {user_query}

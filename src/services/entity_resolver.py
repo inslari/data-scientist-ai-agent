@@ -37,6 +37,22 @@ PARQUET_DIR.mkdir(exist_ok=True)
 #  KATMAN 1 — Entity Kolonu Tespiti
 # ═══════════════════════════════════════════════════════════
 
+def _match_target_column(target_col: str, parquet_cols: list[str]) -> str | None:
+    """
+    Target kolonunu parquet kolonları içinde bulur.
+    Önce tam eşleşme, yoksa suffix'li versiyonu ('churn' -> 'churn_referance_data_1_').
+    Bulunamazsa None.
+    """
+    if not target_col:
+        return None
+    if target_col in parquet_cols:
+        return target_col
+    # suffix'li ara: 'churn' ile başlayıp '_' ile devam eden
+    matches = [c for c in parquet_cols if c == target_col or c.startswith(target_col + "_")]
+    return matches[0] if matches else None
+
+
+
 def _detect_entity_column(
     db_intelligence: dict,
     target_col: str,
@@ -190,16 +206,23 @@ def compute_entity_signals(
               f"{total_rows:,} satır / {unique_entities:,} entity = {entity_ratio:.2f}")
 
         # ── Sinyal 2: Target Stability ──
-        # Her entity'de target kaç farklı değer alıyor?
         target_stable = False
         parquet_cols = [row[0] for row in conn.execute("DESCRIBE data").fetchall()]
 
-        if target_col and target_col in parquet_cols:
+        # Target kolonunu bul: önce tam eşleşme, yoksa suffix'li versiyon
+        # (entity_resolver join'den sonra çalışır, kolon adı 'churn_referance_data_1_' olabilir)
+        actual_target_col = _match_target_column(target_col, parquet_cols)
+
+        if actual_target_col:
+            if actual_target_col != target_col:
+                print(f"[entity_resolver] Target '{target_col}' → "
+                      f"'{actual_target_col}' (suffix eşleşmesi)")
+
             target_nunique = conn.execute(f"""
                 SELECT MAX(target_nunique) FROM (
-                    SELECT COUNT(DISTINCT "{target_col}") as target_nunique
+                    SELECT COUNT(DISTINCT "{actual_target_col}") as target_nunique
                     FROM data
-                    WHERE "{target_col}" IS NOT NULL
+                    WHERE "{actual_target_col}" IS NOT NULL
                     GROUP BY "{entity_col}"
                 )
             """).fetchone()
@@ -210,15 +233,15 @@ def compute_entity_signals(
             print(f"[entity_resolver] Sinyal 2 — target_stable: {target_stable} "
                   f"(max target nunique per entity = {max_nunique})")
         else:
-            print(f"[entity_resolver] Sinyal 2 — target '{target_col}' parquet'te yok, "
-                  f"target_stable=False varsayılıyor")
+            print(f"[entity_resolver] Sinyal 2 — target '{target_col}' parquet'te bulunamadı "
+                  f"(kolonlar: {parquet_cols}), target_stable=False varsayılıyor")
 
         # ── Sinyal 3: Temporal Kolon ──
         describe_df = conn.execute("DESCRIBE data").fetchall()
         temporal_columns = [
             row[0] for row in describe_df
             if any(t in row[1].upper() for t in ("DATE", "TIMESTAMP", "TIME"))
-            and row[0] != target_col
+            and row[0] != actual_target_col
         ]
         has_temporal = len(temporal_columns) > 0
 
@@ -306,38 +329,45 @@ def aggregate_entity_data(
     DuckDB GROUP BY ile tip-bazlı aggregation.
 
     Stratejiler:
-      Sayısal  → mean, std, sum (3 feature — merkezi eğilim + değişkenlik + büyüklük)
-      Kategorik → mode (most frequent), nunique
+      Sayısal  → mean, std, sum
+      Kategorik → mode, nunique
       Temporal  → min, max, range_days
-      Target   → FIRST (zaten entity-sabit)
-      Entity   → GROUP BY key
-      Genel    → record_count (entity başına satır sayısı, tüm kolonlar için tek)
-
-    Returns:
-        (new_parquet_path, aggregation_stats)
+      Target   → FIRST (entity-sabit), temiz isimle yazılır
+      Genel    → record_count
     """
+    target_col_clean = target_col  # downstream'in beklediği temiz isim ("churn")
+
     conn = duckdb.connect(":memory:")
     try:
         conn.execute(f"CREATE VIEW data AS SELECT * FROM read_parquet('{parquet_path}')")
 
-        # Kolon tiplerini al
         describe = conn.execute("DESCRIBE data").fetchall()
         col_types = {row[0]: row[1] for row in describe}
+
+        # Target'ın gerçek parquet adını ÖNCE bul (suffix'li olabilir: churn_referance_data_1_)
+        actual_target_col = _match_target_column(target_col_clean, list(col_types.keys()))
+        if actual_target_col:
+            print(f"[entity_resolver] Aggregation target: '{actual_target_col}' "
+                  f"→ '{target_col_clean}' olarak yazılacak")
+        else:
+            print(f"[entity_resolver] UYARI: target '{target_col_clean}' "
+                  f"aggregation'da bulunamadı! Kolonlar: {list(col_types.keys())}")
 
         # Aggregation SQL parçaları
         select_parts: list[str] = [f'"{entity_col}"']
         features_created = 0
 
-        # Target → FIRST (zaten entity-sabit)
-        if target_col in col_types:
-            select_parts.append(f'FIRST("{target_col}") AS "{target_col}"')
+        # Target → FIRST, gerçek kolondan oku ama TEMİZ isimle yaz
+        if actual_target_col:
+            select_parts.append(f'FIRST("{actual_target_col}") AS "{target_col_clean}"')
 
-        # Entity başına kayıt sayısı — tek seferlik, tüm kolonlar için ortak
-        select_parts.append(f'COUNT(*) AS "record_count"')
+        # Entity başına kayıt sayısı — tek seferlik
+        select_parts.append('COUNT(*) AS "record_count"')
         features_created += 1
 
         for col_name, col_type in col_types.items():
-            category = _classify_column(col_name, col_type, target_col, entity_col)
+            # Target kolonunu (suffix'li gerçek ismiyle) skip et — yukarıda zaten eklendi
+            category = _classify_column(col_name, col_type, actual_target_col or target_col_clean, entity_col)
 
             if category == "skip":
                 continue
@@ -345,7 +375,6 @@ def aggregate_entity_data(
             safe_col = f'"{col_name}"'
 
             if category == "numeric":
-                # mean + std + sum: merkezi eğilim + değişkenlik + büyüklük
                 select_parts.extend([
                     f'AVG({safe_col}) AS "{col_name}_mean"',
                     f'STDDEV({safe_col}) AS "{col_name}_std"',
@@ -364,12 +393,10 @@ def aggregate_entity_data(
                 select_parts.extend([
                     f'MIN({safe_col}) AS "{col_name}_min"',
                     f'MAX({safe_col}) AS "{col_name}_max"',
-                    # range_days: max - min arası gün farkı
                     f'DATEDIFF(\'day\', MIN({safe_col}), MAX({safe_col})) AS "{col_name}_range_days"',
                 ])
                 features_created += 3
 
-        # SQL çalıştır
         select_clause = ",\n    ".join(select_parts)
         agg_sql = f"""
             SELECT
@@ -382,7 +409,15 @@ def aggregate_entity_data(
 
         result_df = conn.execute(agg_sql).df()
 
-        # Yeni parquet yaz
+        # Target gerçekten çıktıda mı? (güvenlik kontrolü)
+        if target_col_clean not in result_df.columns:
+            print(f"[entity_resolver] KRİTİK UYARI: target '{target_col_clean}' "
+                  f"aggregate çıktısında YOK! Kolonlar: {list(result_df.columns)}")
+        else:
+            n_classes = result_df[target_col_clean].nunique(dropna=True)
+            print(f"[entity_resolver] Target '{target_col_clean}' çıktıda OK "
+                  f"({n_classes} benzersiz değer)")
+
         output_name = f"entity_agg_{uuid.uuid4().hex[:8]}"
         output_path = PARQUET_DIR / f"{output_name}.parquet"
         conn.register("result_view", result_df)
@@ -401,16 +436,12 @@ def aggregate_entity_data(
 
         print(f"[entity_resolver] Aggregation tamamlandı: "
               f"{original_rows:,} → {len(result_df):,} satır "
-              f"({features_created} yeni feature, "
-              f"{len(result_df.columns)} kolon)")
-        print(f"[entity_resolver] Yeni parquet: {output_path} "
-              f"({output_path.stat().st_size // 1024:,} KB)")
+              f"({features_created} yeni feature, {len(result_df.columns)} kolon)")
 
         return str(output_path), stats
 
     finally:
         conn.close()
-
 
 # ═══════════════════════════════════════════════════════════
 #  ANA FONKSİYON — Node tarafından çağrılır
