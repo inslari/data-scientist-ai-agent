@@ -11,7 +11,25 @@ class CSVFileModel(Base):
     file_size = Column(Integer)
     row_count = Column(Integer)
     columns_schema = Column(JSON, nullable=True)
+    column_stats_cache = Column(JSON, nullable=True)
     created_at = Column(Integer)
     data_group_id = Column(Integer, ForeignKey("data_groups.id", ondelete="CASCADE"))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     
     data_group = relationship("DataGroupModel", back_populates="csv_files")
+    user = relationship("UserModel")
+
+from sqlalchemy import event
+import os
+
+@event.listens_for(CSVFileModel, 'after_delete')
+def receive_after_delete(mapper, connection, target):
+    """
+    Listen for the 'after_delete' event and delete the physical file.
+    """
+    if target.file_path and os.path.exists(target.file_path):
+        try:
+            os.remove(target.file_path)
+        except OSError:
+            pass
+

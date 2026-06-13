@@ -37,6 +37,13 @@ dependencies = [
     "duckdb>=1.5.3",
     "imbalanced-learn>=0.14.1",
     "langgraph-checkpoint-sqlite>=3.1.0",
+    "pyjwt>=2.12.1",
+    "passlib>=1.7.4",
+    "bcrypt>=5.0.0",
+    "python-multipart>=0.0.28",
+    "slowapi>=0.1.9",
+    "email-validator>=2.3.0",
+    "resend>=2.30.1",
 ]
 
 [tool.pyrefly]

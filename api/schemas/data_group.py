@@ -10,6 +10,7 @@ class DataGroupBase(BaseModel):
 class DataGroupResponse(DataGroupBase):
     id: int
     created_at: int
+    user_id: Optional[int] = None
 
     mcp_config: Optional[MCPConfigResponse] = None
     csv_files: Optional[List[CSVFileResponse]] = None
@@ -36,8 +37,8 @@ from fastapi import HTTPException
 from api.models.data_group import DataGroupModel
 from api.routes.mcp import _call_mcp_tool
 
-async def get_data_group_schema_logic(group_id: int, db: Session):
-    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id).first()
+async def get_data_group_schema_logic(group_id: int, db: Session, user_id: int):
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == user_id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
         
@@ -62,8 +63,8 @@ async def get_data_group_schema_logic(group_id: int, db: Session):
     
     raise HTTPException(status_code=400, detail="Unknown source type")
 
-async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Session):
-    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id).first()
+async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Session, user_id: int):
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == user_id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
         

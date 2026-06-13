@@ -20,21 +20,24 @@ from api.schemas.mcp import (
     MCPToolRequest, MCPSchemaResponse, MCPColumnStatsResponse,
     RefreshCacheResponse, MCPSampleDataRequest, MCPSampleDataResponse
 )
+from api.core.deps import get_current_user
+from api.models.user import UserModel
 
 router = APIRouter(prefix="/mcp", tags=["MCP Configuration"])
 
 @router.post("/config", response_model=MCPConfigResponse)
-def create_mcp_config(config: MCPConfigCreate, db: Session = Depends(get_db)):
+def create_mcp_config(config: MCPConfigCreate, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Kullanıcıdan MCP bilgilerini alıp veritabanına kaydeder.
     """
-    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.name == config.name).first()
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.name == config.name, MCPConfigModel.user_id == current_user.id).first()
     if db_config:
         raise HTTPException(status_code=400, detail="An MCP config with this name already exists")
         
     data_group = DataGroupModel(
         name=config.name,
         source_type="mcp",
+        user_id=current_user.id,
         created_at=int(time.time())
     )
     db.add(data_group)
@@ -48,7 +51,8 @@ def create_mcp_config(config: MCPConfigCreate, db: Session = Depends(get_db)):
         args=config.args,
         url=config.url,
         env=config.env,
-        data_group_id=data_group.id
+        data_group_id=data_group.id,
+        user_id=current_user.id
     )
     db.add(new_config)
     db.commit()
@@ -56,23 +60,23 @@ def create_mcp_config(config: MCPConfigCreate, db: Session = Depends(get_db)):
     return new_config
 
 @router.get("/config", response_model=list[MCPConfigResponse])
-def get_mcp_configs(db: Session = Depends(get_db)):
+def get_mcp_configs(db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Kayıtlı tüm MCP konfigürasyonlarını döner.
     """
-    return db.query(MCPConfigModel).all()
+    return db.query(MCPConfigModel).filter(MCPConfigModel.user_id == current_user.id).all()
 
 @router.put("/config/{config_id}", response_model=MCPConfigResponse)
-def update_mcp_config(config_id: int, config_update: MCPConfigUpdate, db: Session = Depends(get_db)):
+def update_mcp_config(config_id: int, config_update: MCPConfigUpdate, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Belirtilen ID'ye sahip MCP konfigürasyonunu günceller.
     """
-    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == config_id).first()
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == config_id, MCPConfigModel.user_id == current_user.id).first()
     if not db_config:
         raise HTTPException(status_code=404, detail="MCP config not found")
         
     if config_update.name is not None and config_update.name != db_config.name:
-        existing = db.query(MCPConfigModel).filter(MCPConfigModel.name == config_update.name).first()
+        existing = db.query(MCPConfigModel).filter(MCPConfigModel.name == config_update.name, MCPConfigModel.user_id == current_user.id).first()
         if existing:
             raise HTTPException(status_code=400, detail="An MCP config with this new name already exists")
     
@@ -93,11 +97,11 @@ def update_mcp_config(config_id: int, config_update: MCPConfigUpdate, db: Sessio
     return db_config
 
 @router.delete("/config/{config_id}")
-def delete_mcp_config(config_id: int, db: Session = Depends(get_db)):
+def delete_mcp_config(config_id: int, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Belirtilen ID'ye sahip MCP konfigürasyonunu siler.
     """
-    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == config_id).first()
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == config_id, MCPConfigModel.user_id == current_user.id).first()
     if not db_config:
         raise HTTPException(status_code=404, detail="MCP config not found")
         
@@ -106,11 +110,11 @@ def delete_mcp_config(config_id: int, db: Session = Depends(get_db)):
     return {"status": "success", "message": f"MCP config with id {config_id} deleted successfully"}
 
 @router.post("/test-connection", response_model=ConnectionTestResponse)
-async def test_mcp_connection(req: ConnectionTestRequest, db: Session = Depends(get_db)):
+async def test_mcp_connection(req: ConnectionTestRequest, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Kayıtlı bir MCP konfigürasyonuna bağlanmayı dener ve araçlarını listeler.
     """
-    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id).first()
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id, MCPConfigModel.user_id == current_user.id).first()
     if not db_config:
         raise HTTPException(status_code=404, detail="MCP config not found")
     
@@ -247,12 +251,12 @@ async def _call_mcp_tool(db_config, tool_name: str, tool_args: dict = None) -> s
         return ""
 
 @router.post("/schema", response_model=MCPSchemaResponse)
-async def get_mcp_schema(req: MCPToolRequest, db: Session = Depends(get_db)):
+async def get_mcp_schema(req: MCPToolRequest, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Bağlı MCP sunucusundaki tüm veritabanı tablolarının şemasını (schema) döner.
     MCP sunucusundaki 'get_schema' aracını çalıştırır.
     """
-    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id).first()
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id, MCPConfigModel.user_id == current_user.id).first()
     if not db_config:
         raise HTTPException(status_code=404, detail="MCP config not found")
         
@@ -275,12 +279,12 @@ async def get_mcp_schema(req: MCPToolRequest, db: Session = Depends(get_db)):
         return {"status": "error", "message": f"Failed to get schema: {str(e)}"}
 
 @router.post("/column-stats", response_model=MCPColumnStatsResponse)
-async def get_mcp_column_stats(req: MCPToolRequest, db: Session = Depends(get_db)):
+async def get_mcp_column_stats(req: MCPToolRequest, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Bağlı MCP sunucusundaki tüm tabloların kolon istatistiklerini döner.
     MCP sunucusundaki 'get_column_stats' aracını çalıştırır.
     """
-    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id).first()
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id, MCPConfigModel.user_id == current_user.id).first()
     if not db_config:
         raise HTTPException(status_code=404, detail="MCP config not found")
         
@@ -303,12 +307,12 @@ async def get_mcp_column_stats(req: MCPToolRequest, db: Session = Depends(get_db
         return {"status": "error", "message": f"Failed to get column stats: {str(e)}"}
 
 @router.post("/refresh-stats", response_model=RefreshCacheResponse)
-async def refresh_mcp_db_stats(req: MCPToolRequest, db: Session = Depends(get_db)):
+async def refresh_mcp_db_stats(req: MCPToolRequest, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Belirtilen MCP sunucusundaki şema ve kolon istatistiklerini zorla yeniler
     ve veritabanına kaydeder.
     """
-    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id).first()
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id, MCPConfigModel.user_id == current_user.id).first()
     if not db_config:
         raise HTTPException(status_code=404, detail="MCP config not found")
         
@@ -340,11 +344,11 @@ async def refresh_mcp_db_stats(req: MCPToolRequest, db: Session = Depends(get_db
         return {"status": "error", "message": f"Failed to refresh cache: {str(e)}"}
 
 @router.post("/sample-data", response_model=MCPSampleDataResponse)
-async def get_mcp_sample_data(req: MCPSampleDataRequest, db: Session = Depends(get_db)):
+async def get_mcp_sample_data(req: MCPSampleDataRequest, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Belirtilen tablodan belirtilen limit kadar örnek veri döner.
     """
-    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id).first()
+    db_config = db.query(MCPConfigModel).filter(MCPConfigModel.id == req.config_id, MCPConfigModel.user_id == current_user.id).first()
     if not db_config:
         raise HTTPException(status_code=404, detail="MCP config not found")
         

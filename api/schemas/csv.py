@@ -3,6 +3,7 @@ from typing import Optional, List, Dict, Any
 
 class CSVFileResponse(BaseModel):
     id: int
+    user_id: Optional[int] = None
     filename: str
     file_path: str
     file_size: int

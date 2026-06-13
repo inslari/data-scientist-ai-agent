@@ -22,6 +22,7 @@ class MCPConfigUpdate(BaseModel):
 
 class MCPConfigResponse(MCPConfigBase):
     id: int
+    user_id: Optional[int] = None
     data_group_id: int
     
     model_config = ConfigDict(from_attributes=True)

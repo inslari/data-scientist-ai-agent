@@ -11,6 +11,7 @@ class ProjectModel(Base):
     description = Column(Text, nullable=True)
     query = Column(Text, nullable=True)
     data_group_id = Column(Integer, ForeignKey("data_groups.id", ondelete="SET NULL"), nullable=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     
     status = Column(String, default="idle") # idle, running, completed, failed
     report = Column(Text, nullable=True)
@@ -21,6 +22,7 @@ class ProjectModel(Base):
 
     data_group = relationship("DataGroupModel", back_populates="projects")
     steps = relationship("ProjectStepModel", back_populates="project", cascade="all, delete-orphan", order_by="ProjectStepModel.created_at")
+    user = relationship("UserModel")
 
 
 class ProjectStepModel(Base):

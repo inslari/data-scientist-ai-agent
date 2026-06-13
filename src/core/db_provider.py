@@ -78,7 +78,7 @@ class DatabaseProvider:
                 "SELECT table_name, "
                 "'CREATE TABLE ' || table_name AS sql "
                 "FROM information_schema.tables "
-                "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+                "WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'"
             )
         elif self.provider == "mysql":
             return (
@@ -103,7 +103,7 @@ class DatabaseProvider:
         elif self.provider == "postgresql":
             return (
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+                "WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'"
             )
         elif self.provider == "mysql":
             return (
@@ -121,8 +121,15 @@ class DatabaseProvider:
         """Returns SQL to get column metadata for a given table."""
         if self.provider == "sqlite":
             return f"PRAGMA table_info('{table_name}')"
+        elif self.provider == "postgresql":
+            return (
+                f"SELECT column_name, data_type, is_nullable, column_default "
+                f"FROM information_schema.columns "
+                f"WHERE table_schema = current_schema() AND table_name = '{table_name}' "
+                f"ORDER BY ordinal_position"
+            )
         else:
-            # Works for postgresql, mysql, mssql (information_schema)
+            # Works for mysql, mssql (information_schema)
             return (
                 f"SELECT column_name, data_type, is_nullable, column_default "
                 f"FROM information_schema.columns "
@@ -140,7 +147,7 @@ class DatabaseProvider:
             return (
                 f"SELECT column_name, data_type, is_nullable "
                 f"FROM information_schema.columns "
-                f"WHERE table_name = '{table_name}' "
+                f"WHERE table_schema = current_schema() AND table_name = '{table_name}' "
                 f"ORDER BY ordinal_position"
             )
         elif self.provider == "mysql":
