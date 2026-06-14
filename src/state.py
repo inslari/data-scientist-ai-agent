@@ -84,4 +84,7 @@ class AgentState(TypedDict, total=False):
     current_step: str                # Current active node
     error: Optional[str]             # Errors
     messages: list                   # LLM conversation history
-    excluded_models: list[str]       # Models excluded due to overfitting
+    excluded_models: list[str]       # Models excluded due to 
+    
+    # Analysis Report
+    analysis_report: dict            # Deep analysis report
