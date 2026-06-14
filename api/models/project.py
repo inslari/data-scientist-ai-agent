@@ -10,6 +10,7 @@ class ProjectModel(Base):
     title = Column(String, index=True)
     description = Column(Text, nullable=True)
     query = Column(Text, nullable=True)
+    intent = Column(String, nullable=True)
     data_group_id = Column(Integer, ForeignKey("data_groups.id", ondelete="SET NULL"), nullable=True)
     
     status = Column(String, default="idle") # idle, running, completed, failed

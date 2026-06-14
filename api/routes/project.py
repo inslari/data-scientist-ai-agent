@@ -40,6 +40,8 @@ async def _run_project_graph_task_async(project_id: int, query: str, data_group_
             config = {"configurable": {"data_group_id": data_group_id, "thread_id": str(project_id)}}
             
             initial_state = {"user_query": query}
+            if getattr(project, "intent", None):
+                initial_state["intent"] = project.intent
             if is_resume:
                 try:
                     state_snapshot = await app.aget_state(config)
@@ -167,6 +169,7 @@ def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
         title=project.title,
         description=project.description,
         query=project.query,
+        intent=project.intent,
         data_group_id=project.data_group_id,
         created_at=int(time.time()),
         updated_at=int(time.time())
@@ -208,6 +211,8 @@ def update_project(project_id: int, project: ProjectUpdate, db: Session = Depend
         db_project.description = project.description
     if project.query is not None:
         db_project.query = project.query
+    if project.intent is not None:
+        db_project.intent = project.intent
     if project.data_group_id is not None:
         db_project.data_group_id = project.data_group_id
         

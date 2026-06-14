@@ -5,11 +5,30 @@ from ..core.prompt_loader import create_chat_prompt
 from ..schemas.intent_schemas import IntentResult
 
 
+# UI'dan açıkça set edilebilen intent'ler — LLM tespitine gerek yok
+_UI_EXPLICIT_INTENTS = {"deep_analysis"}
+
+
 def intent_node(state: AgentState) -> AgentState:
     """
     Node 1: Kullanıcının sorgusunu analiz edip intent'i belirler.
+
+    Eğer intent UI'dan açıkça verilmişse (ör. "Veri Analizi" modu seçilmiş),
+    LLM tespiti atlanır — kullanıcı ne istediğini zaten söylemiştir.
     """
     print("\n========================================\n[NODE START] intent_node başlıyor...\n========================================")
+
+    # UI'dan açık seçim varsa LLM'e sorma
+    incoming_intent = state.get("intent")
+    if incoming_intent in _UI_EXPLICIT_INTENTS:
+        print(f"[intent_node] UI'dan açık intent: '{incoming_intent}' — LLM atlandı")
+        return {
+            **state,
+            "intent": incoming_intent,
+            "intent_confidence": 1.0,
+            "current_step": "intent_node",
+        }
+
     llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
     structured_llm = llm.with_structured_output(IntentResult)
 

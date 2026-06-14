@@ -17,6 +17,7 @@ from src.nodes.sql_node import sql_node
 from src.nodes.target_discovery_node import target_discovery_node
 from src.nodes.leakage_detector_node import leakage_detector_node
 from src.nodes.entity_resolution_node import entity_resolution_node
+from src.nodes.analysis_node import analysis_node
 
 
 # Routing functions
@@ -30,10 +31,13 @@ def route_after_db_context(state: AgentState) -> str:
 def route_after_execution(state: AgentState) -> str:
     """
     split for execution node after
-      classification / regression / clustering → feature_plan_node
+      classification / regression / clustering → entity_resolution_node
+      deep_analysis                            → analysis_node (model akışına girmez)
       eda / anomaly_detection / report         → automl_node
     """
     intent = state.get("intent", "eda")
+    if intent == "deep_analysis":
+        return "analysis_node"
     if intent in ("classification", "regression", "clustering"):
         return "entity_resolution_node"
     if intent == "anomaly_detection":
@@ -91,6 +95,7 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
     graph.add_node("report_node",              report_node)
     graph.add_node("leakage_detector_node",    leakage_detector_node)
     graph.add_node("entity_resolution_node",   entity_resolution_node)
+    graph.add_node("analysis_node",            analysis_node)
 
     # START → intent_node → db_context_node
     graph.add_edge(START, "intent_node")
@@ -118,10 +123,13 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
         route_after_execution,
         {
             "entity_resolution_node": "entity_resolution_node",
+            "analysis_node": "analysis_node",
             "automl_node":       "automl_node",
             "report_node":       "report_node",
         },
     )
+    graph.add_edge("analysis_node", END)
+
 
     graph.add_edge("entity_resolution_node", "leakage_detector_node")
     graph.add_edge("leakage_detector_node", "feature_plan_node")
