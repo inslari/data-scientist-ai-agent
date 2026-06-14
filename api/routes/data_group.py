@@ -48,16 +48,13 @@ def delete_data_group(group_id: int, db: Session = Depends(get_db), current_user
     db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == current_user.id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
-        
-    # If it's a CSV group, delete physical files
+
+    # If it's a CSV group, delete physical files from storage (MinIO or local)
     if db_group.source_type == "csv" and db_group.csv_files:
+        from api.core.storage import storage
         for csv_file in db_group.csv_files:
-            if os.path.exists(csv_file.file_path):
-                try:
-                    os.remove(csv_file.file_path)
-                except Exception as e:
-                    print(f"Failed to delete file {csv_file.file_path}: {e}")
-                    
+            storage.delete(csv_file.file_path)
+
     db.delete(db_group)
     db.commit()
     return {"status": "success", "message": f"Data group with id {group_id} deleted successfully"}

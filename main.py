@@ -29,55 +29,10 @@ from api.core.worker import job_worker_loop
 async def lifespan(app: FastAPI):
     """
     Application lifespan handler.
-
-    On startup:
-      1. Re-queue any jobs that were left in 'running' or 'pending' state from
-         a previous server crash (inbox recovery).  We reset their status to
-         'pending' so the worker loop picks them up cleanly.
-      2. Start the background worker loop as a long-lived asyncio.Task.
-
-    On shutdown:
-      Cancel the worker task gracefully.
     """
-    db = SessionLocal()
-    try:
-        # Recover interrupted jobs: set 'running' → 'pending' so the worker retries them
-        stuck_jobs = (
-            db.query(BackgroundJobModel)
-            .filter(BackgroundJobModel.status.in_(["running", "pending"]))
-            .all()
-        )
-        for job in stuck_jobs:
-            print(f"[Startup] Re-queuing interrupted job id={job.id} for project_id={job.project_id}")
-            job.status = "pending"
-            job.updated_at = int(time.time())
-
-        # Also make sure corresponding projects show 'queued' instead of 'running'
-        if stuck_jobs:
-            project_ids = [j.project_id for j in stuck_jobs if j.project_id]
-            db.query(ProjectModel).filter(ProjectModel.id.in_(project_ids)).update(
-                {"status": "queued"}, synchronize_session=False
-            )
-
-        db.commit()
-    except Exception as e:
-        print(f"[Startup] Error recovering jobs: {e}")
-    finally:
-        db.close()
-
-    # Start the background worker as a persistent asyncio task
-    worker_task = asyncio.create_task(job_worker_loop())
-    print("[Startup] Background job worker task started.")
-
+    # Previously, we ran the worker and job recovery here. 
+    # Now, the background worker is completely decoupled and runs via worker_main.py.
     yield  # Application is running
-
-    # Graceful shutdown
-    worker_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
-    print("[Shutdown] Background job worker stopped.")
 
 
 from slowapi.errors import RateLimitExceeded

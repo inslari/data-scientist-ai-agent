@@ -3,7 +3,8 @@ from langchain_core.runnables import RunnableConfig
 from fastapi import HTTPException
 
 from api.core.database import SessionLocal
-from api.routes.data_group import get_data_group_schema, run_data_group_query, QueryRequest
+from api.schemas.data_group import get_data_group_schema_logic, run_data_group_query_logic, QueryRequest
+from api.models.data_group import DataGroupModel
 
 @tool
 async def get_schema(config: RunnableConfig) -> str:
@@ -18,7 +19,9 @@ async def get_schema(config: RunnableConfig) -> str:
     print(f" 📡 [Dahili İşlem]: Şema çekiliyor... (Data Group: {data_group_id})")
     db = SessionLocal()
     try:
-        result = await get_data_group_schema(data_group_id, db)
+        dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+        user_id = dg.user_id if dg else 0
+        result = await get_data_group_schema_logic(data_group_id, db, user_id)
         return result.get("schema", str(result))
     except HTTPException as e:
         return f"API Hatası: {e.detail}"
@@ -40,8 +43,10 @@ async def run_sql_query(query: str, config: RunnableConfig) -> str:
     print(f" 📡 [Dahili İşlem - SQL]: {query} (Data Group: {data_group_id})")
     db = SessionLocal()
     try:
+        dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+        user_id = dg.user_id if dg else 0
         req = QueryRequest(query=query)
-        result = await run_data_group_query(data_group_id, req, db)
+        result = await run_data_group_query_logic(data_group_id, req, db, user_id)
         
         if result.get("status") == "success":
             return result.get("result", str(result))

@@ -21,15 +21,13 @@ class CSVFileModel(Base):
 
 from sqlalchemy import event
 import os
+from api.core.storage import storage
 
 @event.listens_for(CSVFileModel, 'after_delete')
 def receive_after_delete(mapper, connection, target):
     """
-    Listen for the 'after_delete' event and delete the physical file.
+    Listen for the 'after_delete' event and delete the physical file from storage.
     """
-    if target.file_path and os.path.exists(target.file_path):
-        try:
-            os.remove(target.file_path)
-        except OSError:
-            pass
+    if target.file_path:
+        storage.delete(target.file_path)
 

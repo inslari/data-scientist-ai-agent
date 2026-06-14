@@ -1,14 +1,16 @@
+import io
 import os
 import time
 import uuid
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from typing import List
 
 from api.core.database import get_db, DATA_DIR
+from api.core.storage import storage
 from api.models.csv import CSVFileModel
 from api.models.data_group import DataGroupModel
 from api.schemas.csv import (
@@ -25,6 +27,7 @@ from api.routes.data_group import _clear_db_cache
 
 router = APIRouter(prefix="/csv", tags=["CSV Upload and Analysis"])
 
+# Local fallback directory (used when MinIO is not configured)
 CSV_STORAGE_DIR = os.path.join(DATA_DIR, "csvs")
 os.makedirs(CSV_STORAGE_DIR, exist_ok=True)
 
@@ -72,30 +75,25 @@ async def upload_csv(
         if not filename.endswith('.csv'):
             errors.append({"filename": filename or "unknown", "error": "Only .csv files are allowed."})
             continue
-            
+
         unique_filename = f"{uuid.uuid4()}_{filename}"
-        file_path = os.path.join(CSV_STORAGE_DIR, unique_filename)
-        
-        # Save the file to disk
+        # Object key for MinIO, or absolute path for local storage
+        object_key = f"csvs/{unique_filename}" if storage.using_minio else os.path.join(CSV_STORAGE_DIR, unique_filename)
+
         contents = await file.read()
-        with open(file_path, "wb") as f:
-            f.write(contents)
-            
-        file_size = os.path.getsize(file_path)
-        
-        # Function to run in threadpool
-        def process_csv(path: str):
-            df = pd.read_csv(path)
+        file_size = len(contents)
+
+        # Upload to storage (MinIO or local disk)
+        file_ref = storage.upload(contents, object_key)
+
+        # Process CSV (schema + stats) using a temp file when using MinIO
+        def process_csv_bytes(csv_bytes: bytes):
+            df = pd.read_csv(io.BytesIO(csv_bytes))
             row_count = len(df)
-            
-            columns_schema = []
-            for col in df.columns:
-                columns_schema.append({
-                    "name": col,
-                    "type": str(df[col].dtype)
-                })
-                
-            # Calculate column stats
+            columns_schema = [
+                {"name": col, "type": str(df[col].dtype)}
+                for col in df.columns
+            ]
             stats_df = df.describe(include='all').T
             stats_df['null_count'] = df.isnull().sum()
             stats_df['dtype'] = df.dtypes.astype(str)
@@ -103,21 +101,21 @@ async def upload_csv(
             stats_df.reset_index(inplace=True)
             stats_df.rename(columns={'index': 'column_name'}, inplace=True)
             stats_list = stats_df.to_dict(orient="records")
-            
             return row_count, columns_schema, stats_list
 
         try:
-            row_count, columns_schema, column_stats_cache = await run_in_threadpool(process_csv, file_path)
+            row_count, columns_schema, column_stats_cache = await run_in_threadpool(
+                process_csv_bytes, contents
+            )
         except Exception as e:
-            # If parsing fails, delete the file and record error
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            # If parsing fails, remove from storage and record error
+            storage.delete(file_ref)
             errors.append({"filename": filename, "error": f"Failed to parse CSV file: {str(e)}"})
             continue
 
         new_csv = CSVFileModel(
             filename=filename,
-            file_path=file_path,
+            file_path=file_ref,   # object key (MinIO) or local path
             file_size=file_size,
             row_count=row_count,
             columns_schema=columns_schema,
@@ -126,7 +124,7 @@ async def upload_csv(
             data_group_id=data_group.id,
             user_id=current_user.id
         )
-        
+
         db.add(new_csv)
         db.commit()
         db.refresh(new_csv)
@@ -164,16 +162,21 @@ def get_csv_file(file_id: int, db: Session = Depends(get_db), current_user: User
 def download_csv_file(file_id: int, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Downloads a specific CSV file.
+    When MinIO is configured, redirects to a presigned URL.
     """
     db_file = db.query(CSVFileModel).filter(CSVFileModel.id == file_id, CSVFileModel.user_id == current_user.id).first()
     if not db_file:
         raise HTTPException(status_code=404, detail="CSV file not found")
-        
+
+    if storage.using_minio:
+        url = storage.get_download_url(db_file.file_path)
+        return RedirectResponse(url=url)
+
+    # Local fallback
     if not os.path.exists(db_file.file_path):
         raise HTTPException(status_code=404, detail="File not found on disk")
-        
     return FileResponse(
-        path=db_file.file_path, 
+        path=db_file.file_path,
         filename=db_file.filename,
         media_type="text/csv"
     )
@@ -181,19 +184,14 @@ def download_csv_file(file_id: int, db: Session = Depends(get_db), current_user:
 @router.delete("/{file_id}")
 def delete_csv_file(file_id: int, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
-    Deletes a CSV file from the database and removes it from disk.
+    Deletes a CSV file from the database and removes it from storage.
     """
     db_file = db.query(CSVFileModel).filter(CSVFileModel.id == file_id, CSVFileModel.user_id == current_user.id).first()
     if not db_file:
         raise HTTPException(status_code=404, detail="CSV file not found")
-        
-    # Remove from disk
-    if os.path.exists(db_file.file_path):
-        try:
-            os.remove(db_file.file_path)
-        except Exception as e:
-            print(f"Failed to delete file {db_file.file_path}: {e}")
-            
+
+    storage.delete(db_file.file_path)
+
     db.delete(db_file)
     db.commit()
 
@@ -225,21 +223,18 @@ async def get_csv_sample_data(file_id: int, req: CSVSampleDataRequest, db: Sessi
     db_file = db.query(CSVFileModel).filter(CSVFileModel.id == file_id, CSVFileModel.user_id == current_user.id).first()
     if not db_file:
         raise HTTPException(status_code=404, detail="CSV file not found")
-        
-    def get_sample(path: str, limit: int):
-        df = pd.read_csv(path, nrows=limit)
-        df = df.where(pd.notnull(df), None)  # type: ignore
-        return list(df.columns), df.to_dict(orient="records")
+
+    def get_sample(file_ref: str, limit: int):
+        with storage.get_stream(file_ref) as stream:
+            df = pd.read_csv(stream, nrows=limit)
+            df = df.where(pd.notnull(df), None)  # type: ignore
+            return list(df.columns), df.to_dict(orient="records")
 
     try:
         columns, rows = await run_in_threadpool(get_sample, db_file.file_path, req.limit)
-        
         return {
             "status": "success",
-            "data": {
-                "columns": columns,
-                "rows": rows
-            }
+            "data": {"columns": columns, "rows": rows}
         }
     except Exception as e:
         return {"status": "error", "message": f"Failed to read sample data: {str(e)}"}
@@ -252,15 +247,12 @@ async def get_csv_column_stats(file_id: int, db: Session = Depends(get_db), curr
     db_file = db.query(CSVFileModel).filter(CSVFileModel.id == file_id, CSVFileModel.user_id == current_user.id).first()
     if not db_file:
         raise HTTPException(status_code=404, detail="CSV file not found")
-        
+
     if db_file.column_stats_cache:
-        return {
-            "status": "success",
-            "data": db_file.column_stats_cache
-        }
-        
-    def calculate_stats(path: str):
-        df = pd.read_csv(path)
+        return {"status": "success", "data": db_file.column_stats_cache}
+
+    def calculate_stats(tmp_path: str):
+        df = pd.read_csv(tmp_path)
         stats_df = df.describe(include='all').T
         stats_df['null_count'] = df.isnull().sum()
         stats_df['dtype'] = df.dtypes.astype(str)
@@ -270,15 +262,13 @@ async def get_csv_column_stats(file_id: int, db: Session = Depends(get_db), curr
         return stats_df.to_dict(orient="records")
 
     try:
-        stats_list = await run_in_threadpool(calculate_stats, db_file.file_path)
-        
+        with storage.download_to_tempfile(db_file.file_path) as tmp_path:
+            stats_list = await run_in_threadpool(calculate_stats, tmp_path)
+
         # Cache it for future
         db_file.column_stats_cache = stats_list
         db.commit()
-        
-        return {
-            "status": "success",
-            "data": stats_list
-        }
+
+        return {"status": "success", "data": stats_list}
     except Exception as e:
         return {"status": "error", "message": f"Failed to calculate column stats: {str(e)}"}

@@ -7,7 +7,8 @@ from ..core.prompt_loader import create_chat_prompt
 from ..schemas.sql_schemas import SQLGenerationResult, ChartConfig
 from langchain_core.runnables import RunnableConfig
 from api.core.database import SessionLocal
-from api.routes.data_group import run_data_group_query, QueryRequest
+from api.schemas.data_group import run_data_group_query_logic, QueryRequest
+from api.models.data_group import DataGroupModel
 import ast
 from ..services.chart_utils import build_chart_payload
 
@@ -109,8 +110,10 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
     try:
         db = SessionLocal()
         try:
+            dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+            user_id = dg.user_id if dg else 0
             req = QueryRequest(query=sql)
-            res = await run_data_group_query(data_group_id, req, db)
+            res = await run_data_group_query_logic(data_group_id, req, db, user_id)
             raw_text = str(res.get("result", "")) if res.get("status") == "success" else ""
             
             lines = raw_text.strip().splitlines()

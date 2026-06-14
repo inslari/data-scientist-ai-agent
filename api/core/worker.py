@@ -21,6 +21,8 @@ import json
 from api.core.database import SessionLocal
 from api.models.job import BackgroundJobModel
 from api.models.project import ProjectModel, ProjectStepModel
+from src.graph import build_graph
+from api.core.database import SQLALCHEMY_DATABASE_URL
 
 # How long the worker sleeps between polling cycles when there is nothing to do.
 POLL_INTERVAL_SECONDS = 5
@@ -51,15 +53,24 @@ async def _process_next_job() -> None:
     Picks the oldest pending job, marks it as running, and executes it.
     Uses a fresh SessionLocal for each poll to avoid stale state.
     """
+    from api.core.database import SQLALCHEMY_DATABASE_URL
+    is_postgres = SQLALCHEMY_DATABASE_URL.startswith("postgresql")
+    
     db = SessionLocal()
     try:
-        # Pick the oldest pending job (FIFO)
-        job: BackgroundJobModel | None = (
+        # Build the query
+        q = (
             db.query(BackgroundJobModel)
             .filter(BackgroundJobModel.status == "pending")
             .order_by(BackgroundJobModel.created_at.asc())
-            .first()
         )
+        
+        # Apply row-level lock (SKIP LOCKED) for Postgres to prevent concurrent worker collisions
+        if is_postgres:
+            q = q.with_for_update(skip_locked=True)
+            
+        # Pick the oldest pending job (FIFO)
+        job: BackgroundJobModel | None = q.first()
 
         if job is None:
             return  # Nothing to do; caller will sleep
@@ -68,6 +79,7 @@ async def _process_next_job() -> None:
         job.status = "running"
         job.updated_at = int(time.time())
         db.commit()
+        db.refresh(job)
 
     finally:
         db.close()
@@ -93,8 +105,6 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     Executes the LangGraph pipeline for a project, streaming results into
     ProjectStepModel rows and updating ProjectModel.status when finished.
     """
-    from src.graph import build_graph
-    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
     project_id = job.project_id
     query = job.query
@@ -116,10 +126,12 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     finally:
         db.close()
 
-    # --- LangGraph execution ---
     error_trace: str | None = None
-    try:
-        async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as saver:
+    is_postgres = SQLALCHEMY_DATABASE_URL.startswith("postgresql")
+
+    async def run_with_saver(saver, is_postgres_db: bool):
+        nonlocal is_resume, error_trace
+        try:
             app = build_graph(checkpointer=saver)
             config = {
                 "configurable": {
@@ -142,22 +154,27 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                     is_resume = False
 
             if force_restart:
-                await saver.conn.execute(
-                    "DELETE FROM checkpoints WHERE thread_id = ?", (str(project_id),)
-                )
-                await saver.conn.execute(
-                    "DELETE FROM writes WHERE thread_id = ?", (str(project_id),)
-                )
-                await saver.conn.commit()
+                if is_postgres_db:
+                    async with saver.conn.connection() as conn:
+                        await conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (str(project_id),))
+                        await conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (str(project_id),))
+                else:
+                    await saver.conn.execute(
+                        "DELETE FROM checkpoints WHERE thread_id = ?", (str(project_id),)
+                    )
+                    await saver.conn.execute(
+                        "DELETE FROM writes WHERE thread_id = ?", (str(project_id),)
+                    )
+                    await saver.conn.commit()
 
             # Clear existing steps for a fresh run
             if not is_resume:
-                db = SessionLocal()
+                db_s = SessionLocal()
                 try:
-                    db.query(ProjectStepModel).filter(ProjectStepModel.project_id == project_id).delete()
-                    db.commit()
+                    db_s.query(ProjectStepModel).filter(ProjectStepModel.project_id == project_id).delete()
+                    db_s.commit()
                 finally:
-                    db.close()
+                    db_s.close()
 
             final_state: dict = {}
 
@@ -181,13 +198,31 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                         else:
                             safe_data[k] = "[Büyük veri kısıtlandı]"
                             continue
-                    try:
-                        json.dumps(v)
-                        safe_data[k] = v
-                    except Exception:
-                        safe_data[k] = str(v)
+                    safe_data[k] = v
 
-                db = SessionLocal()
+                # --- NaN/Inf sanitization ---
+                # psycopg2 uses json.dumps internally and NaN is invalid in standard JSON.
+                # We do a full round-trip: serialize with allow_nan=True to catch everything,
+                # then replace NaN/Inf tokens, then deserialize back to a clean dict.
+                import math
+                def _sanitize(obj):
+                    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                        return None
+                    if isinstance(obj, dict):
+                        return {kk: _sanitize(vv) for kk, vv in obj.items()}
+                    if isinstance(obj, list):
+                        return [_sanitize(i) for i in obj]
+                    return obj
+
+                try:
+                    # Full-depth sanitize then verify no NaN slipped through
+                    safe_data = _sanitize(safe_data)
+                    json.dumps(safe_data, allow_nan=False)  # raises if still invalid
+                except Exception:
+                    # Last resort: convert entire payload to string repr
+                    safe_data = {"_raw": str(safe_data)}
+
+                db_s = SessionLocal()
                 try:
                     step = ProjectStepModel(
                         project_id=project_id,
@@ -195,38 +230,82 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                         step_data=safe_data,
                         created_at=int(time.time()),
                     )
-                    db.add(step)
-                    db.commit()
+                    db_s.add(step)
+                    db_s.commit()
                 finally:
-                    db.close()
+                    db_s.close()
 
             # Mark project completed
-            db = SessionLocal()
+            db_s = SessionLocal()
             try:
-                project = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
-                if project:
-                    project.status = "completed"
-                    project.report = final_state.get("report", "")
-                    db.commit()
+                project_obj = db_s.query(ProjectModel).filter(ProjectModel.id == project_id).first()
+                if project_obj:
+                    project_obj.status = "completed"
+                    project_obj.report = final_state.get("report", "")
+                    db_s.commit()
             finally:
-                db.close()
+                db_s.close()
 
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            error_trace = traceback.format_exc()
+            print(f"[Worker] Graph execution failed for project {project_id}:\n{error_trace}")
+
+            db_s = SessionLocal()
+            try:
+                project_obj = db_s.query(ProjectModel).filter(ProjectModel.id == project_id).first()
+                if project_obj:
+                    project_obj.status = "failed"
+                    project_obj.error = error_trace
+                    db_s.commit()
+            finally:
+                db_s.close()
+
+    # --- Setup saver and run ---
+    try:
+        if is_postgres:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            from psycopg_pool import AsyncConnectionPool
+            from psycopg.rows import dict_row
+            from psycopg import AsyncConnection
+            from typing import Any
+            
+            pg_conn_str = SQLALCHEMY_DATABASE_URL.replace("postgresql+psycopg2://", "postgresql://")
+            
+            pool_kwargs = {
+                "autocommit": True,
+                "row_factory": dict_row,
+            }
+            
+            async with AsyncConnectionPool(
+                pg_conn_str, 
+                kwargs=pool_kwargs
+            ) as pool:
+                saver = AsyncPostgresSaver(pool)  # type: ignore
+                await saver.setup()
+                await run_with_saver(saver, is_postgres_db=True)
+        else:
+            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+            async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as saver:
+                await saver.setup()
+                await run_with_saver(saver, is_postgres_db=False)
     except asyncio.CancelledError:
-        # Worker is shutting down; leave project as 'running' so startup can resume it
         raise
     except Exception:
-        error_trace = traceback.format_exc()
-        print(f"[Worker] Graph execution failed for project {project_id}:\n{error_trace}")
-
-        db = SessionLocal()
-        try:
-            project = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
-            if project:
-                project.status = "failed"
-                project.error = error_trace
-                db.commit()
-        finally:
-            db.close()
+        if not error_trace:
+            error_trace = traceback.format_exc()
+            print(f"[Worker] Saver setup/execution failed for project {project_id}:\n{error_trace}")
+            
+            db_s = SessionLocal()
+            try:
+                project_obj = db_s.query(ProjectModel).filter(ProjectModel.id == project_id).first()
+                if project_obj:
+                    project_obj.status = "failed"
+                    project_obj.error = error_trace
+                    db_s.commit()
+            finally:
+                db_s.close()
 
     _mark_job(job.id, "failed" if error_trace else "completed", error_trace)
 
