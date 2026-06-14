@@ -11,6 +11,8 @@ from api.models.data_group import DataGroupModel, ChatMessageModel
 from api.schemas.data_group import DataGroupResponse
 from api.schemas.chat import ChatRequest, ChatResponse, ChatHistoryResponse
 from src.graphs.talk_to_data_graph import build_ttd_graph
+from api.core.deps import get_current_user
+from api.models.user import UserModel
 
 router = APIRouter(prefix="/data-groups", tags=["Data Groups"])
 
@@ -18,47 +20,62 @@ router = APIRouter(prefix="/data-groups", tags=["Data Groups"])
 from api.schemas.data_group import QueryRequest, get_data_group_schema_logic, run_data_group_query_logic
 
 @router.get("", response_model=List[DataGroupResponse])
-def get_data_groups(db: Session = Depends(get_db)):
+def get_data_groups(db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Returns a list of all data groups, including their associated MCP config or CSV files.
     """
-    return db.query(DataGroupModel).all()
+    return db.query(DataGroupModel).filter(DataGroupModel.user_id == current_user.id).all()
 
 @router.post("/{group_id}/schema")
-async def get_data_group_schema(group_id: int, db: Session = Depends(get_db)):
+async def get_data_group_schema(group_id: int, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Returns the database schema for the specified data group.
     """
-    return await get_data_group_schema_logic(group_id, db)
+    return await get_data_group_schema_logic(group_id, db, current_user.id)
 
 @router.post("/{group_id}/query")
-async def run_data_group_query(group_id: int, req: QueryRequest, db: Session = Depends(get_db)):
+async def run_data_group_query(group_id: int, req: QueryRequest, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Executes a SQL query against the specified data group.
     """
-    return await run_data_group_query_logic(group_id, req, db)
+    return await run_data_group_query_logic(group_id, req, db, current_user.id)
 
 @router.delete("/{group_id}")
-def delete_data_group(group_id: int, db: Session = Depends(get_db)):
+def delete_data_group(group_id: int, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Deletes a data group.
     """
-    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id).first()
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == current_user.id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
-        
-    # If it's a CSV group, delete physical files
+
+    # If it's a CSV group, delete physical files from storage (MinIO or local)
     if db_group.source_type == "csv" and db_group.csv_files:
+        from api.core.storage import storage
         for csv_file in db_group.csv_files:
-            if os.path.exists(csv_file.file_path):
-                try:
-                    os.remove(csv_file.file_path)
-                except Exception as e:
-                    print(f"Failed to delete file {csv_file.file_path}: {e}")
-                    
+            storage.delete(csv_file.file_path)
+
     db.delete(db_group)
     db.commit()
     return {"status": "success", "message": f"Data group with id {group_id} deleted successfully"}
+
+class DataGroupUpdate(BaseModel):
+    name: str
+
+@router.patch("/{group_id}")
+def update_data_group(group_id: int, req: DataGroupUpdate, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
+    """
+    Updates a data group (e.g. renaming).
+    """
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == current_user.id).first()
+    if not db_group:
+        raise HTTPException(status_code=404, detail="Data group not found")
+        
+    db_group.name = req.name
+    db.commit()
+    db.refresh(db_group)
+    return db_group
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,7 +125,7 @@ def _clear_db_cache(db, db_group: DataGroupModel) -> None:
 # POST /{group_id}/refresh-schema
 # ─────────────────────────────────────────────────────────────────────────────
 @router.post("/{group_id}/refresh-schema")
-async def refresh_data_group_schema(group_id: int, db: Session = Depends(get_db)):
+async def refresh_data_group_schema(group_id: int, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Data group'un db_intelligence cache'ini temizler.
     Bir sonraki chat sorgusunda db_context_node yeniden çalışarak
@@ -119,7 +136,7 @@ async def refresh_data_group_schema(group_id: int, db: Session = Depends(get_db)
     - CSV dosyaları güncellendiğinde / yeni dosya eklendiğinde
     - Veri grupları yeniden yapılandırıldığında
     """
-    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id).first()
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == current_user.id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
 
@@ -138,11 +155,11 @@ async def refresh_data_group_schema(group_id: int, db: Session = Depends(get_db)
 # POST /{group_id}/chat
 # ─────────────────────────────────────────────────────────────────────────────
 @router.get("/{group_id}/chat", response_model=ChatHistoryResponse)
-def get_chat_history(group_id: int, db: Session = Depends(get_db)):
+def get_chat_history(group_id: int, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
     Returns the long-term memory and all chat messages for a specific data group.
     """
-    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id).first()
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == current_user.id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
         
@@ -161,6 +178,7 @@ async def chat_with_data_group(
     group_id: int,
     req: ChatRequest,
     db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
 ):
     """
     Talk to Data — Doğal dil sorusunu alır, Talk to Data bağımsız
@@ -174,7 +192,7 @@ async def chat_with_data_group(
     - /refresh-schema çağrıldığında cache temizlenir → bir sonraki sorguda yenilenir.
     - Sunucu yeniden başlatılsa da cache SQLite'ta korunur.
     """
-    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id).first()
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == current_user.id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
 

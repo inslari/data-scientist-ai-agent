@@ -7,7 +7,8 @@ from src.intelligence_engine import DatabaseIntelligenceEngine  # type: ignore[i
 from src.state import AgentState  # type: ignore[import-not-found]
 
 from api.core.database import SessionLocal
-from api.routes.data_group import get_data_group_schema, run_data_group_query, QueryRequest
+from api.schemas.data_group import get_data_group_schema_logic, run_data_group_query_logic, QueryRequest
+from api.models.data_group import DataGroupModel
 
 async def db_context_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """Async node — LangGraph ainvoke ile uyumlu."""
@@ -55,7 +56,12 @@ async def db_context_node(state: AgentState, config: RunnableConfig) -> AgentSta
 async def _fetch_schema_and_samples(data_group_id: int) -> tuple[str, str]:
     db = SessionLocal()
     try:
-        schema_result = await get_data_group_schema(data_group_id, db)
+        dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+        if not dg:
+            raise ValueError(f"DataGroup {data_group_id} not found")
+        user_id = dg.user_id
+
+        schema_result = await get_data_group_schema_logic(data_group_id, db, user_id)
         raw_schema = schema_result.get("schema", "")
         
         table_info = []
@@ -76,7 +82,7 @@ async def _fetch_schema_and_samples(data_group_id: int) -> tuple[str, str]:
             try:
                 query = f'SELECT * FROM "{table}" LIMIT 3'
                 req = QueryRequest(query=query)
-                r = await run_data_group_query(data_group_id, req, db)
+                r = await run_data_group_query_logic(data_group_id, req, db, user_id)
                 if r.get("status") == "success":
                     r_text = str(r.get("result", ""))
                     if len(r_text) > 500:

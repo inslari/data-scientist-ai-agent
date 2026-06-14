@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  # 1. API Servisi
+  api:
+    build: 
+      context: ..
+      dockerfile: Dockerfile
+    container_name: ds-agent-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../data:/app/data
+    env_file:
+      - ../.env
+    restart: unless-stopped
+
+  # 2. Worker Servisi
+  worker:
+    build: 
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+    container_name: ds-agent-worker
+    volumes:
+      - ../data:/app/data
+    env_file:
+      - ../.env
+    restart: unless-stopped
+    depends_on:
+      - api

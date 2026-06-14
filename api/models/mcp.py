@@ -19,5 +19,7 @@ class MCPConfigModel(Base):
     column_stats_cache = Column(String, nullable=True)
     column_stats_cache_updated_at = Column(Integer, nullable=True)  # Unix timestamp
     data_group_id = Column(Integer, ForeignKey("data_groups.id", ondelete="CASCADE"))
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     
     data_group = relationship("DataGroupModel", back_populates="mcp_config")
+    user = relationship("UserModel")

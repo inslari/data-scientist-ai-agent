@@ -10,6 +10,7 @@ class DataGroupBase(BaseModel):
 class DataGroupResponse(DataGroupBase):
     id: int
     created_at: int
+    user_id: Optional[int] = None
 
     mcp_config: Optional[MCPConfigResponse] = None
     csv_files: Optional[List[CSVFileResponse]] = None
@@ -36,8 +37,8 @@ from fastapi import HTTPException
 from api.models.data_group import DataGroupModel
 from api.routes.mcp import _call_mcp_tool
 
-async def get_data_group_schema_logic(group_id: int, db: Session):
-    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id).first()
+async def get_data_group_schema_logic(group_id: int, db: Session, user_id: int):
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == user_id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
         
@@ -62,8 +63,8 @@ async def get_data_group_schema_logic(group_id: int, db: Session):
     
     raise HTTPException(status_code=400, detail="Unknown source type")
 
-async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Session):
-    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id).first()
+async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Session, user_id: int):
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == user_id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
         
@@ -74,15 +75,24 @@ async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Sessi
         return {"status": "success", "result": result_text}
         
     elif db_group.source_type == "csv":
+        from api.core.storage import storage
+        # For each CSV, download to a temp file if on MinIO, then register in DuckDB
+        tmp_paths: list[tuple[str, object]] = []  # (local_path, context_manager_or_none)
+        context_managers = []
         try:
             con = duckdb.connect(database=':memory:')
             for csv_file in db_group.csv_files:
                 table_name = os.path.splitext(csv_file.filename)[0].lower()
                 table_name = re.sub(r'[^a-z0-9_]', '_', table_name)
-                con.execute(f'CREATE VIEW "{table_name}" AS SELECT * FROM read_csv_auto(\'{csv_file.file_path}\')')
-                
+
+                ctx = storage.download_to_tempfile(csv_file.file_path)
+                local_path = ctx.__enter__()
+                context_managers.append(ctx)
+
+                con.execute(f'CREATE VIEW "{table_name}" AS SELECT * FROM read_csv_auto(\'{local_path}\')')
+
             result_df = con.execute(req.query).df()
-            
+
             columns = result_df.columns.tolist()
             output_lines = [f"Columns: {', '.join(columns)}"]
             for row in result_df.itertuples(index=False, name=None):
@@ -90,5 +100,11 @@ async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Sessi
             return {"status": "success", "result": "\n".join(output_lines)}
         except Exception as e:
             return {"status": "error", "result": f"SQL Error: {str(e)}"}
+        finally:
+            for ctx in context_managers:
+                try:
+                    ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
             
     raise HTTPException(status_code=400, detail="Unknown source type")

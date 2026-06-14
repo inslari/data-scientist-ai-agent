@@ -9,6 +9,7 @@ class DataGroupModel(Base):
     name = Column(String, index=True)
     source_type = Column(String)  # "mcp" or "csv"
     created_at = Column(Integer)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
 
     # LLM schema intelligence cache (db_context_node çıktısı)
     db_intelligence_cache = Column(JSON, nullable=True)    # DatabaseIntelligenceModel.model_dump()
@@ -23,6 +24,7 @@ class DataGroupModel(Base):
     csv_files = relationship("CSVFileModel", back_populates="data_group", cascade="all, delete-orphan")
     projects = relationship("ProjectModel", back_populates="data_group")
     chat_messages = relationship("ChatMessageModel", back_populates="data_group", cascade="all, delete-orphan", order_by="ChatMessageModel.created_at")
+    user = relationship("UserModel")
 
 
 class ChatMessageModel(Base):

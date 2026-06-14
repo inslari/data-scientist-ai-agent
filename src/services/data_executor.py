@@ -340,14 +340,22 @@ def _infer_dtypes(df: pd.DataFrame) -> pd.DataFrame:
 # ── MCP async fetcher (chunked) ──────────────────────────────
 async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> dict[str, str]:
     from api.core.database import SessionLocal
-    from api.routes.data_group import run_data_group_query, QueryRequest
+    from api.schemas.data_group import run_data_group_query_logic, QueryRequest
+    from api.models.data_group import DataGroupModel
     
+    db_conn = SessionLocal()
+    try:
+        dg = db_conn.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+        user_id = dg.user_id if dg else 0
+    finally:
+        db_conn.close()
+
     async def fetch_one(table: str, db_name: str) -> tuple[str, str]:
         db = SessionLocal()
         try:
             try:
                 req = QueryRequest(query=f'SELECT COUNT(*) FROM "{table}"')
-                count_result = await run_data_group_query(data_group_id, req, db)
+                count_result = await run_data_group_query_logic(data_group_id, req, db, user_id)
                 count_text = str(count_result.get("result", "")) if count_result.get("status") == "success" else ""
                 total_rows = _extract_count(count_text)
             except Exception:
@@ -357,7 +365,7 @@ async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> 
 
             if total_rows <= CHUNK_SIZE:
                 req = QueryRequest(query=f'SELECT * FROM "{table}"')
-                result = await run_data_group_query(data_group_id, req, db)
+                result = await run_data_group_query_logic(data_group_id, req, db, user_id)
                 if result.get("status") == "success":
                     return table, str(result.get("result", ""))
                 return table, ""
@@ -370,7 +378,7 @@ async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> 
                 limit = min(CHUNK_SIZE, fetch_limit - offset)
                 query = f'SELECT * FROM "{table}" LIMIT {limit} OFFSET {offset}'
                 req = QueryRequest(query=query)
-                result = await run_data_group_query(data_group_id, req, db)
+                result = await run_data_group_query_logic(data_group_id, req, db, user_id)
                 
                 chunk_text = str(result.get("result", "")) if result.get("status") == "success" else ""
 
@@ -826,15 +834,18 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                         SAFE_CHUNK_SIZE = 10_000
                         
                         from api.core.database import SessionLocal
-                        from api.routes.data_group import run_data_group_query, QueryRequest
+                        from api.schemas.data_group import run_data_group_query_logic, QueryRequest
+                        from api.models.data_group import DataGroupModel
                         db_conn = SessionLocal()
                         try:
+                            dg = db_conn.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+                            user_id = dg.user_id if dg else 0
                             for offset in range(0, MAX_FETCH_ROWS, SAFE_CHUNK_SIZE):
                                 limit = min(SAFE_CHUNK_SIZE, MAX_FETCH_ROWS - offset)
                                 chunk_sql = f"{base_join_sql} LIMIT {limit} OFFSET {offset}"
                                 
                                 req = QueryRequest(query=chunk_sql)
-                                result = await run_data_group_query(data_group_id, req, db_conn)
+                                result = await run_data_group_query_logic(data_group_id, req, db_conn, user_id)
                                 chunk_text = str(result.get("result", "")) if result.get("status") == "success" else ""
                                 
                                 # Eğer data dönmediyse break

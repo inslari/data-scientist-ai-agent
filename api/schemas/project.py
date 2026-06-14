@@ -32,6 +32,7 @@ class ProjectUpdate(BaseModel):
 
 class ProjectResponse(ProjectBase):
     id: int
+    user_id: Optional[int] = None
     status: str
     report: Optional[str] = None
     error: Optional[str] = None
