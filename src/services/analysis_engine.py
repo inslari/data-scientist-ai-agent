@@ -10,7 +10,7 @@ Mevcut DuckDBEngine.profile_table() çıktısını ALIR ve üstüne ekler:
   - clustering         : PCA 2D + KMeans (scatter için)
 
 Model EĞİTMEZ. Veriyi anlatır. Hiçbir şeyi silmez/değiştirmez.
-Çıktı: frontend'in Plotly ile çizeceği JSON.
+Çıktı: frontend'in recharts ile çizeceği JSON.
 
 Dataset-agnostik: hiçbir kolon adı hardcode edilmez.
 """
@@ -37,22 +37,31 @@ def _safe_float(v: Any) -> Optional[float]:
         return None
 
 
+def _get_numeric_cols(profile: dict) -> list[str]:
+    """profile dict'inden sayısal kolon listesini çıkarır."""
+    summary = profile.get("summary", {})
+    return summary.get("numeric_columns", [])
+
+
 # ═══════════════════════════════════════════════════════════
-#  1. KORELASYON MATRİSİ (Plotly heatmap için)
+#  1. KORELASYON MATRİSİ (heatmap için)
 # ═══════════════════════════════════════════════════════════
 
-def compute_correlation(df: pd.DataFrame, numeric_cols: list[str]) -> Optional[dict]:
+def compute_correlation(df: pd.DataFrame, profile: dict, target_col: Optional[str] = None) -> Optional[dict]:
     """
     Sayısal sütunlar arası Pearson korelasyon matrisi.
 
-    Returns (Plotly heatmap formatı):
+    Returns (heatmap formatı):
         {
-          "columns": ["age", "tenure", ...],   # x ve y ekseni
-          "matrix":  [[1.0, 0.3, ...], ...],   # z değerleri
-          "top_pairs": [{"a","b","corr"}, ...] # en güçlü ilişkiler (özet için)
+          "correlation_matrix": {
+            "columns": ["age", "tenure", ...],   # x ve y ekseni
+            "matrix":  [[1.0, 0.3, ...], ...],   # z değerleri
+            "top_pairs": [{"a","b","corr"}, ...] # en güçlü ilişkiler (özet için)
+          }
         }
     None: 2'den az sayısal sütun varsa
     """
+    numeric_cols = _get_numeric_cols(profile)
     cols = [c for c in numeric_cols if c in df.columns]
     if len(cols) < 2:
         return None
@@ -80,33 +89,39 @@ def compute_correlation(df: pd.DataFrame, numeric_cols: list[str]) -> Optional[d
     pairs.sort(key=lambda p: abs(p["corr"]), reverse=True)
 
     return {
-        "columns": cols,
-        "matrix": matrix,
-        "top_pairs": pairs[:10],  # en güçlü 10 ilişki
+        "correlation_matrix": {
+            "columns": cols,
+            "matrix": matrix,
+            "top_pairs": pairs[:10],  # en güçlü 10 ilişki
+        }
     }
 
 
 # ═══════════════════════════════════════════════════════════
-#  2. HİSTOGRAMLAR (Plotly bar/histogram için)
+#  2. HİSTOGRAMLAR (bar/histogram için)
 # ═══════════════════════════════════════════════════════════
 
 def compute_histograms(
     df: pd.DataFrame,
-    numeric_cols: list[str],
+    profile: dict,
+    target_col: Optional[str] = None,
     n_bins: int = 20,
-) -> dict:
+) -> Optional[dict]:
     """
     Her sayısal sütun için histogram bin'leri.
 
     Returns:
         {
-          "age": {
-            "bin_edges": [20, 25, 30, ...],   # bin sınırları
-            "counts":    [15, 42, 38, ...],   # her bin'deki sayı
-          },
-          ...
+          "histograms": {
+            "age": {
+              "bin_edges": [20, 25, 30, ...],   # bin sınırları
+              "counts":    [15, 42, 38, ...],   # her bin'deki sayı
+            },
+            ...
+          }
         }
     """
+    numeric_cols = _get_numeric_cols(profile)
     result = {}
     for col in numeric_cols:
         if col not in df.columns:
@@ -122,7 +137,9 @@ def compute_histograms(
             }
         except Exception:
             continue
-    return result
+    if not result:
+        return None
+    return {"histograms": result}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -131,8 +148,8 @@ def compute_histograms(
 
 def compute_target_relations(
     df: pd.DataFrame,
-    target_col: str,
-    numeric_cols: list[str],
+    profile: dict,
+    target_col: Optional[str] = None,
 ) -> Optional[dict]:
     """
     Hedefle en ilişkili sayısal sütunlar.
@@ -141,13 +158,17 @@ def compute_target_relations(
 
     Returns:
         {
-          "target": "churn",
-          "relations": [{"feature": "tenure", "score": 0.42}, ...]  # |score| azalan
+          "target_relations": {
+            "target": "churn",
+            "target_type": "categorical",
+            "relations": [{"feature": "tenure", "score": 0.42}, ...]  # |score| azalan
+          }
         }
     """
-    if target_col not in df.columns:
+    if not target_col or target_col not in df.columns:
         return None
 
+    numeric_cols = _get_numeric_cols(profile)
     feats = [c for c in numeric_cols if c in df.columns and c != target_col]
     if not feats:
         return None
@@ -182,19 +203,22 @@ def compute_target_relations(
     relations.sort(key=lambda r: abs(r["score"]), reverse=True)
 
     return {
-        "target": target_col,
-        "target_type": "numeric" if target_is_numeric else "categorical",
-        "relations": relations,
+        "target_relations": {
+            "target": target_col,
+            "target_type": "numeric" if target_is_numeric else "categorical",
+            "relations": relations,
+        }
     }
 
 
 # ═══════════════════════════════════════════════════════════
-#  4. KÜMELEME (PCA 2D + KMeans, Plotly scatter için)
+#  4. KÜMELEME (PCA 2D + KMeans, scatter için)
 # ═══════════════════════════════════════════════════════════
 
 def compute_clustering(
     df: pd.DataFrame,
-    numeric_cols: list[str],
+    profile: dict,
+    target_col: Optional[str] = None,
     max_k: int = 5,
     sample_size: int = 2000,
 ) -> Optional[dict]:
@@ -204,12 +228,15 @@ def compute_clustering(
 
     Returns:
         {
-          "points": [{"x": .., "y": .., "cluster": 0}, ...],
-          "n_clusters": 3,
-          "explained_variance": 0.78,   # PCA 2 bileşenin açıkladığı oran
+          "clustering": {
+            "points": [{"x": .., "y": .., "cluster": 0}, ...],
+            "n_clusters": 3,
+            "explained_variance": 0.78,   # PCA 2 bileşenin açıkladığı oran
+          }
         }
     None: 2'den az sayısal sütun veya yetersiz veri
     """
+    numeric_cols = _get_numeric_cols(profile)
     cols = [c for c in numeric_cols if c in df.columns]
     if len(cols) < 2:
         return None
@@ -259,15 +286,152 @@ def compute_clustering(
         ]
 
         return {
-            "points": points,
-            "n_clusters": best_k,
-            "silhouette": _safe_float(best_score),
-            "explained_variance": round(explained, 4),
+            "clustering": {
+                "points": points,
+                "n_clusters": best_k,
+                "silhouette": _safe_float(best_score),
+                "explained_variance": round(explained, 4),
+            }
         }
     except ImportError:
         return None
     except Exception:
         return None
+
+
+# ═══════════════════════════════════════════════════════════
+#  5. HEDEF GRUPLARI (box + violin, sınıflandırma için)
+# ═══════════════════════════════════════════════════════════
+
+def compute_target_groups(
+    df: pd.DataFrame,
+    profile: dict,
+    target_col: Optional[str] = None,
+    sample_size: int = 5000,
+) -> Optional[dict]:
+    """
+    Her sayısal feature'ın hedef sınıflarına göre dağılımı.
+    Box istatistikleri (min, q25, median, q75, max, outliers) +
+    violin yoğunluk eğrisi (~25 nokta).
+
+    Sadece KATEGORİK hedef için çalışır. Sayısal hedefte None döner.
+
+    Returns:
+        {
+          "target_groups": {
+            "target_col": "Churn",
+            "groups": ["0", "1"],
+            "features": {
+              "tenure": {
+                "0": {"min": .., "q25": .., "median": .., "q75": .., "max": ..,
+                      "outliers": [...], "density": [{"x": .., "y": ..}, ...]},
+                "1": {...}
+              }
+            }
+          }
+        }
+    """
+    if not target_col or target_col not in df.columns:
+        return None
+
+    # Hedef tipi tespiti (compute_target_relations deseni)
+    target = df[target_col]
+    target_num = pd.to_numeric(target, errors="coerce")
+    target_is_numeric = target_num.notna().sum() > 0.8 * len(target)
+
+    if target_is_numeric:
+        return None  # Regresyon hedefinde uygulanamaz
+
+    numeric_cols = _get_numeric_cols(profile)
+    feats = [c for c in numeric_cols if c in df.columns and c != target_col]
+    if not feats:
+        return None
+
+    # Büyük veride örnekle (compute_clustering deseni, sınır 5000)
+    sub = df[[target_col] + feats].copy()
+    if len(sub) > sample_size:
+        sub = sub.sample(n=sample_size, random_state=42)
+
+    groups = sorted([str(g) for g in target.dropna().unique()])
+    features_data: dict[str, dict] = {}
+
+    for feat in feats:
+        feat_series = pd.to_numeric(sub[feat], errors="coerce")
+        feat_data: dict[str, dict] = {}
+
+        for grp in groups:
+            mask = sub[target_col].astype(str) == grp
+            vals = feat_series[mask].dropna()
+
+            if len(vals) < 2:
+                continue
+
+            q25 = float(vals.quantile(0.25))
+            q75 = float(vals.quantile(0.75))
+            iqr = q75 - q25
+            lower_fence = q25 - 1.5 * iqr
+            upper_fence = q75 + 1.5 * iqr
+
+            outlier_vals = vals[(vals < lower_fence) | (vals > upper_fence)]
+            # Outlier noktalarını sınırla (çok fazla olmasın)
+            outliers = [_safe_float(v) for v in outlier_vals.head(50)]
+            outliers = [o for o in outliers if o is not None]
+
+            # Violin density: np.histogram density=True, ~25 bin
+            try:
+                n_density_bins = 25
+                counts, edges = np.histogram(vals, bins=n_density_bins, density=True)
+                density = []
+                for i in range(len(counts)):
+                    mid_x = (edges[i] + edges[i + 1]) / 2
+                    density.append({
+                        "x": _safe_float(mid_x),
+                        "y": _safe_float(counts[i]),
+                    })
+            except Exception:
+                density = []
+
+            feat_data[grp] = {
+                "min": _safe_float(vals.min()),
+                "q25": _safe_float(q25),
+                "median": _safe_float(vals.median()),
+                "q75": _safe_float(q75),
+                "max": _safe_float(vals.max()),
+                "outliers": outliers,
+                "density": density,
+            }
+
+        if feat_data:
+            features_data[feat] = feat_data
+
+    if not features_data:
+        return None
+
+    return {
+        "target_groups": {
+            "target_col": target_col,
+            "groups": groups,
+            "features": features_data,
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+#  ANALİZ MODÜL KAYIT DEFTERİ (Registry)
+# ═══════════════════════════════════════════════════════════
+
+# Analiz modülleri. "general" her veride çalışır.
+# "fintech" ileride doldurulacak (WoE/IV, target-rate vb.) — şimdilik boş yuva.
+ANALYSIS_MODULES: dict[str, list] = {
+    "general": [
+        compute_correlation,
+        compute_histograms,
+        compute_target_relations,
+        compute_clustering,
+        compute_target_groups,
+    ],
+    "fintech": [],
+}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -278,29 +442,37 @@ def run_deep_analysis(
     df: pd.DataFrame,
     profile: dict,
     target_col: Optional[str] = None,
+    analysis_type: str = "general",
 ) -> dict:
     """
     profile_table çıktısını ALIR, üstüne analiz katmanları ekler.
+
+    Her compute_* fonksiyonu aynı imzayı kullanır:
+        compute_x(df, profile, target_col) -> dict | None
+
+    Her fonksiyon kendi key'ini içeren bir dict döndürür
+    (örn. {"correlation_matrix": {...}}).
+    None dönerse o analiz atlanır.
 
     Args:
         df: ham veri (parquet'ten okunmuş)
         profile: DuckDBEngine.profile_table() çıktısı
         target_col: hedef sütun (opsiyonel)
+        analysis_type: registry'den hangi modül grubunu çalıştır ("general", "fintech")
 
     Returns:
         profile + correlation_matrix + histograms + target_relations + clustering
     """
-    summary = profile.get("summary", {})
-    numeric_cols = summary.get("numeric_columns", [])
-
     # Mevcut profile'ı koru, üstüne ekle
     analysis = dict(profile)
 
-    analysis["correlation_matrix"] = compute_correlation(df, numeric_cols)
-    analysis["histograms"] = compute_histograms(df, numeric_cols)
-    analysis["clustering"] = compute_clustering(df, numeric_cols)
-
-    if target_col:
-        analysis["target_relations"] = compute_target_relations(df, target_col, numeric_cols)
+    for fn in ANALYSIS_MODULES.get(analysis_type, []):
+        try:
+            result = fn(df, profile, target_col)
+            if result and isinstance(result, dict):
+                analysis.update(result)
+        except Exception as e:
+            print(f"[analysis_engine] {fn.__name__} hatası: {e}")
+            continue
 
     return analysis
