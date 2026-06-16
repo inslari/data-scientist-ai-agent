@@ -34,6 +34,7 @@ _MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
 _MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
 _MINIO_BUCKET = os.getenv("MINIO_BUCKET", "ds-agent-csvs")
 _MINIO_SECURE = os.getenv("MINIO_SECURE", "true").lower() == "true"
+_ENVIRONMENT = os.getenv("ENVIRONMENT", "local").lower()
 
 # Presigned URL expiry in seconds (1 hour)
 _PRESIGNED_EXPIRY = 3600
@@ -43,7 +44,7 @@ class StorageService:
     """Unified file storage: MinIO (S3-compatible) or local filesystem."""
 
     def __init__(self) -> None:
-        self._minio = bool(_MINIO_ENDPOINT)
+        self._minio = bool(_MINIO_ENDPOINT) and _ENVIRONMENT in ("prod", "production")
         if self._minio:
             import boto3
             from botocore.client import Config

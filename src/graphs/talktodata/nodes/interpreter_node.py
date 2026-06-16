@@ -4,6 +4,8 @@ from langchain_core.messages import HumanMessage
 
 from ..state import TTDState, _InterpreterResult
 from ..utils import _get_llm, _StructuredJsonParser
+from src.domains import get_active_pack
+from src.domains.base import MerchantContext
 
 TTD_INTERPRETER_SYSTEM = """\
 You are a Data Scientist and Analysis Expert. The user has asked a question, and data has been fetched from the database to answer it.
@@ -46,6 +48,19 @@ async def ttd_interpreter_node(state: TTDState, config: RunnableConfig) -> TTDSt
             return {**state, "sql_query_summary": summary, "current_step": "ttd_interpreter_node"}  # type: ignore[return-value]
         return {**state, "current_step": "ttd_interpreter_node"}  # type: ignore[return-value]
 
+    # Domain pack (varsa) yorum merceğini system prompt'a ekle (veri yorumlama için)
+    system_prompt = TTD_INTERPRETER_SYSTEM
+    if intent not in ("chitchat", "schema_question"):
+        try:
+            pack = get_active_pack(state.get("domain_pack"))
+            mc = MerchantContext.from_dict(state.get("merchant_context"))
+            if pack.name != "none" and mc is not None:
+                lens = pack.interpret_lens(mc, intent)
+                if lens:
+                    system_prompt = TTD_INTERPRETER_SYSTEM + "\n\n" + lens.system_suffix
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[TTD] Domain pack yorum merceği başarısız ({e}); atlanıyor.")
+
     try:
         llm = _get_llm(temperature=0.2)
 
@@ -69,7 +84,7 @@ async def ttd_interpreter_node(state: TTDState, config: RunnableConfig) -> TTDSt
             )
 
         raw_response = llm.invoke([
-            ("system", TTD_INTERPRETER_SYSTEM),
+            ("system", system_prompt),
             HumanMessage(content=user_msg),
         ])
         # Accept both JSON and plain-text responses from the LLM

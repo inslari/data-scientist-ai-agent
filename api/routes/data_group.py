@@ -3,7 +3,7 @@ import json
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel
 
 from api.core.database import get_db
@@ -11,6 +11,7 @@ from api.models.data_group import DataGroupModel, ChatMessageModel
 from api.schemas.data_group import DataGroupResponse
 from api.schemas.chat import ChatRequest, ChatResponse, ChatHistoryResponse
 from src.graphs.talk_to_data_graph import build_ttd_graph
+from src.core.config import settings as _ds_settings
 from api.core.deps import get_current_user
 from api.models.user import UserModel
 
@@ -60,18 +61,28 @@ def delete_data_group(group_id: int, db: Session = Depends(get_db), current_user
     return {"status": "success", "message": f"Data group with id {group_id} deleted successfully"}
 
 class DataGroupUpdate(BaseModel):
-    name: str
+    name: Optional[str] = None
+    domain_pack: Optional[str] = None   # "" / None cleared via explicit send → global DOMAIN_PACK
+    domain_doc: Optional[str] = None    # markdown dataset context; "" / None clears it
 
 @router.patch("/{group_id}")
 def update_data_group(group_id: int, req: DataGroupUpdate, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
-    Updates a data group (e.g. renaming).
+    Updates a data group (e.g. renaming or setting its domain pack).
+    Only fields explicitly present in the request body are modified.
     """
     db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == current_user.id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")
-        
-    db_group.name = req.name
+
+    fields_set = req.model_fields_set
+    if "name" in fields_set and req.name is not None:
+        db_group.name = req.name
+    if "domain_pack" in fields_set:
+        db_group.domain_pack = req.domain_pack or None
+    if "domain_doc" in fields_set:
+        db_group.domain_doc = req.domain_doc or None
+
     db.commit()
     db.refresh(db_group)
     return db_group
@@ -231,6 +242,8 @@ async def chat_with_data_group(
             "messages":         messages,
             "long_term_memory": db_group.long_term_memory,
             "data_group_id":    group_id,
+            "domain_pack":      db_group.domain_pack or _ds_settings.DOMAIN_PACK,
+            "domain_doc":       db_group.domain_doc or "",
         }
 
         if cached:

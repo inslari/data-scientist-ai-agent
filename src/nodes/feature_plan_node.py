@@ -5,6 +5,9 @@ from ..state import AgentState
 from ..core.llm import get_llm
 from ..core.prompt_loader import create_chat_prompt
 from ..schemas.feature_plan_schemas import FeaturePlan
+from ..domains import get_active_pack
+from ..domains.base import MerchantContext, trim_doc
+from ..domains.schemas import MerchantAnalysis
 
 load_dotenv(override=True)
 
@@ -84,6 +87,33 @@ Bunlardan türetilmiş yeni feature'lar da leakage taşır."""
 Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi üret.
 Önceki planla aynı yapıyı tekrarlama."""
 
+    # Domain pack (varsa) feature ipuçları — yoksa boş string
+    domain_hint = ""
+    try:
+        pack = get_active_pack(state.get("domain_pack"))
+        mc = MerchantContext.from_dict(state.get("merchant_context"))
+        analysis = MerchantAnalysis.from_dict(state.get("merchant_analysis"))
+        if pack.name != "none" and (mc is not None or analysis is not None):
+            hint = pack.feature_hints(mc, db_intelligence, analysis)
+            if hint and hint.strip():
+                domain_hint = "\n" + hint
+                src = "agentic bulgular" if analysis else "statik ipuçları"
+                print(f"[feature_plan] Domain pack '{pack.name}' feature ipuçları eklendi ({src}).")
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[feature_plan] Domain pack feature ipucu başarısız ({e}); atlanıyor.")
+
+    # Per-data-group domain document (dataset context) — pack'ten bağımsız enjekte edilir
+    domain_doc = ""
+    doc_text = trim_doc(state.get("domain_doc"), max_chars=4000)
+    if doc_text:
+        domain_doc = (
+            "\n\n--- DATASET DESCRIPTION (provided by the user) ---\n"
+            f"{doc_text}\n"
+            "Use this to choose meaningful, domain-aware features and the right target; "
+            "only reference columns that exist in the schema above."
+        )
+        print("[feature_plan] Dataset domain_doc feature plan'a eklendi.")
+
     chain = FEATURE_PLAN_PROMPT | structured_llm
 
     plan: FeaturePlan = chain.invoke({  # type: ignore[assignment]
@@ -92,7 +122,9 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
         "tables_summary": tables_summary,
         "target_hint": target_hint,
         "retry_context": retry_context,
-        "leakage_hint": leakage_hint
+        "leakage_hint": leakage_hint,
+        "domain_hint": domain_hint,
+        "domain_doc": domain_doc,
     })
 
     # ── Post-processing: Dinamik target validation ────────────────────────────

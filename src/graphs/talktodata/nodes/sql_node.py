@@ -11,6 +11,8 @@ from api.schemas.data_group import (
 
 from ..state import TTDState, _SQLGenerationResult
 from ..utils import _get_llm, _build_column_profiles, _StructuredJsonParser
+from src.domains import get_active_pack
+from src.domains.base import MerchantContext
 
 TTD_SQL_SYSTEM = """\
 You are a SQL database expert. Available databases: {db_providers}.
@@ -81,6 +83,8 @@ STEP 3 — Choose one of three cases:
 --- Column Semantic Profiles ---
 {column_profiles}
 
+{domain_hint}
+
 {validation_fix_hint}
 """
 
@@ -123,6 +127,16 @@ async def ttd_sql_node(state: TTDState, config: RunnableConfig) -> TTDState:
             f"Please analyze the error and correct the query."
         )
 
+    # Domain pack (varsa) query ipuçları — yoksa boş string
+    domain_hint = ""
+    try:
+        pack = get_active_pack(state.get("domain_pack"))
+        mc = MerchantContext.from_dict(state.get("merchant_context"))
+        if pack.name != "none" and mc is not None:
+            domain_hint = pack.query_hints(mc, db_intelligence) or ""
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[TTD] Domain pack query ipucu başarısız ({e}); atlanıyor.")
+
     # Validator'dan gelen düzeltme ipucunu ekle
     validation_fix_hint = ""
     if state.get("validation_fix_hint"):
@@ -148,6 +162,7 @@ async def ttd_sql_node(state: TTDState, config: RunnableConfig) -> TTDState:
             "chat_history":        chat_history_str,
             "long_term_memory":    memory_str,
             "validation_fix_hint": validation_fix_hint,
+            "domain_hint":         domain_hint,
         }
         sql_result: _SQLGenerationResult
         # Strategy 1: structured output (tool-call based — most reliable when supported)

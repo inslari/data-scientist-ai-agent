@@ -18,6 +18,12 @@ class DataGroupResponse(DataGroupBase):
     # Schema cache metadata — frontend'de "Son Analiz: ..." göstermek için
     schema_cache_updated_at: Optional[int] = None   # Unix timestamp, None = henüz analiz yok
 
+    # Domain (sector) pack for this dataset. None/empty = global DOMAIN_PACK.
+    domain_pack: Optional[str] = None
+
+    # Domain/dataset description (markdown) used as pipeline context. None = none.
+    domain_doc: Optional[str] = None
+
     model_config = ConfigDict(from_attributes=True)
 
 

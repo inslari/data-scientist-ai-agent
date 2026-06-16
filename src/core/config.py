@@ -12,7 +12,12 @@ class Settings:
     MCP_SERVER_PATH: str = os.getenv("MCP_SERVER_PATH", "/mcp")
     RANDOM_SEED : int = 42
     ENABLE_DETERMINISM : bool = True
-    
+
+    # Deployment environment. When set to "local" (env ENVIRONMENT=local), the
+    # default dataset DB points at data/financial.db so the MCP server serves the
+    # financial transaction dataset locally without any .env DB overrides.
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT", "").strip().lower()
+
     @property
     def MCP_SERVER_URL(self) -> str:
         return f"http://{self.MCP_SERVER_HOST}:{self.MCP_SERVER_PORT}{self.MCP_SERVER_PATH}"
@@ -37,6 +42,14 @@ class Settings:
             }
         }
 
+    # Absolute path to data/financial.db — used by the MCP server in local mode
+    # (ENVIRONMENT=local) so only the MCP tool layer serves the financial dataset,
+    # while the rest of the app keeps using DATABASES (e.g. PostgreSQL).
+    LOCAL_FINANCIAL_DB_PATH: str = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "data", "financial.db"
+    )
+
     HISTORY_DB_PROVIDER: str = os.getenv("HISTORY_DB_PROVIDER", "sqlite")
     HISTORY_DB_CONNECTION_STRING: str = os.getenv(
         "HISTORY_DB_CONNECTION_STRING",
@@ -49,5 +62,12 @@ class Settings:
     INTELLIGENCE_ENGINE_PROVIDER: str = os.getenv("INTELLIGENCE_ENGINE_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))
     INTELLIGENCE_ENGINE_MODEL: str = os.getenv("INTELLIGENCE_ENGINE_MODEL", "gpt-4o")
     DEFAULT_TEMPERATURE: float = 0.0
+
+    # Domain (Sector) Pack Configuration
+    # Selects the active Merchant/Domain Intelligence pack that augments the
+    # pipeline (intent → query → feature engineering → interpretation).
+    # "none" → NullDomainPack (no behavioral change; pipeline stays domain-agnostic).
+    # Per-run override is possible via initial_state["domain_pack"].
+    DOMAIN_PACK: str = os.getenv("DOMAIN_PACK", "none")
 
 settings = Settings()

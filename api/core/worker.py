@@ -21,7 +21,9 @@ import json
 from api.core.database import SessionLocal
 from api.models.job import BackgroundJobModel
 from api.models.project import ProjectModel, ProjectStepModel
+from api.models.data_group import DataGroupModel
 from src.graph import build_graph
+from src.core.config import settings
 from api.core.database import SQLALCHEMY_DATABASE_URL
 
 # How long the worker sleeps between polling cycles when there is nothing to do.
@@ -112,6 +114,10 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     is_resume = bool(job.is_resume)
     force_restart = bool(job.force_restart)
 
+    # Resolve domain pack: project override → data group → global DOMAIN_PACK
+    resolved_domain_pack = settings.DOMAIN_PACK
+    domain_doc = ""
+
     db = SessionLocal()
     try:
         project: ProjectModel | None = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
@@ -119,6 +125,14 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             print(f"[Worker] Project {project_id} not found; skipping job {job.id}.")
             _mark_job(job.id, "failed", "Project not found")
             return
+
+        dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first() if data_group_id else None
+        if project.domain_pack:
+            resolved_domain_pack = project.domain_pack
+        elif dg and dg.domain_pack:
+            resolved_domain_pack = dg.domain_pack
+        domain_doc = (dg.domain_doc if dg else None) or ""
+        print(f"[Worker] Resolved domain_pack='{resolved_domain_pack}', domain_doc={'yes' if domain_doc else 'no'} for project {project_id}")
 
         project.status = "running"
         project.error = None
@@ -140,7 +154,10 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                 }
             }
 
-            initial_state: dict | None = {"user_query": query}
+            # domain_pack resolved above: project override → data group → global default
+            domain_pack = resolved_domain_pack
+            # domain_doc resolved above from the data group (dataset description)
+            initial_state: dict | None = {"user_query": query, "domain_pack": domain_pack, "domain_doc": domain_doc}
 
             if is_resume:
                 try:

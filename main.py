@@ -17,6 +17,7 @@ from api.routes.csv import router as csv_router
 from api.routes.data_group import router as data_group_router
 from api.routes.project import router as project_router
 from api.routes.auth import router as auth_router
+from api.routes.domain_pack import router as domain_pack_router
 
 from contextlib import asynccontextmanager
 import asyncio
@@ -66,6 +67,7 @@ app.include_router(project_router)
 app.include_router(mcp_router)
 app.include_router(csv_router)
 app.include_router(auth_router)
+app.include_router(domain_pack_router)
 
 
 @app.get("/health", tags=["System"])
