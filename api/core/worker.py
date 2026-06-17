@@ -113,6 +113,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     force_restart = bool(job.force_restart)
 
     db = SessionLocal()
+    project_intent = None
     try:
         project: ProjectModel | None = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
         if not project:
@@ -120,6 +121,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             _mark_job(job.id, "failed", "Project not found")
             return
 
+        project_intent = getattr(project, "intent", None)
         project.status = "running"
         project.error = None
         db.commit()
@@ -141,6 +143,8 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             }
 
             initial_state: dict | None = {"user_query": query}
+            if project_intent:
+                initial_state["intent"] = project_intent
 
             if is_resume:
                 try:

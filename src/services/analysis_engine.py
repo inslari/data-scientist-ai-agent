@@ -49,52 +49,143 @@ def _get_numeric_cols(profile: dict) -> list[str]:
 
 def compute_correlation(df: pd.DataFrame, profile: dict, target_col: Optional[str] = None) -> Optional[dict]:
     """
-    Sayısal sütunlar arası Pearson korelasyon matrisi.
+    Sayısal sütunlar arası Pearson korelasyon matrisi +
+    kategorik sütunlar dahil birleşik matris (Cramér's V).
 
-    Returns (heatmap formatı):
+    Returns:
         {
-          "correlation_matrix": {
-            "columns": ["age", "tenure", ...],   # x ve y ekseni
-            "matrix":  [[1.0, 0.3, ...], ...],   # z değerleri
-            "top_pairs": [{"a","b","corr"}, ...] # en güçlü ilişkiler (özet için)
+          "correlation_matrix": {          # geriye dönük uyumlu (sadece sayısal)
+            "columns": [...], "matrix": [...], "top_pairs": [...]
+          },
+          "correlation_full": {            # sayısal + kategorik birleşik
+            "columns": [...], "matrix": [...], "top_pairs": [...]
           }
         }
-    None: 2'den az sayısal sütun varsa
+    None: 2'den az sütun varsa
     """
     numeric_cols = _get_numeric_cols(profile)
     cols = [c for c in numeric_cols if c in df.columns]
-    if len(cols) < 2:
-        return None
 
-    sub = df[cols].apply(pd.to_numeric, errors="coerce")
-    corr = sub.corr(method="pearson")
+    # --- Pearson (mevcut davranış, geriye dönük uyumlu) ---
+    pearson_result = None
+    if len(cols) >= 2:
+        sub = df[cols].apply(pd.to_numeric, errors="coerce")
+        corr = sub.corr(method="pearson")
 
-    # Matrisi listeye çevir (NaN → 0, heatmap render edilebilsin)
-    matrix = []
-    for a in cols:
-        row = []
-        for b in cols:
-            v = corr.loc[a, b]
-            row.append(_safe_float(v) if _safe_float(v) is not None else 0.0)
-        matrix.append(row)
+        matrix = []
+        for a in cols:
+            row = []
+            for b in cols:
+                v = corr.loc[a, b]
+                row.append(_safe_float(v) if _safe_float(v) is not None else 0.0)
+            matrix.append(row)
 
-    # En güçlü ilişkiler (mutlak değer, kendisiyle olan 1.0'ları hariç tut)
-    pairs = []
-    for i, a in enumerate(cols):
-        for j, b in enumerate(cols):
-            if i < j:  # her çifti bir kez
-                v = _safe_float(corr.loc[a, b])
-                if v is not None:
-                    pairs.append({"a": a, "b": b, "corr": v})
-    pairs.sort(key=lambda p: abs(p["corr"]), reverse=True)
+        pairs = []
+        for i, a in enumerate(cols):
+            for j, b in enumerate(cols):
+                if i < j:
+                    v = _safe_float(corr.loc[a, b])
+                    if v is not None:
+                        pairs.append({"a": a, "b": b, "corr": v})
+        pairs.sort(key=lambda p: abs(p["corr"]), reverse=True)
 
-    return {
-        "correlation_matrix": {
+        pearson_result = {
             "columns": cols,
             "matrix": matrix,
-            "top_pairs": pairs[:10],  # en güçlü 10 ilişki
+            "top_pairs": pairs[:10],
         }
+
+    # --- Cramér's V (kategorik-kategorik) + birleşik matris ---
+    summary = profile.get("summary", {})
+    cat_cols = summary.get("categorical_columns", [])
+    cat_cols = [c for c in cat_cols if c in df.columns]
+
+    all_cols = cols + cat_cols
+    if len(all_cols) < 2:
+        if pearson_result:
+            return {"correlation_matrix": pearson_result}
+        return None
+
+    # Birleşik matris hesapla
+    full_size = len(all_cols)
+    full_matrix = [[0.0] * full_size for _ in range(full_size)]
+
+    # Sayısal-sayısal: Pearson'dan kopyala
+    if len(cols) >= 2:
+        sub_num = df[cols].apply(pd.to_numeric, errors="coerce")
+        corr_num = sub_num.corr(method="pearson")
+        for i, a in enumerate(cols):
+            for j, b in enumerate(cols):
+                v = _safe_float(corr_num.loc[a, b])
+                ai, bi = all_cols.index(a), all_cols.index(b)
+                full_matrix[ai][bi] = v if v is not None else 0.0
+
+    # Kategorik-kategorik: Cramér's V
+    def _cramers_v(x: pd.Series, y: pd.Series) -> Optional[float]:
+        """Cramér's V — chi-square tabanlı kategorik ilişki ölçüsü."""
+        try:
+            from scipy.stats import chi2_contingency
+            ct = pd.crosstab(x, y)
+            if ct.shape[0] < 2 or ct.shape[1] < 2:
+                return None
+            chi2, _, _, _ = chi2_contingency(ct)
+            n = ct.sum().sum()
+            min_dim = min(ct.shape[0], ct.shape[1]) - 1
+            if min_dim == 0 or n == 0:
+                return None
+            return float(np.sqrt(chi2 / (n * min_dim)))
+        except Exception:
+            return None
+
+    for i, a in enumerate(cat_cols):
+        ai = all_cols.index(a)
+        full_matrix[ai][ai] = 1.0  # diagonal
+        for j, b in enumerate(cat_cols):
+            if i >= j:
+                continue
+            bi = all_cols.index(b)
+            v = _cramers_v(df[a].astype(str), df[b].astype(str))
+            val = _safe_float(v) if v is not None else 0.0
+            full_matrix[ai][bi] = val
+            full_matrix[bi][ai] = val
+
+    # Sayısal-kategorik: correlation ratio (eta) yaklaşımı
+    for num_c in cols:
+        ni = all_cols.index(num_c)
+        num_series = pd.to_numeric(df[num_c], errors="coerce")
+        for cat_c in cat_cols:
+            ci = all_cols.index(cat_c)
+            try:
+                groups = num_series.groupby(df[cat_c].astype(str))
+                grand_mean = num_series.mean()
+                ss_between = sum(len(g) * (g.mean() - grand_mean) ** 2 for _, g in groups)
+                ss_total = ((num_series - grand_mean) ** 2).sum()
+                eta = float(np.sqrt(ss_between / ss_total)) if ss_total > 0 else 0.0
+                val = _safe_float(eta) if not np.isnan(eta) else 0.0
+            except Exception:
+                val = 0.0
+            full_matrix[ni][ci] = val
+            full_matrix[ci][ni] = val
+
+    # top_pairs (birleşik)
+    full_pairs = []
+    for i, a in enumerate(all_cols):
+        for j, b in enumerate(all_cols):
+            if i < j:
+                v = full_matrix[i][j]
+                if v and v != 0.0:
+                    full_pairs.append({"a": a, "b": b, "corr": v})
+    full_pairs.sort(key=lambda p: abs(p["corr"]), reverse=True)
+
+    result = {}
+    if pearson_result:
+        result["correlation_matrix"] = pearson_result
+    result["correlation_full"] = {
+        "columns": all_cols,
+        "matrix": full_matrix,
+        "top_pairs": full_pairs[:15],
     }
+    return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -134,6 +225,7 @@ def compute_histograms(
             result[col] = {
                 "bin_edges": [_safe_float(e) for e in edges],
                 "counts": [int(c) for c in counts],
+                "bin_indices": list(range(len(counts))),
             }
         except Exception:
             continue
@@ -417,6 +509,253 @@ def compute_target_groups(
 
 
 # ═══════════════════════════════════════════════════════════
+#  6. PAIRWISE SCATTER (sayısal çiftler arası scatter)
+# ═══════════════════════════════════════════════════════════
+
+def compute_pairwise(
+    df: pd.DataFrame,
+    profile: dict,
+    target_col: Optional[str] = None,
+    max_features: int = 5,
+    sample_size: int = 1500,
+) -> Optional[dict]:
+    """
+    Sayısal feature çiftleri için scatter noktaları.
+    Frontend küçük scatter ızgarası çizecek.
+
+    - max_features: kalabalık olmasın diye ilk N sayısal feature
+    - sample_size: her çift için örneklenmiş nokta sayısı
+    - Hedef kategorikse noktaya sınıf etiketi eklenir
+
+    Returns:
+        {
+          "pairwise": {
+            "features": ["tenure", "MonthlyCharges", ...],
+            "points": [
+              {"x_feat": "tenure", "y_feat": "MonthlyCharges",
+               "x": 12, "y": 70.3, "target": "1"},
+              ...
+            ]
+          }
+        }
+    """
+    numeric_cols = _get_numeric_cols(profile)
+    cols = [c for c in numeric_cols if c in df.columns]
+    if len(cols) < 2:
+        return None
+
+    # İlk max_features ile sınırla
+    cols = cols[:max_features]
+
+    sub = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(sub) < 10:
+        return None
+
+    # Büyük veride örnekle (compute_clustering deseni)
+    if len(sub) > sample_size:
+        sub = sub.sample(n=sample_size, random_state=42)
+
+    # Hedef kategorik mi?
+    has_target = False
+    target_values = None
+    if target_col and target_col in df.columns:
+        target_series = df[target_col]
+        target_num = pd.to_numeric(target_series, errors="coerce")
+        target_is_numeric = target_num.notna().sum() > 0.8 * len(target_series)
+        if not target_is_numeric:
+            has_target = True
+            target_values = target_series.loc[sub.index].astype(str)
+
+    points = []
+    for i, col_a in enumerate(cols):
+        for j, col_b in enumerate(cols):
+            if i >= j:
+                continue  # her çifti bir kez, diagonal hariç
+            for idx in sub.index:
+                pt = {
+                    "x_feat": col_a,
+                    "y_feat": col_b,
+                    "x": _safe_float(sub.loc[idx, col_a]),
+                    "y": _safe_float(sub.loc[idx, col_b]),
+                }
+                if has_target and target_values is not None:
+                    pt["target"] = target_values.loc[idx]
+                points.append(pt)
+
+    if not points:
+        return None
+
+    return {
+        "pairwise": {
+            "features": cols,
+            "points": points,
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+#  7. KDE (yoğunluk eğrisi, ~40 nokta)
+# ═══════════════════════════════════════════════════════════
+
+def compute_kde(
+    df: pd.DataFrame,
+    profile: dict,
+    target_col: Optional[str] = None,
+    n_bins: int = 40,
+) -> Optional[dict]:
+    """
+    Her sayısal feature için pürüzsüz yoğunluk eğrisi.
+    np.histogram(density=True) ile ~40 nokta.
+
+    Returns:
+        {
+          "kde": {
+            "tenure": [{"x": .., "y": ..}, ...],
+            ...
+          }
+        }
+    """
+    numeric_cols = _get_numeric_cols(profile)
+    result = {}
+
+    for col in numeric_cols:
+        if col not in df.columns:
+            continue
+        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(series) < 2:
+            continue
+        try:
+            counts, edges = np.histogram(series, bins=n_bins, density=True)
+            curve = []
+            for i in range(len(counts)):
+                mid_x = (edges[i] + edges[i + 1]) / 2
+                curve.append({
+                    "x": _safe_float(mid_x),
+                    "y": _safe_float(counts[i]),
+                })
+            result[col] = curve
+        except Exception:
+            continue
+
+    if not result:
+        return None
+
+    return {"kde": result}
+
+
+# ═══════════════════════════════════════════════════════════
+#  8. EKSİK VERİ DESENİ (missing pattern ısı-matrisi)
+# ═══════════════════════════════════════════════════════════
+
+def compute_missing_pattern(
+    df: pd.DataFrame,
+    profile: dict,
+    target_col: Optional[str] = None,
+    max_rows: int = 200,
+) -> Optional[dict]:
+    """
+    Eksik veri eş-oluşum deseni. Satırlardan örnekle,
+    her sütun için eksik=1 / dolu=0 matrisi üret.
+    Frontend bunu ısı-matrisi gibi çizecek.
+
+    Sadece en az bir eksiği olan sütunları dahil eder.
+    Hiç eksik yoksa None döner.
+
+    Returns:
+        {
+          "missing_pattern": {
+            "columns": ["TotalCharges", "MonthlyCharges", ...],
+            "rows": [[0, 1, 0, ...], [1, 0, 0, ...], ...]
+          }
+        }
+    """
+    # Sadece en az 1 eksik değeri olan sütunları bul
+    missing_cols = [c for c in df.columns if df[c].isna().sum() > 0]
+    if not missing_cols:
+        return None
+
+    sub = df[missing_cols]
+
+    # Sadece en az bir eksik değeri olan satırları al, sonra örnekle
+    has_any_missing = sub.isna().any(axis=1)
+    missing_rows = sub[has_any_missing]
+
+    if len(missing_rows) == 0:
+        return None
+
+    if len(missing_rows) > max_rows:
+        missing_rows = missing_rows.sample(n=max_rows, random_state=42)
+
+    # 1=eksik, 0=dolu matrisi
+    matrix = missing_rows.isna().astype(int).values.tolist()
+
+    return {
+        "missing_pattern": {
+            "columns": missing_cols,
+            "rows": matrix,
+        }
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+#  9. ECDF (kümülatif dağılım, ~50 nokta)
+# ═══════════════════════════════════════════════════════════
+
+def compute_ecdf(
+    df: pd.DataFrame,
+    profile: dict,
+    target_col: Optional[str] = None,
+    n_points: int = 50,
+) -> Optional[dict]:
+    """
+    Her sayısal feature için kümülatif dağılım fonksiyonu.
+    Sıralı eşik değerleri + o değerin altındaki oran (~50 nokta).
+
+    Returns:
+        {
+          "ecdf": {
+            "tenure": [{"x": .., "p": ..}, ...],
+            ...
+          }
+        }
+    """
+    numeric_cols = _get_numeric_cols(profile)
+    result = {}
+
+    for col in numeric_cols:
+        if col not in df.columns:
+            continue
+        series = pd.to_numeric(df[col], errors="coerce").dropna().sort_values()
+        if len(series) < 2:
+            continue
+
+        try:
+            # n_points eşit aralıklı quantile noktası
+            n = len(series)
+            if n <= n_points:
+                indices = list(range(n))
+            else:
+                indices = [int(i * (n - 1) / (n_points - 1)) for i in range(n_points)]
+
+            curve = []
+            for idx in indices:
+                x_val = series.iloc[idx]
+                p_val = (idx + 1) / n  # kümülatif oran
+                curve.append({
+                    "x": _safe_float(x_val),
+                    "p": _safe_float(p_val),
+                })
+            result[col] = curve
+        except Exception:
+            continue
+
+    if not result:
+        return None
+
+    return {"ecdf": result}
+
+
+# ═══════════════════════════════════════════════════════════
 #  ANALİZ MODÜL KAYIT DEFTERİ (Registry)
 # ═══════════════════════════════════════════════════════════
 
@@ -429,6 +768,10 @@ ANALYSIS_MODULES: dict[str, list] = {
         compute_target_relations,
         compute_clustering,
         compute_target_groups,
+        compute_pairwise,
+        compute_kde,
+        compute_missing_pattern,
+        compute_ecdf,
     ],
     "fintech": [],
 }

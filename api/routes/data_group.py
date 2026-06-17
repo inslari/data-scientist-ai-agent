@@ -243,7 +243,7 @@ async def chat_with_data_group(
         else:
             print(f"[ttd chat] SQLite cache miss: group_id={group_id} — ttd_db_context_node çalışacak")
 
-        config = {"configurable": {"data_group_id": group_id}}
+        config = {"configurable": {"data_group_id": group_id, "user_id": current_user.id}}
         result = await graph.ainvoke(initial_state, config=config)
 
         # ── SQLite'a yaz (ttd_db_context_node çalıştıysa) ──────────────────

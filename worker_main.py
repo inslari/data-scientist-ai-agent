@@ -63,6 +63,9 @@ def main():
     
     print("[Worker Process] Starting job loop...")
     try:
+        import sys
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(job_worker_loop())
     except KeyboardInterrupt:
         print("\n[Worker Process] Shutting down cleanly due to KeyboardInterrupt.")

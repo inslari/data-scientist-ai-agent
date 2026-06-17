@@ -91,10 +91,6 @@ def detect_target_lock(X: pd.DataFrame, y: np.ndarray,
 
         local_jump_ratio = float(local_jump / (avg_jump + 1e-9))
 
-        # DEBUG — ilk testlerde aç, doğrulayınca kaldır
-        print(f"[DEBUG TLOCK] {feat}: rates={[round(float(r),3) for r in rates]}")
-        print(f"[DEBUG TLOCK]   flagged_idx={flagged_idx}, local_jump={local_jump:.3f}, "
-              f"avg_jump={avg_jump:.3f}, ratio={local_jump_ratio:.2f}")
 
         # Komşusundan 2x+ ani kopuyorsa → leakage şüphesi (high)
         # Kademeli geçiyorsa → meşru güçlü sinyal (low)

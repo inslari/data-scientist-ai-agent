@@ -242,30 +242,6 @@ def _select_anchor_table(
 
 
 def _parse_mcp_to_df(raw: str, table_name: str = "") -> pd.DataFrame:
-    # ─── DEBUG (geçici, sorun çözülünce silinecek) ───
-    print(f"\n[DEBUG _parse] table: '{table_name}'")
-    print(f"[DEBUG _parse] raw type: {type(raw).__name__}")
-    if raw is None:
-        print(f"[DEBUG _parse] raw is None")
-    elif isinstance(raw, str):
-        print(f"[DEBUG _parse] raw length: {len(raw)}")
-        print(f"[DEBUG _parse] raw ilk 400 char:")
-        print(raw[:400])
-        print(f"[DEBUG _parse] raw son 200 char:")
-        print(raw[-200:] if len(raw) > 200 else "(zaten yukarıda)")
-        # Columns satırı var mı?
-        has_columns_line = any(l.startswith("Columns:") for l in raw.strip().splitlines())
-        print(f"[DEBUG _parse] 'Columns:' satırı var mı: {has_columns_line}")
-        # İlk 5 satırın preview'i
-        lines_preview = raw.strip().splitlines()[:5]
-        print(f"[DEBUG _parse] ilk 5 satır:")
-        for i, l in enumerate(lines_preview):
-            print(f"  [{i}] {l[:150]}")
-    else:
-        print(f"[DEBUG _parse] beklenmeyen tip, str(raw)[:300]:")
-        print(str(raw)[:300])
-    print(f"[DEBUG _parse] === END ===\n")
-    # ─── /DEBUG ───
 
     if not raw:
         raise ValueError(f"[{table_name}] MCP boş yanıt döndürdü.")
@@ -353,45 +329,27 @@ async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> 
     async def fetch_one(table: str, db_name: str) -> tuple[str, str]:
         db = SessionLocal()
         try:
+            # Satır sayısını öğren (opsiyonel, log için)
             try:
                 req = QueryRequest(query=f'SELECT COUNT(*) FROM "{table}"')
                 count_result = await run_data_group_query_logic(data_group_id, req, db, user_id)
                 count_text = str(count_result.get("result", "")) if count_result.get("status") == "success" else ""
                 total_rows = _extract_count(count_text)
             except Exception:
-                total_rows = CHUNK_SIZE
+                total_rows = 0
 
             print(f"[execution] '{table}': {total_rows:,} satır tespit edildi")
 
-            if total_rows <= CHUNK_SIZE:
-                req = QueryRequest(query=f'SELECT * FROM "{table}"')
-                result = await run_data_group_query_logic(data_group_id, req, db, user_id)
-                if result.get("status") == "success":
-                    return table, str(result.get("result", ""))
-                return table, ""
+            # TEK SORGU — chunk yok. MAX_FETCH_ROWS kadar LIMIT'le.
+            fetch_limit = min(total_rows, MAX_FETCH_ROWS) if total_rows else MAX_FETCH_ROWS
+            query = f'SELECT * FROM "{table}" LIMIT {fetch_limit}'
+            req = QueryRequest(query=query)
+            result = await run_data_group_query_logic(data_group_id, req, db, user_id)
 
-            fetch_limit = min(total_rows, MAX_FETCH_ROWS)
-            chunks_text = []
-            header_written = False
-
-            for offset in range(0, fetch_limit, CHUNK_SIZE):
-                limit = min(CHUNK_SIZE, fetch_limit - offset)
-                query = f'SELECT * FROM "{table}" LIMIT {limit} OFFSET {offset}'
-                req = QueryRequest(query=query)
-                result = await run_data_group_query_logic(data_group_id, req, db, user_id)
-                
-                chunk_text = str(result.get("result", "")) if result.get("status") == "success" else ""
-
-                if not header_written:
-                    chunks_text.append(chunk_text)
-                    header_written = True
-                else:
-                    data_lines = [l for l in chunk_text.splitlines() if l.strip().startswith("(")]
-                    chunks_text.append("\n".join(data_lines))
-
-                print(f"[execution] '{table}' chunk {offset//CHUNK_SIZE+1}: {offset+limit:,}/{fetch_limit:,}")
-
-            return table, "\n".join(chunks_text)
+            if result.get("status") == "success":
+                print(f"[execution] '{table}': {fetch_limit:,} satır tek sorguda çekildi")
+                return table, str(result.get("result", ""))
+            return table, ""
         finally:
             db.close()
 

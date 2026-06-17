@@ -22,12 +22,13 @@ async def ttd_db_context_node(state: TTDState, config: RunnableConfig) -> TTDSta
         return {**state, "current_step": "ttd_db_context_node"}  # type: ignore[return-value]
 
     data_group_id = config.get("configurable", {}).get("data_group_id") or state.get("data_group_id")
-    if not data_group_id:
-        return {**state, "error": "data_group_id missing", "current_step": "ttd_db_context_node"}  # type: ignore[return-value]
+    user_id = config.get("configurable", {}).get("user_id") or state.get("user_id")
+    if not data_group_id or not user_id:
+        return {**state, "error": "data_group_id or user_id missing", "current_step": "ttd_db_context_node"}  # type: ignore[return-value]
 
     db = SessionLocal()
     try:
-        schema_result = await get_data_group_schema(data_group_id, db)
+        schema_result = await get_data_group_schema(data_group_id, db, user_id)
         raw_schema = schema_result.get("schema", "")
 
         # sample data
@@ -46,7 +47,7 @@ async def ttd_db_context_node(state: TTDState, config: RunnableConfig) -> TTDSta
         for tname in table_names[:5]:
             try:
                 req = DGQueryRequest(query=f'SELECT * FROM "{tname}" LIMIT 3')
-                r = await run_data_group_query(data_group_id, req, db)
+                r = await run_data_group_query(data_group_id, req, db, user_id)
                 if r.get("status") == "success":
                     txt = str(r.get("result", ""))[:500]
                     sample_parts.append(f"Table: {tname}\n{txt}")

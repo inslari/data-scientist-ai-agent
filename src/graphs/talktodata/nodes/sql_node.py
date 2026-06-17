@@ -96,8 +96,9 @@ async def ttd_sql_node(state: TTDState, config: RunnableConfig) -> TTDState:
     print("\n[TTD] ttd_sql_node başlıyor...")
 
     data_group_id = config.get("configurable", {}).get("data_group_id") or state.get("data_group_id")
-    if not data_group_id:
-        return {**state, "error": "data_group_id missing", "current_step": "ttd_sql_node"}  # type: ignore[return-value]
+    user_id = config.get("configurable", {}).get("user_id") or state.get("user_id")
+    if not data_group_id or not user_id:
+        return {**state, "error": "data_group_id or user_id missing", "current_step": "ttd_sql_node"}  # type: ignore[return-value]
 
     llm             = _get_llm(temperature=0)
     user_query      = state["user_query"]
@@ -192,7 +193,7 @@ async def ttd_sql_node(state: TTDState, config: RunnableConfig) -> TTDState:
         db = SessionLocal()
         try:
             req = DGQueryRequest(query=sql)
-            res = await run_data_group_query(data_group_id, req, db)
+            res = await run_data_group_query(data_group_id, req, db, user_id)
 
             if res.get("status") == "error":
                 raise Exception(res.get("result"))
