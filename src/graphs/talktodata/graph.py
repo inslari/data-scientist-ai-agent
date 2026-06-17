@@ -33,14 +33,17 @@ def _route_after_sql(state: TTDState) -> str:
 def _route_after_validator(state: TTDState) -> str:
     """
     Validator sonucuna göre routing:
-    - Geçersiz + retry hakkı varsa → sql_node
+    - Geçersiz + retry hakkı varsa + empty_result DEĞİLSE → sql_node
+    - empty_result: veri gerçekten yok, retry işe yaramaz → direkt chart_node
     - Geçerli veya retry hakkı bittiyse → chart_node
     """
     retry_count = state.get("sql_retry_count") or 0
-    if not state.get("validation_passed") and retry_count < 3:
-        print(f"[TTD] validator rejected results (issue={state.get('validation_issue')}), retrying SQL (attempt {retry_count + 1})")
-        # retry_count'u artır ki sonsuz döngüye girmesin
+    issue = state.get("validation_issue")
+    if not state.get("validation_passed") and issue != "empty_result" and retry_count < 3:
+        print(f"[TTD] validator rejected results (issue={issue}), retrying SQL (attempt {retry_count}/{3})")
         return "ttd_sql_node"
+    if issue == "empty_result":
+        print(f"[TTD] empty result — veri yok, retry atlanıyor, interpreter'a gidiliyor")
     return "ttd_chart_node"
 
 

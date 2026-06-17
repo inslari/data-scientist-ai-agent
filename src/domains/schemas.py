@@ -13,6 +13,14 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+class DiscoveredQuery(BaseModel):
+    """A reusable analytical query the expert agent surfaced while investigating."""
+
+    title: str = Field(description="Short descriptive name for this query")
+    description: str = Field(default="", description="What this query reveals and when to use it")
+    sql: str = Field(description="The complete, ready-to-run SQL query")
+
+
 class ExpertFinding(BaseModel):
     """What a single expert agent concluded after investigating the data."""
 
@@ -36,6 +44,10 @@ class ExpertFinding(BaseModel):
     )
     interpretation_notes: str = Field(
         default="", description="How downstream reporting should read the results"
+    )
+    discovered_queries: list[DiscoveredQuery] = Field(
+        default_factory=list,
+        description="Useful analytical queries the expert saved for reuse",
     )
 
 

@@ -70,6 +70,12 @@ class _RecordFindings(BaseModel):
     interpretation_notes: str = Field(default="", description="How downstream reporting should read the results")
 
 
+class _RecordQuery(BaseModel):
+    title: str = Field(description="Short descriptive name, e.g. 'Fraud Rate by Merchant Category'")
+    description: str = Field(default="", description="What this query reveals and when to use it")
+    sql: str = Field(description="The complete, ready-to-run SQL query")
+
+
 def _build_expert_agent(expert, run_sql_tool):
     from langchain.agents import create_agent
     from langchain_core.tools import tool
@@ -80,6 +86,11 @@ def _build_expert_agent(expert, run_sql_tool):
         """Record your final structured findings. Call this EXACTLY ONCE as your last step."""
         return {"status": "recorded"}
 
+    @tool(args_schema=_RecordQuery)
+    def record_query(title: str, description: str = "", sql: str = "") -> dict:
+        """Save a useful analytical query you discovered. Call up to 3 times — once per genuinely useful query that reveals important patterns, risks, or business insights about this dataset. Only save queries you actually ran and that returned meaningful results."""
+        return {"status": "recorded", "title": title}
+
     system_prompt = (
         f"You are the {expert.name} of a Merchant Intelligence Engine for financial/payments data.\n"
         f"Persona: {expert.summary}\n"
@@ -88,20 +99,26 @@ def _build_expert_agent(expert, run_sql_tool):
         "1. Use the run_sql tool to investigate the ACTUAL data (counts, distributions, group-bys, "
         "null rates, class balance, ranges). Run at most 4-5 focused aggregate queries.\n"
         "2. Ground every claim in numbers you actually retrieved — do not guess.\n"
-        "3. Then call record_findings EXACTLY ONCE with your structured conclusions "
+        "3. Call record_query (up to 3 times) for each query you ran that revealed a genuinely useful "
+        "pattern, risk, or business insight. Include the exact SQL you used.\n"
+        "4. Finally call record_findings EXACTLY ONCE with your structured conclusions "
         "(summary, key_signals with numbers, recommended_target, recommended_features, risks, "
         "interpretation_notes). Do not call run_sql after record_findings.\n"
         "Only reference columns/tables that exist in the schema below."
     )
 
-    agent = create_agent(model=get_llm(temperature=0), tools=[run_sql_tool, record_findings], system_prompt=system_prompt)
+    agent = create_agent(model=get_llm(temperature=0), tools=[run_sql_tool, record_findings, record_query], system_prompt=system_prompt)
     return agent
 
 
 def _extract_finding(expert_key: str, result: dict) -> ExpertFinding:
-    """Pull the record_findings args + run_sql audit trail out of the agent transcript."""
+    """Pull the record_findings args + run_sql audit trail + record_query calls from the agent transcript."""
+    from src.domains.schemas import DiscoveredQuery
+
     findings_args: Optional[dict] = None
     queries: list[str] = []
+    discovered: list[DiscoveredQuery] = []
+
     for msg in result.get("messages", []):
         for tc in (getattr(msg, "tool_calls", None) or []):
             name = tc.get("name")
@@ -110,14 +127,19 @@ def _extract_finding(expert_key: str, result: dict) -> ExpertFinding:
                 findings_args = args
             elif name == "run_sql" and args.get("sql"):
                 queries.append(args["sql"])
+            elif name == "record_query" and args.get("sql") and args.get("title"):
+                discovered.append(DiscoveredQuery(
+                    title=args["title"],
+                    description=args.get("description", ""),
+                    sql=args["sql"],
+                ))
 
     if findings_args is None:
-        # Agent never recorded — synthesize a minimal finding from the last message text.
         last = result.get("messages", [])[-1] if result.get("messages") else None
         text = getattr(last, "content", "") if last else ""
         if isinstance(text, list):
             text = " ".join(str(p) for p in text)
-        return ExpertFinding(expert=expert_key, summary=str(text)[:1000], queries_used=queries)
+        return ExpertFinding(expert=expert_key, summary=str(text)[:1000], queries_used=queries, discovered_queries=discovered)
 
     return ExpertFinding(
         expert=expert_key,
@@ -128,6 +150,7 @@ def _extract_finding(expert_key: str, result: dict) -> ExpertFinding:
         risks=findings_args.get("risks") or [],
         queries_used=queries,
         interpretation_notes=findings_args.get("interpretation_notes", ""),
+        discovered_queries=discovered,
     )
 
 

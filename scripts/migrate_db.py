@@ -46,4 +46,22 @@ with engine.connect() as conn:
 
     conn.commit()
 
+# Create data_group_queries table (raw SQL, idempotent)
+with engine.connect() as conn:
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS data_group_queries (
+            id SERIAL PRIMARY KEY,
+            data_group_id INTEGER NOT NULL REFERENCES data_groups(id) ON DELETE CASCADE,
+            title VARCHAR NOT NULL,
+            description TEXT,
+            sql TEXT NOT NULL,
+            expert VARCHAR,
+            pack_name VARCHAR,
+            created_at INTEGER NOT NULL
+        )
+    """))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_data_group_queries_data_group_id ON data_group_queries (data_group_id)"))
+    conn.commit()
+print("Table 'data_group_queries' ensured.")
+
 print("Migration completed.")

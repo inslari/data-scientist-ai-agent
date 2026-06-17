@@ -184,6 +184,24 @@ def get_chat_history(group_id: int, db: Session = Depends(get_db), current_user:
     }
 
 
+@router.delete("/{group_id}/chat")
+def clear_chat_history(group_id: int, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
+    """
+    Deletes all chat messages for a specific data group and resets its long-term memory.
+    """
+    db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == current_user.id).first()
+    if not db_group:
+        raise HTTPException(status_code=404, detail="Data group not found")
+
+    deleted = db.query(ChatMessageModel).filter(
+        ChatMessageModel.data_group_id == group_id
+    ).delete(synchronize_session=False)
+    db_group.long_term_memory = None
+    db.commit()
+
+    return {"status": "success", "deleted": deleted}
+
+
 @router.post("/{group_id}/chat", response_model=ChatResponse)
 async def chat_with_data_group(
     group_id: int,
@@ -256,7 +274,7 @@ async def chat_with_data_group(
         else:
             print(f"[ttd chat] SQLite cache miss: group_id={group_id} — ttd_db_context_node çalışacak")
 
-        config = {"configurable": {"data_group_id": group_id}}
+        config = {"configurable": {"data_group_id": group_id, "user_id": current_user.id}}
         result = await graph.ainvoke(initial_state, config=config)
 
         # ── SQLite'a yaz (ttd_db_context_node çalıştıysa) ──────────────────

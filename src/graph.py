@@ -36,6 +36,8 @@ def route_after_execution(state: AgentState) -> str:
       deep_analysis                            → analysis_node (model akışına girmez)
       eda / anomaly_detection / report         → automl_node
     """
+    if state.get("error"):
+        return "report_node"
     intent = state.get("intent", "eda")
     if intent == "deep_analysis":
         return "analysis_node"

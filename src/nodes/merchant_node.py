@@ -1,9 +1,43 @@
 from __future__ import annotations
 
+import time as _time
 from langchain_core.runnables import RunnableConfig
 
 from src.state import AgentState
 from src.domains import get_active_pack
+
+
+def _save_discovered_queries(analysis, data_group_id: int) -> None:
+    """Persist all discovered_queries from expert findings to data_group_queries table."""
+    all_queries = [
+        (finding.expert, dq)
+        for finding in analysis.findings
+        for dq in finding.discovered_queries
+        if dq.sql.strip()
+    ]
+    if not all_queries:
+        return
+    try:
+        from api.core.database import SessionLocal
+        from api.models.data_group_query import DataGroupQueryModel
+        db = SessionLocal()
+        try:
+            for expert_key, dq in all_queries:
+                db.add(DataGroupQueryModel(
+                    data_group_id=data_group_id,
+                    title=dq.title,
+                    description=dq.description or None,
+                    sql=dq.sql,
+                    expert=expert_key,
+                    pack_name=analysis.pack_name,
+                    created_at=int(_time.time()),
+                ))
+            db.commit()
+            print(f"[merchant_node] {len(all_queries)} keşfedilen sorgu data_group {data_group_id} için kaydedildi.")
+        finally:
+            db.close()
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[merchant_node] Sorgular kaydedilemedi: {e}")
 
 
 async def merchant_intelligence_node(state: AgentState, config: RunnableConfig) -> AgentState:
@@ -49,6 +83,8 @@ async def merchant_intelligence_node(state: AgentState, config: RunnableConfig) 
         )
         if analysis is not None:
             print(f"[merchant_node] analiz tamam → expert(ler)={analysis.council}, bulgu={len(analysis.findings)}")
+            if data_group_id:
+                _save_discovered_queries(analysis, data_group_id)
             return {
                 **state,
                 "merchant_analysis": analysis.to_dict(),
