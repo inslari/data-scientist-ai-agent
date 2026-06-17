@@ -13,7 +13,11 @@ class ProjectModel(Base):
     intent = Column(String, nullable=True)
     data_group_id = Column(Integer, ForeignKey("data_groups.id", ondelete="SET NULL"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
-    
+
+    # Domain (sector) pack override for this project. NULL/empty = inherit from
+    # the data group, then from the global DOMAIN_PACK setting.
+    domain_pack = Column(String, nullable=True)
+
     status = Column(String, default="idle") # idle, running, completed, failed
     report = Column(Text, nullable=True)
     error = Column(Text, nullable=True)

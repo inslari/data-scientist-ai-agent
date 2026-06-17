@@ -3,6 +3,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from ..state import TTDState, _IntentResult
 from ..utils import _get_llm, _StructuredJsonParser
+from src.domains import get_active_pack
 
 TTD_INTENT_SYSTEM = """\
 You are an intent classifier for a data analytics assistant.
@@ -23,6 +24,8 @@ Available intent labels:
 
 --- User Message ---
 {user_query}
+
+{domain_context}
 
 Classification rules:
 - If the user says hello/thanks/goodbye → "chitchat"
@@ -59,10 +62,26 @@ async def ttd_intent_classifier_node(state: TTDState, config: RunnableConfig) ->
     if not chat_history_str:
         chat_history_str = "No previous messages."
 
+    # Domain pack (varsa) expert seçimi → merchant_context + intent ek-bağlamı
+    merchant_context = None
+    domain_context = ""
+    try:
+        pack = get_active_pack(state.get("domain_pack"))
+        if pack.name != "none":
+            domain_doc = state.get("domain_doc") or ""
+            ctx = pack.select_experts(user_query, state.get("db_intelligence"), domain_doc)
+            merchant_context = ctx.to_dict()
+            domain_context = pack.enrich_intent_prompt(ctx, domain_doc)
+            print(f"[TTD] Domain pack '{pack.name}' aktif → expert(ler): "
+                  f"{ctx.council if ctx.is_council else [ctx.primary_expert]}")
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[TTD] Domain pack seçimi başarısız ({e}); atlanıyor.")
+
     invoke_kwargs = {
-        "user_query":   user_query,
-        "raw_schema":   raw_schema,
-        "chat_history": chat_history_str,
+        "user_query":     user_query,
+        "raw_schema":     raw_schema,
+        "chat_history":   chat_history_str,
+        "domain_context": domain_context or "",
     }
 
     try:
@@ -95,6 +114,7 @@ async def ttd_intent_classifier_node(state: TTDState, config: RunnableConfig) ->
             "sql_query_results":      [],
             "sql_query_columns":      [],
             "sql_query_chart":        {},
+            "merchant_context":       merchant_context,
             "current_step":           "ttd_intent_classifier_node",
         }  # type: ignore[return-value]
 
@@ -104,5 +124,6 @@ async def ttd_intent_classifier_node(state: TTDState, config: RunnableConfig) ->
         "needs_multiple_queries": intent_result.needs_multiple_queries,
         "clarification_needed":   intent_result.clarification_needed,
         "clarification_question": intent_result.clarification_question,
+        "merchant_context":       merchant_context,
         "current_step":           "ttd_intent_classifier_node",
     }  # type: ignore[return-value]

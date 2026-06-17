@@ -913,6 +913,18 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
     finally:
         duck.close()
 
+    if not data_path and not sql_results:
+        step_names = [s.get("step", "") for s in analysis_plan]
+        print(f"[execution] HATA: data_path boş, sql_results boş. Plan adımları: {step_names}")
+        return {
+            "error": (
+                "Veri çekme adımı çalışmadı. Analiz planı bir 'sql_query' adımı içermiyor "
+                f"veya tanınmayan adım isimleri var: {step_names}. "
+                "Lütfen projeyi yeniden başlatın."
+            ),
+            "current_step": "execution_node",
+        }
+
     return {
         "sql_results": sql_results,
         "data_path": data_path,

@@ -52,3 +52,5 @@ STEP 3 — Choose one of three cases:
 
 --- Column Semantic Profiles ---
 {column_profiles}
+
+{domain_hint}
