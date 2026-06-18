@@ -326,9 +326,6 @@ async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> 
     finally:
         db_conn.close()
 
-    # MCP server cannot handle concurrent connections — run tables serially
-    mcp_semaphore = asyncio.Semaphore(1)
-
     async def fetch_one(table: str, db_name: str) -> tuple[str, str]:
         db = SessionLocal()
         try:
