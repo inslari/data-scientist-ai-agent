@@ -39,7 +39,7 @@ from mcp.client.session import ClientSession
 from src.core.config import settings
 
 # ── Sabitler ────────────────────────────────────────────────
-CHUNK_SIZE        = 10_000   # MCP'den kaç satır çekileceği (per chunk)
+CHUNK_SIZE        = 5_000   # MCP'den kaç satır çekileceği (per chunk) — küçük chunk = hızlı sorgu, daha az iptal/spin riski
 MAX_FETCH_ROWS    = 300_000  # Tek tablodan max çekilecek satır
 ML_SAMPLE_ROWS    = 300_000  # ML eğitimi için max satır
 PROFILE_SAMPLE    = 300_000  # Profiling için max satır (yoksa full)
@@ -342,7 +342,7 @@ async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> 
     from api.core.database import SessionLocal
     from api.schemas.data_group import run_data_group_query_logic, QueryRequest
     from api.models.data_group import DataGroupModel
-    
+
     db_conn = SessionLocal()
     try:
         dg = db_conn.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
@@ -350,50 +350,54 @@ async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> 
     finally:
         db_conn.close()
 
+    # MCP server cannot handle concurrent connections — run tables serially
+    mcp_semaphore = asyncio.Semaphore(1)
+
     async def fetch_one(table: str, db_name: str) -> tuple[str, str]:
-        db = SessionLocal()
-        try:
+        async with mcp_semaphore:
+            db = SessionLocal()
             try:
-                req = QueryRequest(query=f'SELECT COUNT(*) FROM "{table}"')
-                count_result = await run_data_group_query_logic(data_group_id, req, db, user_id)
-                count_text = str(count_result.get("result", "")) if count_result.get("status") == "success" else ""
-                total_rows = _extract_count(count_text)
-            except Exception:
-                total_rows = CHUNK_SIZE
+                try:
+                    req = QueryRequest(query=f'SELECT COUNT(*) FROM "{table}"')
+                    count_result = await run_data_group_query_logic(data_group_id, req, db, user_id)
+                    count_text = str(count_result.get("result", "")) if count_result.get("status") == "success" else ""
+                    total_rows = _extract_count(count_text)
+                except Exception:
+                    total_rows = CHUNK_SIZE
 
-            print(f"[execution] '{table}': {total_rows:,} satır tespit edildi")
+                print(f"[execution] '{table}': {total_rows:,} satır tespit edildi")
 
-            if total_rows <= CHUNK_SIZE:
-                req = QueryRequest(query=f'SELECT * FROM "{table}"')
-                result = await run_data_group_query_logic(data_group_id, req, db, user_id)
-                if result.get("status") == "success":
-                    return table, str(result.get("result", ""))
-                return table, ""
+                if total_rows <= CHUNK_SIZE:
+                    req = QueryRequest(query=f'SELECT * FROM "{table}"')
+                    result = await run_data_group_query_logic(data_group_id, req, db, user_id)
+                    if result.get("status") == "success":
+                        return table, str(result.get("result", ""))
+                    return table, ""
 
-            fetch_limit = min(total_rows, MAX_FETCH_ROWS)
-            chunks_text = []
-            header_written = False
+                fetch_limit = min(total_rows, MAX_FETCH_ROWS)
+                chunks_text = []
+                header_written = False
 
-            for offset in range(0, fetch_limit, CHUNK_SIZE):
-                limit = min(CHUNK_SIZE, fetch_limit - offset)
-                query = f'SELECT * FROM "{table}" LIMIT {limit} OFFSET {offset}'
-                req = QueryRequest(query=query)
-                result = await run_data_group_query_logic(data_group_id, req, db, user_id)
-                
-                chunk_text = str(result.get("result", "")) if result.get("status") == "success" else ""
+                for offset in range(0, fetch_limit, CHUNK_SIZE):
+                    limit = min(CHUNK_SIZE, fetch_limit - offset)
+                    query = f'SELECT * FROM "{table}" LIMIT {limit} OFFSET {offset}'
+                    req = QueryRequest(query=query)
+                    result = await run_data_group_query_logic(data_group_id, req, db, user_id)
 
-                if not header_written:
-                    chunks_text.append(chunk_text)
-                    header_written = True
-                else:
-                    data_lines = [l for l in chunk_text.splitlines() if l.strip().startswith("(")]
-                    chunks_text.append("\n".join(data_lines))
+                    chunk_text = str(result.get("result", "")) if result.get("status") == "success" else ""
 
-                print(f"[execution] '{table}' chunk {offset//CHUNK_SIZE+1}: {offset+limit:,}/{fetch_limit:,}")
+                    if not header_written:
+                        chunks_text.append(chunk_text)
+                        header_written = True
+                    else:
+                        data_lines = [l for l in chunk_text.splitlines() if l.strip().startswith("(")]
+                        chunks_text.append("\n".join(data_lines))
 
-            return table, "\n".join(chunks_text)
-        finally:
-            db.close()
+                    print(f"[execution] '{table}' chunk {offset//CHUNK_SIZE+1}: {offset+limit:,}/{fetch_limit:,}")
+
+                return table, "\n".join(chunks_text)
+            finally:
+                db.close()
 
     results = await asyncio.gather(
         *[fetch_one(t, db) for t, db in table_to_db.items()],
@@ -831,7 +835,7 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                         header_written = False
                         
                         # Use a safe chunk size below MAX_DISPLAY_ROWS
-                        SAFE_CHUNK_SIZE = 10_000
+                        SAFE_CHUNK_SIZE = 5_000
                         
                         from api.core.database import SessionLocal
                         from api.schemas.data_group import run_data_group_query_logic, QueryRequest
