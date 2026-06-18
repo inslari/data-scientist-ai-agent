@@ -78,12 +78,14 @@ async def ttd_result_validator_node(state: TTDState, config: RunnableConfig) -> 
         print(f"[TTD] validator failed ({e}), assuming valid")
         val_result = _ValidationResult(is_valid=True)
 
-    print(f"[TTD] validation: is_valid={val_result.is_valid} | issue={val_result.issue}")
+    retry_count = state.get("sql_retry_count") or 0
+    print(f"[TTD] validation: is_valid={val_result.is_valid} | issue={val_result.issue} | retry_count={retry_count}")
 
     return {
         **state,
         "validation_passed":    val_result.is_valid,
         "validation_issue":     val_result.issue,
         "validation_fix_hint":  val_result.suggested_fix if not val_result.is_valid else None,
+        "sql_retry_count":      retry_count + 1 if not val_result.is_valid else retry_count,
         "current_step":         "ttd_result_validator_node",
     }  # type: ignore[return-value]

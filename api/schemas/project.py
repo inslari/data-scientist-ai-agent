@@ -20,6 +20,7 @@ class ProjectBase(BaseModel):
     data_group_id: Optional[int] = None
     intent: Optional[str] = None
     target_col: Optional[str] = None
+    domain_pack: Optional[str] = None   # None/empty = inherit (data group → global)
 
 class ProjectCreate(ProjectBase):
     pass
@@ -31,6 +32,7 @@ class ProjectUpdate(BaseModel):
     data_group_id: Optional[int] = None
     intent: Optional[str] = None
     target_col: Optional[str] = None
+    domain_pack: Optional[str] = None
 
 class ProjectResponse(ProjectBase):
     id: int

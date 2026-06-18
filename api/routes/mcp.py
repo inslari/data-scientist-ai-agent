@@ -25,6 +25,49 @@ from api.models.user import UserModel
 
 router = APIRouter(prefix="/mcp", tags=["MCP Configuration"])
 
+# ---------------------------------------------------------------------------
+# Persistent MCP session pool — keyed by URL.
+# Reusing a single session avoids repeated connect+initialize overhead and
+# prevents half-open connections from piling up on the server.
+# ---------------------------------------------------------------------------
+_session_pool: dict[str, tuple[ClientSession, contextlib.AsyncExitStack]] = {}
+_session_lock = asyncio.Lock()
+
+async def _get_or_create_session(url: str) -> ClientSession:
+    """Return a cached MCP session for the given URL, creating one if needed."""
+    async with _session_lock:
+        entry = _session_pool.get(url)
+        if entry is not None:
+            session, _ = entry
+            return session
+        print(f"[MCP] opening persistent session → {url}")
+        stack = contextlib.AsyncExitStack()
+        try:
+            transport = await asyncio.wait_for(
+                stack.enter_async_context(streamable_http_client(url)), timeout=15.0
+            )
+            read, write = transport[0], transport[1]
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await asyncio.wait_for(session.initialize(), timeout=10.0)
+            _session_pool[url] = (session, stack)
+            print(f"[MCP] persistent session ready → {url}")
+            return session
+        except Exception as exc:
+            await stack.aclose()
+            raise RuntimeError(f"Failed to open MCP session for {url}: {exc}") from exc
+
+async def _invalidate_session(url: str) -> None:
+    """Close and remove a cached session so the next call recreates it."""
+    async with _session_lock:
+        entry = _session_pool.pop(url, None)
+        if entry:
+            _, stack = entry
+            try:
+                await stack.aclose()
+            except Exception:
+                pass
+            print(f"[MCP] session invalidated → {url}")
+
 @router.post("/config", response_model=MCPConfigResponse)
 def create_mcp_config(config: MCPConfigCreate, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
     """
@@ -200,55 +243,74 @@ async def test_mcp_connection(req: ConnectionTestRequest, db: Session = Depends(
         except Exception as e:
             return {"status": "error", "message": f"Failed to connect to MCP server: {str(e)}"}
 
+async def _run_mcp_session(transport_cm_factory, tool_name: str, tool_args: dict) -> str:
+    """Open a transport context, initialize an MCP session, and call a tool.
+
+    transport_cm_factory is a callable (no args) returning a fresh context manager.
+    """
+    query_preview = str(tool_args.get("query", ""))[:120] if tool_args else ""
+    print(f"[MCP] >> tool={tool_name} | args={query_preview!r}")
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            result = await asyncio.wait_for(
+                stack.enter_async_context(transport_cm_factory()), timeout=15.0
+            )
+            read, write = result[0], result[1]
+            print(f"[MCP] connected, initializing session...")
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await asyncio.wait_for(session.initialize(), timeout=10.0)
+            print(f"[MCP] session ready, calling tool...")
+            tool_result = await asyncio.wait_for(
+                session.call_tool(tool_name, tool_args), timeout=120.0
+            )
+            print(f"[MCP] << tool={tool_name} OK, content_items={len(tool_result.content or [])}")
+    except Exception as exc:
+        print(f"[MCP] !! tool={tool_name} FAILED: {type(exc).__name__}: {exc}")
+        raise
+    if tool_result.content:
+        parts = []
+        for item in tool_result.content:
+            if hasattr(item, "text"):
+                parts.append(item.text)
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return ""
+
+
 async def _call_mcp_tool(db_config, tool_name: str, tool_args: dict = None) -> str:
     """
     Verilen MCP konfigürasyonuna bağlanır ve belirtilen tool'u çalıştırır.
     Sonucu ham string olarak döner.
+    SSE/streamable-HTTP için kalıcı session pool kullanır.
     """
-    async with contextlib.AsyncExitStack() as stack:
-        if db_config.type == "stdio":
-            if not db_config.command or not shutil.which(db_config.command):
-                raise ValueError(f"Command not found: {db_config.command}")
-            env = get_default_environment()
-            if db_config.env:
-                env.update(db_config.env)
-            server_params = StdioServerParameters(
-                command=db_config.command,
-                args=db_config.args or [],
-                env=env
-            )
-            read, write = await asyncio.wait_for(
-                stack.enter_async_context(stdio_client(server_params)), timeout=15.0
-            )
-        elif db_config.type == "sse":
-            if not db_config.url:
-                raise ValueError("URL is required for sse type")
-            try:
-                result = await asyncio.wait_for(
-                    stack.enter_async_context(streamable_http_client(db_config.url)), timeout=15.0
-                )
-                read, write = result[0], result[1]
-            except Exception:
-                read, write = await asyncio.wait_for(
-                    stack.enter_async_context(sse_client(db_config.url)), timeout=15.0
-                )
-        else:
-            raise ValueError(f"Unknown connection type: {db_config.type}")
+    tool_args = tool_args or {}
 
-        session = await stack.enter_async_context(ClientSession(read, write))
-        await asyncio.wait_for(session.initialize(), timeout=10.0)
-        result = await asyncio.wait_for(session.call_tool(tool_name, tool_args or {}), timeout=30.0)
+    if db_config.type == "stdio":
+        if not db_config.command or not shutil.which(db_config.command):
+            raise ValueError(f"Command not found: {db_config.command}")
+        env = get_default_environment()
+        if db_config.env:
+            env.update(db_config.env)
+        server_params = StdioServerParameters(
+            command=db_config.command,
+            args=db_config.args or [],
+            env=env
+        )
+        return await _run_mcp_session(lambda: stdio_client(server_params), tool_name, tool_args)
 
-        # Tool sonucu genellikle bir liste içinde TextContent nesnesi döner
-        if result.content:
-            parts = []
-            for item in result.content:
-                if hasattr(item, "text"):
-                    parts.append(item.text)
-                else:
-                    parts.append(str(item))
-            return "\n".join(parts)
-        return ""
+    elif db_config.type == "sse":
+        if not db_config.url:
+            raise ValueError("URL is required for sse type")
+        url = db_config.url
+        query_preview = str(tool_args.get("query", ""))[:80] if tool_args else ""
+        print(f"[MCP] >> tool={tool_name} | {query_preview!r}")
+        return await _run_mcp_session(
+            lambda: streamable_http_client(url), tool_name, tool_args
+        )
+
+    else:
+        raise ValueError(f"Unknown connection type: {db_config.type}")
 
 @router.post("/schema", response_model=MCPSchemaResponse)
 async def get_mcp_schema(req: MCPToolRequest, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):

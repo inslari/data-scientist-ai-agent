@@ -8,6 +8,7 @@ from api.models.data_group import DataGroupModel
 from api.models.project import ProjectModel
 from api.models.user import UserModel
 from api.models.job import BackgroundJobModel  # Must be imported so the table is created
+from api.models.data_group_query import DataGroupQueryModel  # Must be imported so the table is created
 
 # Create all DB tables
 Base.metadata.create_all(bind=engine)
@@ -17,6 +18,8 @@ from api.routes.csv import router as csv_router
 from api.routes.data_group import router as data_group_router
 from api.routes.project import router as project_router
 from api.routes.auth import router as auth_router
+from api.routes.domain_pack import router as domain_pack_router
+from api.routes.data_group_query import router as data_group_query_router
 
 from contextlib import asynccontextmanager
 import asyncio
@@ -62,10 +65,12 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # ty
 app.add_middleware(SlowAPIMiddleware)
 
 app.include_router(data_group_router)
+app.include_router(data_group_query_router)
 app.include_router(project_router)
 app.include_router(mcp_router)
 app.include_router(csv_router)
 app.include_router(auth_router)
+app.include_router(domain_pack_router)
 
 
 @app.get("/health", tags=["System"])

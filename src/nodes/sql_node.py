@@ -5,6 +5,9 @@ from ..core.llm import get_llm
 from ..core.config import settings
 from ..core.prompt_loader import create_chat_prompt
 from ..schemas.sql_schemas import SQLGenerationResult, ChartConfig
+from ..domains import get_active_pack
+from ..domains.base import MerchantContext
+from ..domains.schemas import MerchantAnalysis
 from langchain_core.runnables import RunnableConfig
 from api.core.database import SessionLocal
 from api.schemas.data_group import run_data_group_query_logic, QueryRequest
@@ -71,6 +74,17 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
     raw_schema       = state.get("raw_schema", "Schema not available.")
     column_profiles  = _build_column_profiles(db_intelligence)
 
+    # Domain pack (varsa) query ipuçları — yoksa boş string
+    domain_hint = ""
+    try:
+        pack = get_active_pack(state.get("domain_pack"))
+        mc = MerchantContext.from_dict(state.get("merchant_context"))
+        analysis = MerchantAnalysis.from_dict(state.get("merchant_analysis"))
+        if pack.name != "none" and (mc is not None or analysis is not None):
+            domain_hint = pack.query_hints(mc, db_intelligence, analysis) or ""
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[sql_node] Domain pack query ipucu başarısız ({e}); atlanıyor.")
+
     try:
         db_providers_info = ", ".join([f"{k} ({v.provider_display_name})" for k, v in db_manager.get_all_providers().items()])
         SQL_GEN_PROMPT = create_chat_prompt("sql_generation.md", "Kullanici sorusu: {user_query}")
@@ -80,6 +94,7 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
             "column_profiles": column_profiles,
             "user_query":      user_query,
             "db_providers":    db_providers_info,
+            "domain_hint":     domain_hint,
         })
         sql                  = sql_result.sql.strip()
         target_db_name       = str(sql_result.db_name).strip().strip('",\'”’ \t\n')

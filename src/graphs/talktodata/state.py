@@ -9,6 +9,11 @@ class TTDState(TypedDict):
     messages: Optional[list]
     long_term_memory: Optional[str]
 
+    # Domain (Sector) Pack — pluggable Merchant Intelligence layer
+    domain_pack: Optional[str]        # Active pack name ("none" disables the layer)
+    merchant_context: Optional[dict]  # MerchantContext.to_dict() — selected expert(s) & framing
+    domain_doc: Optional[str]         # Per-data-group dataset description (markdown context)
+
     # Schema / DB intelligence (cache'den veya canlı)
     raw_schema: Optional[str]
     db_intelligence: Optional[dict]

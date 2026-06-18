@@ -18,6 +18,7 @@ from src.nodes.target_discovery_node import target_discovery_node
 from src.nodes.leakage_detector_node import leakage_detector_node
 from src.nodes.entity_resolution_node import entity_resolution_node
 from src.nodes.analysis_node import analysis_node
+from src.nodes.merchant_node import merchant_intelligence_node
 
 
 # Routing functions
@@ -39,6 +40,8 @@ def route_after_execution(state: AgentState) -> str:
       deep_analysis                            → analysis_node (model akışına girmez)
       eda / anomaly_detection / report         → automl_node
     """
+    if state.get("error"):
+        return "report_node"
     intent = state.get("intent", "eda")
     if intent == "deep_analysis":
         return "analysis_node"
@@ -100,14 +103,18 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
     graph.add_node("leakage_detector_node",    leakage_detector_node)
     graph.add_node("entity_resolution_node",   entity_resolution_node)
     graph.add_node("analysis_node",            analysis_node)
+    graph.add_node("merchant_intelligence_node", merchant_intelligence_node)
 
-    # START → intent_node → db_context_node
+    # START → intent_node → db_context_node → merchant_intelligence_node
     graph.add_edge(START, "intent_node")
     graph.add_edge("intent_node", "db_context_node")
+    # Agentic Merchant Intelligence runs after schema understanding, before routing,
+    # so both the sql_query and ML paths get data-grounded expert findings.
+    graph.add_edge("db_context_node", "merchant_intelligence_node")
 
-    # db_context_node → sql_node or planner_node
+    # merchant_intelligence_node → sql_node or target_discovery_node
     graph.add_conditional_edges(
-        "db_context_node",
+        "merchant_intelligence_node",
         route_after_db_context,
         {
             "sql_node":              "sql_node",

@@ -21,10 +21,11 @@ async def ttd_db_context_node(state: TTDState, config: RunnableConfig) -> TTDSta
         print("[TTD] db_context: cache hit, skipping LLM analysis")
         return {**state, "current_step": "ttd_db_context_node"}  # type: ignore[return-value]
 
-    data_group_id = config.get("configurable", {}).get("data_group_id") or state.get("data_group_id")
-    user_id = config.get("configurable", {}).get("user_id") or state.get("user_id")
-    if not data_group_id or not user_id:
-        return {**state, "error": "data_group_id or user_id missing", "current_step": "ttd_db_context_node"}  # type: ignore[return-value]
+    cfg = config.get("configurable", {})
+    data_group_id = cfg.get("data_group_id") or state.get("data_group_id")
+    user_id = cfg.get("user_id")
+    if not data_group_id:
+        return {**state, "error": "data_group_id missing", "current_step": "ttd_db_context_node"}  # type: ignore[return-value]
 
     db = SessionLocal()
     try:

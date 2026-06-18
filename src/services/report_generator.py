@@ -33,6 +33,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.core.config import settings
 from src.state import AgentState
 from src.core.prompt_loader import load_prompt
+from src.domains import get_active_pack
+from src.domains.base import MerchantContext
+from src.domains.schemas import MerchantAnalysis
 
 
 # LLM Setup
@@ -480,6 +483,20 @@ def generate_report(state: AgentState) -> dict:
         system_prompt = SYSTEM_PROMPT_REGRESSION
     else:
         system_prompt = SYSTEM_PROMPT
+
+    # Domain pack (varsa) yorum merceğini system prompt'a ekle
+    try:
+        pack = get_active_pack(state.get("domain_pack"))
+        mc = MerchantContext.from_dict(state.get("merchant_context"))
+        analysis = MerchantAnalysis.from_dict(state.get("merchant_analysis"))
+        if pack.name != "none" and (mc is not None or analysis is not None):
+            lens = pack.interpret_lens(mc, intent, analysis)
+            if lens:
+                system_prompt = system_prompt + "\n\n" + lens.system_suffix
+                src = "agentic" if analysis else "statik"
+                print(f"[report] Domain pack '{pack.name}' yorum merceği eklendi ({src}).")
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[report] Domain pack yorum merceği başarısız ({e}); atlanıyor.")
 
     # llm
     llm = _get_llm()

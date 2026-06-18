@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, JSON, ForeignKey
+from sqlalchemy import Column, Integer, String, JSON, ForeignKey, Text
 from sqlalchemy.orm import relationship
 from api.core.database import Base
 
@@ -18,6 +18,14 @@ class DataGroupModel(Base):
 
     # Long-term memory for Talk to Data
     long_term_memory = Column(String, nullable=True)
+
+    # Domain (sector) pack for this dataset. Used by Talk-to-Data chat and as the
+    # fallback for projects on this data group. NULL/empty = global DOMAIN_PACK.
+    domain_pack = Column(String, nullable=True)
+
+    # Free-form domain/dataset description (markdown). Injected into the sector
+    # agent and feature-engineering prompts as dataset context. NULL = none.
+    domain_doc = Column(Text, nullable=True)
 
     # Relationships
     mcp_config = relationship("MCPConfigModel", back_populates="data_group", cascade="all, delete-orphan", uselist=False)

@@ -102,6 +102,7 @@ def create_project(
         intent=project.intent,
         target_col=project.target_col,
         data_group_id=project.data_group_id,
+        domain_pack=project.domain_pack or None,
         user_id=current_user.id,
         created_at=int(time.time()),
         updated_at=int(time.time()),
@@ -168,6 +169,8 @@ def update_project(
         db_project.target_col = project.target_col
     if project.data_group_id is not None:
         db_project.data_group_id = project.data_group_id
+    if "domain_pack" in project.model_fields_set:
+        db_project.domain_pack = project.domain_pack or None
 
     db_project.updated_at = int(time.time())
     db.commit()

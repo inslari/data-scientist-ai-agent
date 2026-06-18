@@ -7,6 +7,12 @@ from typing_extensions import TypedDict
 class AgentState(TypedDict, total=False):
     user_query: str                  # Raw user query
 
+    # Domain (Sector) Pack — pluggable Merchant Intelligence layer
+    domain_pack: str                 # Active pack name ("none" disables the layer)
+    merchant_context: dict           # MerchantContext.to_dict() — selected expert(s) & framing
+    domain_doc: str                  # Per-data-group dataset description (markdown context)
+    merchant_analysis: dict          # MerchantAnalysis.to_dict() — agentic expert findings
+
     # Intent Node output
     intent: str                      # "eda", "classification", "regression", "clustering", "report", "sql_query"
     intent_confidence: float         # 0-1 confidence score

@@ -58,7 +58,14 @@ class DatabaseProvider:
     @property
     def engine(self) -> Engine:
         if self._engine is None:
-            self._engine = create_engine(self.connection_string)
+            kwargs: dict = {}
+            if self.provider == "sqlite":
+                # check_same_thread=False so connections can be used across the
+                # threadpool that runs blocking SQL. Default QueuePool gives
+                # multiple connections so one wedged/cancelled query cannot
+                # block all others (StaticPool's single connection could).
+                kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
+            self._engine = create_engine(self.connection_string, **kwargs)
         return self._engine
 
     @contextmanager

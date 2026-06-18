@@ -29,7 +29,18 @@ SQLALCHEMY_DATABASE_URL = os.getenv(
 _is_sqlite = SQLALCHEMY_DATABASE_URL.startswith("sqlite")
 _connect_args = {"check_same_thread": False} if _is_sqlite else {}
 
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=_connect_args)
+# pool_pre_ping: her pool checkout'unda bağlantıyı test eder; ölü bağlantıyı
+# otomatik yeniler. Özellikle worker gibi uzun süre bekleyen servisler için kritik
+# (PostgreSQL idle timeout / server restart sonrası "server closed the connection" hatası).
+# pool_recycle: 1800s'den eski bağlantıları havuzdan çıkarır (cloud DB'ler genelde
+# 5-10 dk idle sonrası keser; 30 dk yeterince güvenli marj).
+_pool_kwargs = (
+    {"pool_pre_ping": True, "pool_recycle": 1800}
+    if not _is_sqlite
+    else {}
+)
+
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=_connect_args, **_pool_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

@@ -39,7 +39,7 @@ from mcp.client.session import ClientSession
 from src.core.config import settings
 
 # ── Sabitler ────────────────────────────────────────────────
-CHUNK_SIZE        = 10_000   # MCP'den kaç satır çekileceği (per chunk)
+CHUNK_SIZE        = 5_000   # MCP'den kaç satır çekileceği (per chunk) — küçük chunk = hızlı sorgu, daha az iptal/spin riski
 MAX_FETCH_ROWS    = 300_000  # Tek tablodan max çekilecek satır
 ML_SAMPLE_ROWS    = 300_000  # ML eğitimi için max satır
 PROFILE_SAMPLE    = 300_000  # Profiling için max satır (yoksa full)
@@ -318,13 +318,16 @@ async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> 
     from api.core.database import SessionLocal
     from api.schemas.data_group import run_data_group_query_logic, QueryRequest
     from api.models.data_group import DataGroupModel
-    
+
     db_conn = SessionLocal()
     try:
         dg = db_conn.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
         user_id = dg.user_id if dg else 0
     finally:
         db_conn.close()
+
+    # MCP server cannot handle concurrent connections — run tables serially
+    mcp_semaphore = asyncio.Semaphore(1)
 
     async def fetch_one(table: str, db_name: str) -> tuple[str, str]:
         db = SessionLocal()
@@ -789,7 +792,7 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                         header_written = False
                         
                         # Use a safe chunk size below MAX_DISPLAY_ROWS
-                        SAFE_CHUNK_SIZE = 10_000
+                        SAFE_CHUNK_SIZE = 5_000
                         
                         from api.core.database import SessionLocal
                         from api.schemas.data_group import run_data_group_query_logic, QueryRequest
@@ -870,6 +873,18 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
 
     finally:
         duck.close()
+
+    if not data_path and not sql_results:
+        step_names = [s.get("step", "") for s in analysis_plan]
+        print(f"[execution] HATA: data_path boş, sql_results boş. Plan adımları: {step_names}")
+        return {
+            "error": (
+                "Veri çekme adımı çalışmadı. Analiz planı bir 'sql_query' adımı içermiyor "
+                f"veya tanınmayan adım isimleri var: {step_names}. "
+                "Lütfen projeyi yeniden başlatın."
+            ),
+            "current_step": "execution_node",
+        }
 
     return {
         "sql_results": sql_results,
