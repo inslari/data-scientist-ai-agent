@@ -16,6 +16,9 @@ class AgentState(TypedDict, total=False):
     db_intelligence: dict            # DatabaseIntelligenceModel dict
     relevant_tables: list[str]       # Filtered tables for planner
 
+    # Manuel hedef seçimi (UI'dan gelir) — doluysa target_discovery_node bypass edilir
+    target_col: str                  # Kullanıcının UI'dan el ile seçtiği hedef sütun
+
     # Target Discovery Node output
     target_definition: dict          # Target definition for modeling
 

@@ -32,6 +32,7 @@ from src.core.llm import get_llm
 from langchain_core.messages import HumanMessage, SystemMessage
 from src.core.config import settings
 from src.state import AgentState
+from src.core.prompt_loader import load_prompt
 
 
 # LLM Setup
@@ -46,6 +47,17 @@ def _get_llm():
 
 # Context Builder
 
+def _overfitting_scores(ovf: dict) -> tuple[Any, Any, str]:
+    """Overfitting train/test skorunu şemadan bağımsız okur.
+    Classification → train_score/test_score (AUC/accuracy),
+    Regression     → train_r2/test_r2 (R²). Etiket de döner."""
+    if ovf.get("train_score") is not None:
+        return ovf.get("train_score"), ovf.get("test_score"), "skor"
+    if ovf.get("train_r2") is not None:
+        return ovf.get("train_r2"), ovf.get("test_r2"), "R²"
+    return None, None, ""
+
+
 def _build_context(state: AgentState) -> str:
     """Formats all state outputs into a structured text block for the LLM."""
     lines: list[str] = []
@@ -53,20 +65,19 @@ def _build_context(state: AgentState) -> str:
 
     # quality gate
     qg = state.get("quality_gate") or {}
-    print(f"[DEBUG REPORT QG] quality_gate var mi: {bool(qg)}")
-    print(f"[DEBUG REPORT QG] status: {qg.get('status', 'YOK')}")
     if qg:
-        status = qg.get("status", "unknown").upper()
-        severity = qg.get("severity", "ok")
         summary = qg.get("summary", "")
-        
+
+        # Durum rozeti — H1 DEĞİL; deterministik başlığın altında küçük durum satırı.
+        # Kategorik "güvenilir/üretime alınmamalı" iddiası yok, sadece durum işareti.
         badge = {
-            "pass": "✅ MODEL GÜVENİLİR",
-            "warn": "⚠️ DİKKAT — MODELDE ŞÜPHELİ DURUMLAR VAR",
-            "fail": "🛑 MODEL YETERSİZ — ÜRETİME ALINMAMALI",
+            "pass": "✅ Durum: güçlü performans",
+            "warn": "⚠️ Durum: dikkat gerektiren noktalar var",
+            "fail": "🛑 Durum: yetersiz, gözden geçirme gerekli",
         }.get(qg.get("status"), "")
-        
-        lines.append(f"# {badge}\n")
+
+        if badge:
+            lines.append(f"**{badge}**\n")
         lines.append(f"**Karar:** {summary}\n")
         
         failures = qg.get("failures", [])
@@ -272,20 +283,28 @@ def _build_context(state: AgentState) -> str:
                 lines.append("\n### Bootstrap Güven Aralıkları (%95)")
                 for metric, vals in ci.items():
                     lines.append(f"  - {metric}: {vals['mean']} [{vals['lower']} — {vals['upper']}]")
+            else:
+                lines.append("\n*Bootstrap güven aralığı bu çalışmada hesaplanmadı (yetersiz veri veya zaman aşımı).*")
 
-            lines.append(
-                f"\n### Overfitting\n"
-                f"  - Train: {ovf.get('train_score')} | Test: {ovf.get('test_score')}\n"
-                f"  - Fark: {ovf.get('gap')} | Durum: {ovf.get('status')}\n"
-                f"  - {ovf.get('description')}"
-            )
+            train_s, test_s, ovf_label = _overfitting_scores(ovf)
+            if ovf and train_s is not None:
+                lines.append(
+                    f"\n### Overfitting\n"
+                    f"  - Train ({ovf_label}): {train_s} | Test ({ovf_label}): {test_s}\n"
+                    f"  - Fark: {ovf.get('gap')} | Durum: {ovf.get('status')}\n"
+                    f"  - {ovf.get('description')}"
+                )
+            else:
+                lines.append("\n*Overfitting analizi bu çalışmada uygulanmadı.*")
 
-            if cal:
+            if cal and isinstance(cal, dict) and cal.get('brier_score') is not None:
                 lines.append(
                     f"\n### Kalibrasyon\n"
                     f"  - Brier Score: {cal.get('brier_score')}\n"
                     f"  - İyi kalibre: {cal.get('is_well_calibrated')}"
                 )
+            else:
+                lines.append("\n*Kalibrasyon analizi bu çalışmada uygulanmadı (regresyon veya çok sınıflı modelde geçerli değil).*")
 
             if err:
                 conf = err.get("confidence_analysis", {})
@@ -300,10 +319,12 @@ def _build_context(state: AgentState) -> str:
                     for feat, info in list(feat_diff.items())[:3]:
                         lines.append(f"      {feat}: d={info['cohens_d']} ({info['effect_magnitude']})")
 
-            if shap:
+            if shap and shap.get("top5_shap_features"):
                 lines.append("\n### SHAP (Açıklanabilir AI)")
                 for feat, pct in list(shap.get("top5_shap_features", {}).items())[:5]:
                     lines.append(f"  - {feat}: %{pct}")
+            else:
+                lines.append("\n*SHAP açıklanabilirlik analizi bu çalışmada hesaplanmadı.*")
 
             if fi_sum:
                 lines.append(
@@ -327,253 +348,85 @@ def _build_context(state: AgentState) -> str:
                     lines.append(f"  - Grup: {base_col}")
                     for col, metrics in cols.items():
                         lines.append(f"    - {col}: FPR={metrics.get('fpr', 0):.3f}, FNR={metrics.get('fnr', 0):.3f}")
+            else:
+                lines.append("\n*Adalet/yanlılık analizi bu veri setinde uygulanmadı (demografik etiket yok).*")
 
             if opt_thresh:
                 lines.append(f"\n- Optimal Threshold (Youden's J): {opt_thresh}")
 
-            lines.append(
-                f"\n### Güvenilirlik\n"
-                f"  - Skor: {rel.get('score')}/100 | Grade: {rel.get('grade')}\n"
-                f"  - Faktörler: {', '.join(rel.get('factors', []))}"
-            )
+            if rel and rel.get('score') is not None:
+                lines.append(
+                    f"\n### Güvenilirlik\n"
+                    f"  - Skor: {rel.get('score')}/100 | Grade: {rel.get('grade')}\n"
+                    f"  - Faktörler: {', '.join(rel.get('factors', []))}"
+                )
+            else:
+                lines.append("\n*Güvenilirlik skoru bu çalışmada hesaplanmadı.*")
     
     final_context = "\n".join(lines)
-    print(f"[DEBUG REPORT CONTEXT] domain_leakage_report = {state.get('domain_leakage_report')}")
-    print(f"[DEBUG REPORT CONTEXT] 'leakage' kelimesi context'te geciyor mu: {'leakage' in final_context.lower()}")
-    print(f"[DEBUG REPORT CONTEXT] context length: {len(final_context)} chars")
     return final_context
 
 
-# System Prompts — task-specific
+# System Prompts — task-specific (prompts/*.md dosyalarından yüklenir)
 
-SYSTEM_PROMPT = """You are an expert Data Scientist. You will be provided with the complete outputs of an ML pipeline.
-Your task is to analyze these outputs and write a comprehensive, clear, and professional analysis report.
-
-CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
-
-## MANDATORY REPORT HEADER (HIGHEST PRIORITY)
-
-If the context begins with a "Quality Gate Badge" line (a heading starting with ✅, ⚠️, or 🛑), you MUST:
-1. Make this badge line the VERY FIRST line of your report (as a # H1 heading)
-2. Include the "Karar:" summary line right after it
-3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM
-4. THEN proceed with the normal report structure below
-
-Example correct beginning:
-# ⚠️ DİKKAT — MODELDE ŞÜPHELİ DURUMLAR VAR
-**Karar:** Model çalışıyor ancak N dikkat edilmesi gereken durum var. Sonuçları kullanmadan önce kontrol edin.
-
-## Uyarılar (WARN)
-- Yüksek şüpheli leakage: Sales. Tahminler güvenilir olmayabilir.
-- 2 feature anormal yüksek importance'a sahip.
-- MAPE yüksek (%79.8). Tahmin hataları büyük olabilir.
-
-## 📊 Analiz Raporu — [Title]
-> Model: ... | Intent: ... | Tarih: ...
-
-DO NOT skip the Quality Gate badge. DO NOT rephrase it. Copy it verbatim from context.
-If no badge exists in context, skip this header section entirely.
-
----
-
-Write the rest of the report strictly using the following Markdown structure:
-
-# 📊 Analiz Raporu — [Title]
-
-## 1. Yönetici Özeti ve Soruya Yanıt (Executive Summary & Direct Answer)
-Provide a 3-4 sentence summary that a non-technical stakeholder can understand.
-CRITICAL INSTRUCTION: You MUST directly and explicitly answer the user's original query here! If the user asked "Why X happens?", explain the exact reasons based on the feature importance, profiling data, or bias analysis. DO NOT just give a generic model summary.
-What problem was solved, how good is the model, and what is the direct answer to the user's question?
-
-## 2. Veri Kalitesi (Data Quality)
-- Evaluate the overall state of the dataset.
-- Summarize the cleaning operations applied.
-- Highlight any notable data quality issues or outliers.
-
-## 3. Model Performansı (Model Performance)
-- Interpret the most important metrics (do not just list numbers; explain what they mean).
-- Evaluate the reliability of the performance using the Bootstrap Confidence Intervals.
-- Compare the chosen model against other evaluated models.
-
-## 4. Güçlü Yönler (Strengths)
-- Areas where the model excels.
-- Evaluate the model's calibration (e.g., Brier Score).
-- Key insights derived from SHAP values.
-
-## 5. Zayıf Yönler ve Riskler (Weaknesses & Risks)
-- Interpret the overfitting status (Train vs Test gap).
-- Evaluate "High Confidence Errors" (cases where the model was certain but wrong).
-- Draw actionable conclusions from the Error Analysis section.
-
-## 6. Adalet ve Yanlılık Analizi (Fairness & Bias)
-- Analyze the Bias & Fairness metrics (e.g., FPR, FNR differences across demographic groups) if they exist.
-- Identify if the model systematically disadvantages certain groups.
-- If biases are found, explain the real-world implications (e.g., "The model rejects loan applications from Group X more frequently").
-- If no bias data is present, state that it was not evaluated.
-
-## 7. En Etkili Özellikler ve Kullanıcı Sorusunun Kök Nedeni (Most Impactful Features & Root Cause)
-- Compare and interpret SHAP values and Feature Importance.
-- Explain the impact of each top feature on the target variable using **real-world domain knowledge**.
-- CRITICAL: Tie these features back to the user's specific question. If the user asked "Why does group X earn less?", analyze how the top features (e.g., education, age, capital gain) might disproportionately affect or describe group X based on the context.
-- DO NOT use circular, generic, or repetitive statements like "This feature is important because it had the highest contribution score."
-
-## 8. Operasyonel Öneriler (Operational Recommendations)
-- Discuss the Optimal Threshold (if provided) and when it should be used instead of the default 0.5.
-- What needs to be done before putting this model into production?
-- Suggest improvements like regularization or simpler models if applicable.
-
-## 9. Sonraki Adımlar (Next Steps)
-Propose 3-5 concrete, prioritized actionable steps.
-
----
-RULES:
-- OUTPUT LANGUAGE MUST BE TURKISH.
-- THINK DEEPLY. Extract hidden meanings, logical causalities, and business implications from the numbers. Do not just state the numbers. Be a highly experienced senior consultant.
-- Use technical terms but briefly explain them.
-- Put numbers into context (e.g., "0.96 AUC is excellent because...").
-- Do not repeat yourself.
-- Keep the tone professional, authoritative, and fluent.
-- Preserve the exact Markdown formatting (headers, bullet points, bold text).
-"""
+SYSTEM_PROMPT            = load_prompt("report_system_classification.md")
+SYSTEM_PROMPT_REGRESSION = load_prompt("report_system_regression.md")
+SYSTEM_PROMPT_CLUSTERING = load_prompt("report_system_clustering.md")
+SYSTEM_PROMPT_ANOMALY    = load_prompt("report_system_anomaly.md")
 
 
-SYSTEM_PROMPT_CLUSTERING = """You are an expert Data Scientist specializing in unsupervised learning and customer segmentation.
+# Deterministik başlık üretimi (LLM'e bırakılmaz)
 
-CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
-
-## MANDATORY REPORT HEADER (HIGHEST PRIORITY)
-
-If the context begins with a "Quality Gate Badge" line (a heading starting with ✅, ⚠️, or 🛑), you MUST:
-1. Make this badge line the VERY FIRST line of your report (as a # H1 heading)
-2. Include the "Karar:" summary line right after it
-3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM
-4. THEN proceed with the normal clustering report structure below
-
-DO NOT skip the Quality Gate badge. DO NOT rephrase it. Copy it verbatim from context.
-If no badge exists in context, skip this header section entirely.
-
----
-
-Write the rest of the report strictly using the following Markdown structure:
-
-# 📊 Kümeleme Analizi Raporu — [Başlık]
-
-## 1. Yönetici Özeti (Executive Summary)
-Provide a 3-4 sentence summary: how many segments were found, how well-separated they are (Silhouette Score), and what it means for the business.
-
-## 2. Veri Kalitesi (Data Quality)
-- Evaluate the overall state of the dataset.
-- Summarize any cleaning operations applied and their impact.
-- Highlight outliers or quality issues that could affect cluster quality.
-
-## 3. Küme Kalitesi (Cluster Quality)
-- Interpret the Silhouette Score in plain language (what does the number mean, is it good?).
-- Discuss Davies-Bouldin Index and Calinski-Harabasz Score if available.
-- Compare KMeans vs DBSCAN performance from the algorithm comparison table.
-- Explain WHY the selected algorithm outperformed the alternatives.
-
-## 4. Küme Profilleri (Cluster Profiles)
-- For each cluster, describe its relative size and infer likely characteristics.
-- Use domain knowledge to interpret what each segment likely represents.
-- Example: "Küme 0, toplam verinin %X'ini oluşturmaktadır — muhtemelen..."
-
-## 5. Güçlü Yönler (Strengths)
-- Where the segmentation model excels.
-- Explain why the Silhouette score indicates good/excellent cluster separation.
-
-## 6. Zayıf Yönler ve Riskler (Weaknesses & Risks)
-- Potential issues: do the clusters make business sense?
-- Risks of over-interpreting cluster boundaries without domain validation.
-- Limitations of the chosen algorithm (e.g., KMeans assumes spherical clusters).
-
-## 7. Operasyonel Öneriler (Operational Recommendations)
-- How to use these segments in real business decisions.
-- What domain experts should validate before acting on results.
-- Whether additional features or data collection could improve segmentation.
-
-## 8. Sonraki Adımlar (Next Steps)
-Propose 3-5 concrete, prioritized actionable steps.
-
----
-RULES:
-- OUTPUT LANGUAGE MUST BE TURKISH.
-- NEVER mention: Brier Score, ROC-AUC, confusion matrix, F1, precision, recall, SHAP, accuracy, overfitting, high confidence errors.
-  These concepts do NOT apply to unsupervised clustering.
-- Focus on cluster interpretability, business value, and actionable insights.
-- THINK DEEPLY. Extract hidden meanings, logical causalities, and business implications from the numbers. Do not just state the numbers. Be a highly experienced senior consultant.
-- Use technical terms but briefly explain them.
-- Do not repeat yourself.
-- Keep the tone professional, authoritative, and fluent.
-"""
+# Hedef adı yalnızca bu intent'lerde meta satırına yazılır (clustering/anomaly hedefsiz)
+_SUPERVISED_INTENTS = ("classification", "regression")
 
 
-SYSTEM_PROMPT_ANOMALY = """You are an expert Data Scientist specializing in anomaly detection and fraud/outlier analysis.
+def _report_title_for(intent: str) -> str:
+    """Intent'e göre sabit, generik rapor başlığı. Hedef adı başlıkta GEÇMEZ."""
+    if intent == "clustering":
+        return "Kümeleme Analizi Raporu"
+    if intent == "anomaly_detection":
+        return "Anomali Tespiti Raporu"
+    return "Model Değerlendirme Raporu"
 
-CRITICAL: The final output MUST be written entirely in fluent, professional Turkish.
 
-## MANDATORY REPORT HEADER (HIGHEST PRIORITY)
+def _resolve_target_name(state: AgentState) -> str:
+    """
+    Hedef sütun adını önceliğe göre çözer: target_col → target_definition.column_name
+    → feature_plan.target_column. Ham ad korunur (çeviri/güzelleştirme yok).
+    """
+    return (
+        state.get("target_col")
+        or (state.get("target_definition") or {}).get("column_name")
+        or (state.get("feature_plan") or {}).get("target_column")
+        or ""
+    )
 
-If the context begins with a "Quality Gate Badge" line (a heading starting with ✅, ⚠️, or 🛑), you MUST:
-1. Make this badge line the VERY FIRST line of your report (as a # H1 heading)
-2. Include the "Karar:" summary line right after it
-3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM
-4. THEN proceed with the normal anomaly report structure below
 
-DO NOT skip the Quality Gate badge. DO NOT rephrase it. Copy it verbatim from context.
-If no badge exists in context, skip this header section entirely.
+def _build_report_header(state: AgentState) -> str:
+    """
+    Deterministik H1 başlık + meta satırı üretir:
+        # <generik başlık>
+        > hedef: <ham ad> · görev: <intent> · model: <model> · <tarih>
+    Hedef adı yalnızca supervised intent'lerde ve doluysa eklenir.
+    """
+    intent = state.get("intent", "classification")
+    model_name = state.get("model_name", "unknown")
+    timestamp = datetime.now().strftime("%d.%m.%Y %H:%M")
 
----
+    title = _report_title_for(intent)
 
-Write the rest of the report strictly using the following Markdown structure:
+    parts: list[str] = []
+    if intent in _SUPERVISED_INTENTS:
+        target_name = _resolve_target_name(state)
+        if target_name:
+            parts.append(f"hedef: {target_name}")
+    parts.append(f"görev: {intent}")
+    parts.append(f"model: {model_name}")
+    parts.append(timestamp)
 
-# 📊 Anomali Tespiti Raporu — [Başlık]
+    return f"# {title}\n> {' · '.join(parts)}\n"
 
-## 1. Yönetici Özeti (Executive Summary)
-Provide a 3-4 sentence summary: how many anomalies were found, at what rate, and what business risk this signals.
-
-## 2. Veri Kalitesi (Data Quality)
-- Evaluate the overall state of the dataset.
-- Summarize any cleaning operations and their impact on detection quality.
-
-## 3. Anomali Tespiti Performansı (Detection Performance)
-- Interpret the contamination parameter and why it was chosen.
-- Explain the anomaly rate in business terms (is X% normal for this domain?).
-- Compare the contamination scan results to justify the selected threshold.
-
-## 4. Anomali Profili (Anomaly Profile)
-- Interpret the feature importance: which features most drive anomaly scores?
-- Use domain knowledge to explain WHY these features signal anomalies.
-- Example: "Yüksek 'capital.gain' değerleri anomali skorunu artırıyor — bu, ortalama dışı finansal hareketlere işaret edebilir."
-
-## 5. Güçlü Yönler (Strengths)
-- Where the model excels at detecting outliers.
-- Why IsolationForest is appropriate for this dataset.
-
-## 6. Zayıf Yönler ve Riskler (Weaknesses & Risks)
-- False positive risks (normal records flagged as anomalies).
-- False negative risks (real anomalies missed) — especially critical for fraud detection.
-- No ground-truth labels available — results need human validation.
-- Limitations of IsolationForest.
-
-## 7. Operasyonel Öneriler (Operational Recommendations)
-- How to operationalize anomaly flags in a business workflow.
-- Manual review strategy for flagged records.
-- When to adjust the contamination parameter.
-
-## 8. Sonraki Adımlar (Next Steps)
-Propose 3-5 concrete, prioritized actionable steps.
-
----
-RULES:
-- OUTPUT LANGUAGE MUST BE TURKISH.
-- NEVER mention: ROC-AUC, confusion matrix, F1, precision, recall, Brier Score, SHAP, accuracy, calibration.
-  These require ground-truth labels which anomaly detection does NOT have.
-- Focus on anomaly interpretation, business risk, feature drivers, and recommended actions.
-- THINK DEEPLY. Extract hidden meanings, logical causalities, and business implications from the numbers. Do not just state the numbers. Be a highly experienced senior consultant.
-- Use technical terms but briefly explain them.
-- Do not repeat yourself.
-- Keep the tone professional, authoritative, and fluent.
-"""
 
 # Main Node
 def generate_report(state: AgentState) -> dict:
@@ -623,6 +476,8 @@ def generate_report(state: AgentState) -> dict:
         system_prompt = SYSTEM_PROMPT_CLUSTERING
     elif intent == "anomaly_detection":
         system_prompt = SYSTEM_PROMPT_ANOMALY
+    elif intent == "regression":
+        system_prompt = SYSTEM_PROMPT_REGRESSION
     else:
         system_prompt = SYSTEM_PROMPT
 
@@ -650,22 +505,8 @@ def generate_report(state: AgentState) -> dict:
         elif not isinstance(report_text, str):
             report_text = str(report_text)
 
-        # create header note with model name and date 
-        timestamp = datetime.now().strftime("%d.%m.%Y %H:%M")
-        header_note = (
-            f"\n> **Model:** {model_name} | "
-            f"**Intent:** {intent} | "
-            f"**Tarih:** {timestamp}\n"
-        )
-        # add note under first header
-        if "# " in report_text:
-            first_newline = report_text.find("\n")
-            if first_newline != -1:
-                report_text = (
-                    report_text[:first_newline]
-                    + header_note
-                    + report_text[first_newline:]
-                )
+        # Deterministik başlık + meta satırını en üste ekle (LLM başlık üretmiyor).
+        report_text = _build_report_header(state) + "\n" + report_text.lstrip()
 
     except Exception as e:
         print(f"[report] LLM hatası: {e}")
@@ -673,10 +514,6 @@ def generate_report(state: AgentState) -> dict:
         report_text = _generate_fallback_report(state)
 
     print(f"[report] Rapor tamamlandı ({len(report_text)} karakter)")
-    print("\n" + "=" * 60)
-    print("FINAL RAPOR (İlk 500 karakter):")
-    print("=" * 60)
-    print(report_text[:500] + "..." if len(report_text) > 500 else report_text)
 
     return {
         **state,
@@ -709,8 +546,7 @@ def _generate_fallback_report(state: AgentState) -> str:
     score = rel.get("score", 0)
 
     lines = [
-        f"# 📊 Analiz Raporu",
-        f"> **Model:** {model_name} | **Intent:** {intent} | **Tarih:** {timestamp}",
+        _build_report_header(state).rstrip("\n"),
         "",
         "## 1. Yönetici Özeti",
         f"- Analiz tipi: **{intent}**",
@@ -730,27 +566,37 @@ def _generate_fallback_report(state: AgentState) -> str:
         lines += ["", "### Bootstrap Güven Aralıkları (%95)"]
         for metric, vals in ci.items():
             lines.append(f"- **{metric}**: {vals['mean']} [{vals['lower']} — {vals['upper']}]")
+    else:
+        lines.append("\n*Bootstrap güven aralığı bu çalışmada hesaplanmadı.*")
 
-    lines += [
-        "",
-        "## 3. Overfitting Analizi",
-        f"- Train: {ovf.get('train_score')} | Test: {ovf.get('test_score')}",
-        f"- Fark: {ovf.get('gap')} | Durum: **{ovf.get('status')}**",
-        f"- {ovf.get('description', '')}",
-    ]
+    train_s, test_s, ovf_label = _overfitting_scores(ovf)
+    if ovf and train_s is not None:
+        lines += [
+            "",
+            "## 3. Overfitting Analizi",
+            f"- Train ({ovf_label}): {train_s} | Test ({ovf_label}): {test_s}",
+            f"- Fark: {ovf.get('gap')} | Durum: **{ovf.get('status')}**",
+            f"- {ovf.get('description', '')}",
+        ]
+    else:
+        lines.append("\n*Overfitting analizi bu çalışmada uygulanmadı.*")
 
-    if cal:
+    if cal and isinstance(cal, dict) and cal.get('brier_score') is not None:
         lines += [
             "",
             "## 4. Kalibrasyon",
             f"- Brier Score: {cal.get('brier_score')}",
             f"- İyi kalibre: {'✅' if cal.get('is_well_calibrated') else '❌'}",
         ]
+    else:
+        lines.append("\n*Kalibrasyon analizi bu çalışmada uygulanmadı.*")
 
-    if shap:
+    if shap and shap.get("top5_shap_features"):
         lines += ["", "## 5. En Etkili Özellikler (SHAP)"]
         for feat, pct in shap.get("top5_shap_features", {}).items():
             lines.append(f"- **{feat}**: %{pct}")
+    else:
+        lines.append("\n*SHAP açıklanabilirlik analizi bu çalışmada hesaplanmadı.*")
 
     if err:
         conf = err.get("confidence_analysis", {})
@@ -768,6 +614,8 @@ def _generate_fallback_report(state: AgentState) -> str:
             lines.append(f"- **Grup: {base_col}**")
             for col, metrics in cols.items():
                 lines.append(f"  - {col}: FPR={metrics.get('fpr', 0):.3f}, FNR={metrics.get('fnr', 0):.3f}")
+    else:
+        lines.append("\n*Adalet/yanlılık analizi bu veri setinde uygulanmadı (demografik etiket yok).*")
 
     opt_thresh = ev.get("optimal_threshold")
     if opt_thresh:

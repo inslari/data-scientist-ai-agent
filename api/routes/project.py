@@ -100,6 +100,7 @@ def create_project(
         description=project.description,
         query=project.query,
         intent=project.intent,
+        target_col=project.target_col,
         data_group_id=project.data_group_id,
         user_id=current_user.id,
         created_at=int(time.time()),
@@ -163,6 +164,8 @@ def update_project(
         db_project.query = project.query
     if project.intent is not None:
         db_project.intent = project.intent
+    if project.target_col is not None:
+        db_project.target_col = project.target_col
     if project.data_group_id is not None:
         db_project.data_group_id = project.data_group_id
 

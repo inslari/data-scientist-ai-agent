@@ -19,6 +19,7 @@ class ProjectBase(BaseModel):
     query: Optional[str] = None
     data_group_id: Optional[int] = None
     intent: Optional[str] = None
+    target_col: Optional[str] = None
 
 class ProjectCreate(ProjectBase):
     pass
@@ -29,6 +30,7 @@ class ProjectUpdate(BaseModel):
     query: Optional[str] = None
     data_group_id: Optional[int] = None
     intent: Optional[str] = None
+    target_col: Optional[str] = None
 
 class ProjectResponse(ProjectBase):
     id: int

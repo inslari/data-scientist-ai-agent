@@ -29,7 +29,11 @@ with engine.connect() as conn:
     if "description" not in existing_cols:
         print("Adding 'description' column to 'projects'...")
         conn.execute(text("ALTER TABLE projects ADD COLUMN description TEXT"))
-        
+
+    if "target_col" not in existing_cols:
+        print("Adding 'target_col' column to 'projects'...")
+        conn.execute(text("ALTER TABLE projects ADD COLUMN target_col VARCHAR"))
+
     conn.commit()
 
 print("Migration completed.")

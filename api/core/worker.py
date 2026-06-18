@@ -114,6 +114,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
 
     db = SessionLocal()
     project_intent = None
+    project_target_col = None
     try:
         project: ProjectModel | None = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
         if not project:
@@ -122,6 +123,8 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             return
 
         project_intent = getattr(project, "intent", None)
+        # DetachedInstanceError'dan kaçınmak için session AÇIKKEN lokal değişkene oku
+        project_target_col = getattr(project, "target_col", None)
         project.status = "running"
         project.error = None
         db.commit()
@@ -145,6 +148,19 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             initial_state: dict | None = {"user_query": query}
             if project_intent:
                 initial_state["intent"] = project_intent
+            if project_target_col:
+                # Manuel hedef seçimi: target_discovery_node bypass edilecek.
+                # feature_plan_node'un confidence guard'ı bozulmasın diye
+                # target_definition'ı confidence=1.0 ile dolu veriyoruz.
+                initial_state["target_col"] = project_target_col
+                initial_state["target_definition"] = {
+                    "column_name": project_target_col,
+                    "table_name": "",
+                    "is_binary": False,
+                    "description": "",
+                    "confidence": 1.0,
+                    "confirmed": True,
+                }
 
             if is_resume:
                 try:

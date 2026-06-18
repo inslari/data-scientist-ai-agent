@@ -13,36 +13,37 @@ import pandas as pd
 
 def detect_target_lock(X: pd.DataFrame, y: np.ndarray,
                        feature_importance: dict,
+                       intent: str = "classification",
                        importance_threshold: float = 0.05,
                        purity_threshold: float = 0.97,
                        min_bin_fraction: float = 0.05,
+                       variance_collapse_threshold: float = 0.05,
                        n_bins: int = 10) -> list[dict]:
     """
     Yüksek-importance sayısal feature'ları dilimlere böler.
-    Bir dilimde target tek sınıfa kilitleniyorsa (purity > eşik) ve
-    o dilim yeterince büyükse (> min_bin_fraction), sızıntı şüphesi raporlar.
+    Classification: Bir dilimde target tek sınıfa kilitleniyorsa (purity > eşik)
+    Regression: Bir dilimde target varyansı global varyansa göre çöküyorsa (oran < eşik)
+    ve o dilim yeterince büyükse (> min_bin_fraction), sızıntı şüphesi raporlar.
 
     Confidence ayrımı (lokal sıçrama analizi):
       - high: şüpheli dilim komşusundan ANİ kopuyor → yapay leakage şüphesi
-              (örn: date_nunique, %11.9'dan aniden %0'a düşüyor)
       - low:  şüpheli dilim komşusuna KADEMELİ bağlanıyor → meşru güçlü sinyal
-              (örn: active_product, %6'dan kademeli %0.6'ya)
-
-    Hiçbir şey gizlenmez — ikisi de raporlanır, sadece önceliklendirilir.
-    Dataset-agnostik: hiçbir kolon adı hardcode edilmez.
     """
     concerns = []
     y = np.asarray(y)
     n = len(y)
+    
+    is_class = intent.strip().lower() == "classification"
+    global_std = float(np.std(y)) if not is_class else 0.0
 
     for feat, imp in feature_importance.items():
         if imp < importance_threshold:
-            continue  # düşük importance, zarar vermez, atla
+            continue
         if feat not in X.columns:
             continue
         col = X[feat]
         if col.nunique() < n_bins:
-            continue  # yeterince sürekli değil, dilimlenemiyor
+            continue
 
         try:
             bins = pd.qcut(col, q=n_bins, duplicates='drop')
@@ -50,63 +51,87 @@ def detect_target_lock(X: pd.DataFrame, y: np.ndarray,
             continue
 
         df = pd.DataFrame({'bin': bins, 'y': y})
-
-        # Dilim istatistikleri (sıra korunur — qcut zaten artan sırada)
-        bin_stats = df.groupby('bin', observed=True)['y'].agg(['mean', 'count'])
-        rates = bin_stats['mean'].values  # her dilimde pozitif-sınıf oranı
-
-        # Şüpheli dilimi bul (purity yüksek + yeterince büyük)
+        
         flagged_bin = None
         flagged_purity = 0.0
         flagged_size = 0
-        for bin_val, row in bin_stats.iterrows():
-            if row['count'] < min_bin_fraction * n:
+
+        if is_class:
+            bin_stats = df.groupby('bin', observed=True)['y'].agg(['mean', 'count'])
+            rates = bin_stats['mean'].values
+            
+            for bin_val, row in bin_stats.iterrows():
+                if row['count'] < min_bin_fraction * n:
+                    continue
+                grp = df[df['bin'] == bin_val]['y']
+                purity = grp.value_counts(normalize=True).max()
+                if purity >= purity_threshold:
+                    flagged_bin = bin_val
+                    flagged_purity = float(purity)
+                    flagged_size = int(row['count'])
+                    break
+            jump_metrics = rates
+        else:
+            if global_std == 0:
                 continue
-            grp = df[df['bin'] == bin_val]['y']
-            purity = grp.value_counts(normalize=True).max()
-            if purity >= purity_threshold:
-                flagged_bin = bin_val
-                flagged_purity = float(purity)
-                flagged_size = int(row['count'])
-                break
+            
+            bin_stats = df.groupby('bin', observed=True)['y'].agg(['std', 'count'])
+            bin_stats['std'] = bin_stats['std'].fillna(0.0)
+            rates = (bin_stats['std'] / global_std).values
+            
+            for idx, (bin_val, row) in enumerate(bin_stats.iterrows()):
+                if row['count'] < min_bin_fraction * n:
+                    continue
+                oran = rates[idx]
+                if oran <= variance_collapse_threshold:
+                    flagged_bin = bin_val
+                    flagged_purity = float(oran) # We keep the key name as purity for compatibility
+                    flagged_size = int(row['count'])
+                    break
+            jump_metrics = rates
 
         if flagged_bin is None:
-            continue  # kilitlenme yok
+            continue
 
-        # ── Lokal sıçrama analizi ──
-        # Şüpheli dilim, komşusundan ANİ mi kopuyor (leakage) yoksa
-        # KADEMELİ mi bağlanıyor (meşru sinyal)?
         bin_list = list(bin_stats.index)
         flagged_idx = bin_list.index(flagged_bin)
 
-        avg_jump = float(np.abs(np.diff(rates)).mean()) if len(rates) >= 2 else 0.0
+        avg_jump = float(np.abs(np.diff(jump_metrics)).mean()) if len(jump_metrics) >= 2 else 0.0
 
-        # Komşu dilimle fark (önceki varsa önceki, yoksa sonraki)
         if flagged_idx > 0:
-            local_jump = abs(rates[flagged_idx] - rates[flagged_idx - 1])
-        elif flagged_idx < len(rates) - 1:
-            local_jump = abs(rates[flagged_idx] - rates[flagged_idx + 1])
+            local_jump = abs(jump_metrics[flagged_idx] - jump_metrics[flagged_idx - 1])
+        elif flagged_idx < len(jump_metrics) - 1:
+            local_jump = abs(jump_metrics[flagged_idx] - jump_metrics[flagged_idx + 1])
         else:
-            local_jump = 0.0  # tek dilim, karşılaştırılamaz
+            local_jump = 0.0
 
         local_jump_ratio = float(local_jump / (avg_jump + 1e-9))
-
-
-        # Komşusundan 2x+ ani kopuyorsa → leakage şüphesi (high)
-        # Kademeli geçiyorsa → meşru güçlü sinyal (low)
         confidence = "high" if local_jump_ratio >= 2.0 else "low"
 
-        if confidence == "high":
-            reason = (
-                f"'{feat}' bu aralıkta sonucu %{flagged_purity*100:.0f} oranında "
-                f"tek bir değere kilitliyor ve komşu aralıklardan ani şekilde kopuyor. "
-                f"Model gerçek davranıştan değil, bu kopuştan öğreniyor olabilir → olası veri sızıntısı"
-            )
+        if is_class:
+            if confidence == "high":
+                reason = (
+                    f"'{feat}' bu aralıkta sonucu %{flagged_purity*100:.0f} oranında "
+                    f"tek bir değere kilitliyor ve komşu aralıklardan ani şekilde kopuyor. "
+                    f"Model gerçek davranıştan değil, bu kopuştan öğreniyor olabilir → olası veri sızıntısı"
+                )
+            else:
+                reason = (
+                    f"'{feat}' bu aralıkta sonucu %{flagged_purity*100:.0f} oranında belirliyor "
+                    f"ama bu kademeli ve tutarlı bir ilişki → büyük olasılıkla gerçek bir sinyal, sızıntı değil"
+                )
         else:
-            reason = (
-                f"'{feat}' bu aralıkta sonucu %{flagged_purity*100:.0f} oranında belirliyor "
-                f"ama bu kademeli ve tutarlı bir ilişki → büyük olasılıkla gerçek bir sinyal, sızıntı değil"
-            )
+            if confidence == "high":
+                reason = (
+                    f"'{feat}' bu aralıkta hedefin varyansını global varyansın %{flagged_purity*100:.1f}'sine "
+                    f"kadar düşürüyor (neredeyse sabitliyor) ve komşu aralıklardan ani şekilde kopuyor. "
+                    f"Model gerçek davranıştan değil, bu çöküşten öğreniyor olabilir → olası veri sızıntısı"
+                )
+            else:
+                reason = (
+                    f"'{feat}' bu aralıkta hedefin varyansını global varyansın %{flagged_purity*100:.1f}'sine düşürüyor "
+                    f"ama bu kademeli ve tutarlı bir ilişki → büyük olasılıkla gerçek bir sinyal, sızıntı değil"
+                )
 
         concerns.append({
             "feature": feat,

@@ -341,6 +341,19 @@ def _evaluate_regression(
         evaluation["feature_importance"] = fi
         evaluation["feature_importance_summary"] = _summarize_feature_importance(fi)
 
+        # Target-lock (veri sızıntısı) kontrolü — regresyon varyans-çöküşü modu.
+        # Classification ile aynı anahtara yazılır; intent="regression" ile
+        # detect_target_lock'un regresyon dalı (Faz 3) tetiklenir.
+        target_lock_concerns = detect_target_lock(
+            X_test, y_test, feature_importance=fi, intent="regression"
+        )
+        if target_lock_concerns:
+            evaluation["target_lock_leakage"] = target_lock_concerns
+            print(f"[evaluation] Target-lock leakage suphesi: "
+                  f"{len(target_lock_concerns)} feature")
+            for c in target_lock_concerns:
+                print(f"  - {c['feature']} (imp={c['importance']}): {c['reason']}")
+
     # Bootstrap confidence intervals
     print("Bootstrap CI hesaplanıyor...")
     evaluation["confidence_intervals"] = _bootstrap_ci_regression(
@@ -1042,6 +1055,10 @@ def evaluate_model(state: AgentState) -> dict:
 
     # Evaluation regarding task type
     if intent == "regression":
+        # NOT (Faz 4): _evaluate_regression artık target-lock sızıntı kontrolünü
+        # (varyans-çöküşü modu) BİLİNÇLİ olarak çalıştırıyor. Önceden regresyonda
+        # bu 4. savunma sessizce devre dışıydı; artık classification ile aynı
+        # "target_lock_leakage" anahtarını dolduruyor. Bilinçli bir karardır.
         evaluation_report = _evaluate_regression(
             model, X_train, y_train, X_test, y_test, feature_names
         )
