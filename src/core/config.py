@@ -32,23 +32,15 @@ class Settings:
         DATABASES = {}
 
     if not DATABASES:
+        print(DATABASES)
         DATABASES = {
             "default": {
                 "provider": os.getenv("DB_PROVIDER", "sqlite"),
                 "connection_string": os.getenv(
-                    "DB_CONNECTION_STRING",
-                    f"sqlite:///{os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'data', 'adult_income.db')}"
-                )
+                    "DB_CONNECTION_STRING")
             }
         }
 
-    # Absolute path to data/financial.db — used by the MCP server in local mode
-    # (ENVIRONMENT=local) so only the MCP tool layer serves the financial dataset,
-    # while the rest of the app keeps using DATABASES (e.g. PostgreSQL).
-    LOCAL_FINANCIAL_DB_PATH: str = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        "data", "financial.db"
-    )
 
     HISTORY_DB_PROVIDER: str = os.getenv("HISTORY_DB_PROVIDER", "sqlite")
     HISTORY_DB_CONNECTION_STRING: str = os.getenv(

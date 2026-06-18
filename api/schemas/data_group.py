@@ -51,6 +51,10 @@ async def get_data_group_schema_logic(group_id: int, db: Session, user_id: int):
     if db_group.source_type == "mcp":
         if not db_group.mcp_config:
             raise HTTPException(status_code=400, detail="MCP config is missing for this data group")
+        if db_group.mcp_config.schema_cache:
+            print("[MCP] schema_cache hit, skipping MCP call")
+            return {"status": "success", "schema": db_group.mcp_config.schema_cache}
+        print(f"[MCP] schema_cache miss, calling MCP server for get_schema | type={db_group.mcp_config.type} url={getattr(db_group.mcp_config, 'url', None)}")
         schema_text = await _call_mcp_tool(db_group.mcp_config, "get_schema")
         return {"status": "success", "schema": schema_text}
         
