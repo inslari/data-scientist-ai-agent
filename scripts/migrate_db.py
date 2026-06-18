@@ -31,6 +31,10 @@ with engine.connect() as conn:
         print("Adding 'description' column to 'projects'...")
         conn.execute(text("ALTER TABLE projects ADD COLUMN description TEXT"))
 
+    if "target_col" not in existing_cols:
+        print("Adding 'target_col' column to 'projects'...")
+        conn.execute(text("ALTER TABLE projects ADD COLUMN target_col VARCHAR"))
+
     # Domain (sector) pack selection
     if "domain_pack" not in existing_cols:
         print("Adding 'domain_pack' column to 'projects'...")

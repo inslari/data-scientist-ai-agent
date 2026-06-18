@@ -119,12 +119,18 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     domain_doc = ""
 
     db = SessionLocal()
+    project_intent = None
+    project_target_col = None
     try:
         project: ProjectModel | None = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
         if not project:
             print(f"[Worker] Project {project_id} not found; skipping job {job.id}.")
             _mark_job(job.id, "failed", "Project not found")
             return
+
+        project_intent = getattr(project, "intent", None)
+        # DetachedInstanceError'dan kaçınmak için session AÇIKKEN lokal değişkene oku
+        project_target_col = getattr(project, "target_col", None)
 
         dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first() if data_group_id else None
         if project.domain_pack:
@@ -158,6 +164,21 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             domain_pack = resolved_domain_pack
             # domain_doc resolved above from the data group (dataset description)
             initial_state: dict | None = {"user_query": query, "domain_pack": domain_pack, "domain_doc": domain_doc}
+            if project_intent:
+                initial_state["intent"] = project_intent
+            if project_target_col:
+                # Manuel hedef seçimi: target_discovery_node bypass edilecek.
+                # feature_plan_node'un confidence guard'ı bozulmasın diye
+                # target_definition'ı confidence=1.0 ile dolu veriyoruz.
+                initial_state["target_col"] = project_target_col
+                initial_state["target_definition"] = {
+                    "column_name": project_target_col,
+                    "table_name": "",
+                    "is_binary": False,
+                    "description": "",
+                    "confidence": 1.0,
+                    "confirmed": True,
+                }
 
             if is_resume:
                 try:

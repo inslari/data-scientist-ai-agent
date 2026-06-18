@@ -26,6 +26,10 @@ def route_after_db_context(state: AgentState) -> str:
     intent = state.get("intent", "eda")
     if intent == "sql_query":
         return "sql_node"
+    # Manuel hedef seçimi: kullanıcı UI'dan hedefi verdiyse otomatik
+    # target_discovery'yi atla, doğrudan planner'a git.
+    if state.get("target_col"):
+        return "planner_node"
     return "target_discovery_node"
 
 
@@ -114,7 +118,8 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
         route_after_db_context,
         {
             "sql_node":              "sql_node",
-            "target_discovery_node": "target_discovery_node",   # planner_node yerine
+            "target_discovery_node": "target_discovery_node",
+            "planner_node":          "planner_node",            # manuel hedef → discovery bypass
         },
 )
 

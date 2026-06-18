@@ -269,6 +269,43 @@ def _resolve_target(
     return best
 
 
+# Manuel hedef seçimi: görev tipini hedef sütunun verisinden çıkar
+def infer_task_type(series) -> str:
+    """
+    Hedef sütunun verisinden görev tipini (classification/regression) çıkarır.
+
+    Eşikler bu dosyadaki _find_candidates skorlama mantığından BİREBİR alındı
+    (yeni eşik uydurulmadı):
+      - non-numeric dtype                    → classification
+        (regression sayısal kolon ister; ml_trainer satır 925-931 ile tutarlı)
+      - binary (0/1, True/False)             → classification
+        (_find_candidates is_binary, satır 75-78 / 97)
+      - sayısal + unique_count > 50          → regression
+        (_find_candidates satır 108: en güçlü regression sinyali)
+      - sayısal + düşük kardinalite (≤50)    → classification
+        (_find_candidates satır 120-125: düşük kardinalite classification ister)
+    """
+    import pandas as pd
+
+    s = series.dropna()
+
+    # non-numeric → classification
+    if not pd.api.types.is_numeric_dtype(s):
+        return "classification"
+
+    # binary (0/1) → classification
+    unique_vals = set(str(v) for v in s.unique())
+    if unique_vals <= {"0", "1"} or \
+       unique_vals <= {"0.0", "1.0"} or \
+       unique_vals <= {"True", "False"}:
+        return "classification"
+
+    # sayısal + yüksek kardinalite → regression, aksi halde classification
+    if s.nunique() > 50:
+        return "regression"
+    return "classification"
+
+
 # Main node
 def discover_target(state: dict) -> dict:
     """
@@ -324,7 +361,7 @@ def discover_target(state: dict) -> dict:
     target_dict = {
         "column_name": best.column_name,
         "table_name":  best.table_name,
-        "is_binary":   best.is_binary,
+        "is_binary":   best.is_binary,  # regresyonda üretilir ama göz ardı edilir (zararsız)
         "description": best.description,
         "confidence":  round(confidence, 2),
         "confirmed":   False, 

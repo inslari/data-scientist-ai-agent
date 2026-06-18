@@ -96,28 +96,51 @@ def evaluate_quality_gate(state: dict) -> dict:
     high_lock = [c for c in target_lock if c.get("confidence") == "high"]
     low_lock = [c for c in target_lock if c.get("confidence") == "low"]
 
+    # Mesajlar task tipine göre dallanır: regresyonda "varyansı dar bir aralıkta
+    # neredeyse sabitliyor" dili, classification'da mevcut "sonucu belirliyor" dili.
+    is_regression = "regression" in task
+
     if high_lock:
         feats = ", ".join(c["feature"] for c in high_lock)
-        warnings.append({
-            "code": "target_lock_leakage_high",
-            "message": (
+        if is_regression:
+            high_message = (
+                f"Olası veri sızıntısı: {feats}. "
+                f"Bu özellikler belirli aralıklarda hedefi dar bir bantta neredeyse tam belirliyor "
+                f"(hedefin varyansı çöküyor) — yani model 'tahmin' etmek yerine cevabı doğrudan "
+                f"görüyor olabilir. Gerçek kullanımda bu bilgi elde olmayabilir; bu özelliklerin "
+                f"çıkarılması önerilir."
+            )
+        else:
+            high_message = (
                 f"Olası veri sızıntısı: {feats}. "
                 f"Bu özellikler belirli aralıklarda sonucu neredeyse kesin belirliyor — "
                 f"yani model 'tahmin' etmek yerine cevabı doğrudan görüyor olabilir. "
                 f"Gerçek kullanımda bu bilgi elde olmayabilir; bu özelliklerin çıkarılması önerilir."
-            ),
+            )
+        warnings.append({
+            "code": "target_lock_leakage_high",
+            "message": high_message,
             "details": high_lock,
         })
     if low_lock:
         feats = ", ".join(c["feature"] for c in low_lock)
-        warnings.append({
-            "code": "target_lock_signal_low",
-            "message": (
+        if is_regression:
+            low_message = (
+                f"Güçlü belirleyici özellik: {feats}. "
+                f"Hedefle güçlü ama tutarlı bir ilişkisi var (belirli aralıklarda varyansını "
+                f"kademeli azaltıyor) — bu genelde normaldir, sızıntı değil gerçek bir sinyaldir. "
+                f"Yine de gerçek kullanımda bu bilginin elde olacağından emin olun."
+            )
+        else:
+            low_message = (
                 f"Güçlü belirleyici özellik: {feats}. "
                 f"Sonuçla güçlü ama tutarlı bir ilişkisi var — bu genelde normaldir, "
                 f"sızıntı değil gerçek bir sinyaldir. Yine de gerçek kullanımda bu bilginin "
                 f"elde olacağından emin olun."
-            ),
+            )
+        warnings.append({
+            "code": "target_lock_signal_low",
+            "message": low_message,
             "details": low_lock,
         })
 
@@ -141,14 +164,60 @@ def evaluate_quality_gate(state: dict) -> dict:
                 "value": round(mape, 1),
             })
 
+    # ── Manuel hedef seçimi sanity-check (öneri DEĞİL, bariz hata WARN'ı) ──
+    # Yalnızca kullanıcı UI'dan hedefi el ile seçtiyse (target_col dolu) çalışır.
+    # Engelleyici değil — pipeline çalışmaya devam eder, sadece WARN gösterilir.
+    # profile_table'dan gelen hazır veriyi kullanır, yeniden hesaplama yok.
+    target_col = state.get("target_col")
+    if target_col:
+        checks_performed.append("target_sanity")
+        profiling_report = state.get("profiling_report") or {}
+        target_profile = (profiling_report.get("columns") or {}).get(target_col) or {}
+        unique_count = target_profile.get("unique_count")
+        unique_rate  = target_profile.get("unique_rate")
+        null_rate    = target_profile.get("null_rate")
+
+        # 1) Sıfır varyans — tek değer
+        if unique_count is not None and unique_count <= 1:
+            warnings.append({
+                "code": "target_zero_variance",
+                "message": (
+                    f"Seçilen hedef '{target_col}' tek bir değerden oluşuyor (sıfır varyans) — "
+                    f"modellenecek bir değişkenlik yok."
+                ),
+                "value": unique_count,
+            })
+        # 2) ID-vari — kardinalite ≈ satır sayısı (eşik feature_builder ile aynı: 0.95)
+        elif unique_rate is not None and unique_rate > 0.95:
+            warnings.append({
+                "code": "target_id_like",
+                "message": (
+                    f"Seçilen hedef '{target_col}' neredeyse tüm satırlarda benzersiz "
+                    f"(%{unique_rate*100:.0f}) — bir kimlik (ID) sütunu olabilir, "
+                    f"modelleme anlamlı olmayabilir."
+                ),
+                "value": round(unique_rate, 4),
+            })
+
+        # 3) Yüksek null — null_rate > %50
+        if null_rate is not None and null_rate > 0.50:
+            warnings.append({
+                "code": "target_high_null",
+                "message": (
+                    f"Seçilen hedef '{target_col}' satırların %{null_rate*100:.0f}'inde boş — "
+                    f"yüksek eksik oranı modellemeyi güvenilmez kılabilir."
+                ),
+                "value": round(null_rate, 4),
+            })
+
     # ── Sonuç ─────────────────────────────────────────
-    
+
     if failures:
         status = "fail"
         severity = "critical"
         summary = (
             f"Model yetersiz — {len(failures)} kritik sorun tespit edildi. "
-            "Üretime alınması önerilmez."
+            "Sonuçlar bu haliyle güvenilir değil; sorunlar giderilmeden kullanılmamalı."
         )
     elif warnings:
         status = "warn"
@@ -160,7 +229,10 @@ def evaluate_quality_gate(state: dict) -> dict:
     else:
         status = "pass"
         severity = "ok"
-        summary = "Model güvenilir, üretime alınabilir."
+        summary = (
+            "Model güçlü performans gösteriyor. Dağıtımdan önce bağımsız "
+            "doğrulama ve sürekli izleme önerilir."
+        )
 
     print(f"\n[quality_gate] STATUS: {status.upper()}")
     print(f"[quality_gate] {summary}")

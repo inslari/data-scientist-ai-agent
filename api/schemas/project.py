@@ -19,6 +19,7 @@ class ProjectBase(BaseModel):
     query: Optional[str] = None
     data_group_id: Optional[int] = None
     intent: Optional[str] = None
+    target_col: Optional[str] = None
     domain_pack: Optional[str] = None   # None/empty = inherit (data group → global)
 
 class ProjectCreate(ProjectBase):
@@ -30,6 +31,7 @@ class ProjectUpdate(BaseModel):
     query: Optional[str] = None
     data_group_id: Optional[int] = None
     intent: Optional[str] = None
+    target_col: Optional[str] = None
     domain_pack: Optional[str] = None
 
 class ProjectResponse(ProjectBase):

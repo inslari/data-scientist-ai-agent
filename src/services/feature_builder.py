@@ -846,9 +846,10 @@ def build_features(state: dict) -> dict:
         y_train = y_test = pd.Series([], dtype=int)
         print(f"[feature_eng] Unsupervised — split atlandi")
     else:
+        stratify_arg = y if intent.strip().lower() == "classification" else None
         try:
             X_train, X_test, y_train, y_test = train_test_split(
-                df, y, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED, stratify=y
+                df, y, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED, stratify=stratify_arg
             )
         except ValueError:
             X_train, X_test, y_train, y_test = train_test_split(

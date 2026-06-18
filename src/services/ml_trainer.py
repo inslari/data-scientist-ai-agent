@@ -911,6 +911,7 @@ def train_model(state: AgentState) -> dict:
     y_train_raw = state.get("y_train", [])
     y_test_raw = state.get("y_test", [])
     intent = state.get("intent", "classification")
+    intent_norm = intent.strip().lower() if isinstance(intent, str) else "classification"
 
     if not X_train_raw:
         return {**state, "error": "AutoML için veri bulunamadı.",
@@ -922,14 +923,14 @@ def train_model(state: AgentState) -> dict:
     feature_names = X_train.columns.tolist()
 
     # Auto-correct intent if y is categorical string but intent is regression
-    if intent == "regression" and y_train.dtype.kind in ('O', 'U', 'S'):
+    if intent_norm == "regression" and y_train.dtype.kind in ('O', 'U', 'S'):
         try:
             y_train.astype(float)
         except ValueError:
             print("[automl] Uyarı: y değişkeni string içeriyor, intent 'classification' olarak değiştirildi.")
-            intent = "classification"
+            intent_norm = "classification"
 
-    if intent == "classification" or (intent not in ("regression", "clustering", "anomaly_detection")):
+    if intent_norm == "classification" or (intent_norm not in ("regression", "clustering", "anomaly_detection")):
         le = LabelEncoder()
         y_train = le.fit_transform(y_train)
         known_classes = set(le.classes_)
@@ -938,7 +939,7 @@ def train_model(state: AgentState) -> dict:
     print(f"\n[automl] Başlıyor:")
     print(f"  X_train : {X_train.shape}")
     print(f"  X_test  : {X_test.shape}")
-    print(f"  Intent  : {intent}")
+    print(f"  Intent  : {intent_norm}")
 
     # Task routing   
     top_models = state.get("top_models", [])
@@ -948,19 +949,19 @@ def train_model(state: AgentState) -> dict:
     if strong_regularization:
         print("[automl] Critic Node'dan Strong Regularization (Finetuning) sinyali alındı!")
 
-    if intent == "classification":
+    if intent_norm == "classification":
         model_name, model, metrics = _run_classification(
             X_train, y_train, X_test, y_test, feature_names, top_models, strong_regularization
         )
-    elif intent == "regression":
+    elif intent_norm == "regression":
         model_name, model, metrics = _run_regression(
             X_train, y_train, X_test, y_test, feature_names, top_models, strong_regularization
         )
-    elif intent == "clustering":
+    elif intent_norm == "clustering":
         model_name, model, metrics = _run_clustering(
             X_train, X_test, feature_names
         )
-    elif intent == "anomaly_detection":
+    elif intent_norm == "anomaly_detection":
         model_name, model, metrics = _run_anomaly_detection(
             X_train, X_test, feature_names
         )

@@ -11,6 +11,7 @@ class ProjectModel(Base):
     description = Column(Text, nullable=True)
     query = Column(Text, nullable=True)
     intent = Column(String, nullable=True)
+    target_col = Column(String, nullable=True)
     data_group_id = Column(Integer, ForeignKey("data_groups.id", ondelete="SET NULL"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
 
