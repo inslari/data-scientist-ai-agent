@@ -76,6 +76,13 @@ class _RecordQuery(BaseModel):
     sql: str = Field(description="The complete, ready-to-run SQL query")
 
 
+class _ProposeFeature(BaseModel):
+    name: str = Field(description="Output column name, e.g. 'amount_to_balance_ratio'")
+    op: str = Field(description="One of: ratio, product, difference (2 inputs); zscore, log (1 input)")
+    inputs: List[str] = Field(description="Existing column name(s) the op consumes, in order — use the EXACT columns you saw in the data")
+    rationale: str = Field(default="", description="Why this feature matters for this dataset")
+
+
 def _build_expert_agent(expert, run_sql_tool):
     from langchain.agents import create_agent
     from langchain_core.tools import tool
@@ -91,6 +98,20 @@ def _build_expert_agent(expert, run_sql_tool):
         """Save a useful analytical query you discovered. Call up to 3 times — once per genuinely useful query that reveals important patterns, risks, or business insights about this dataset. Only save queries you actually ran and that returned meaningful results."""
         return {"status": "recorded", "title": title}
 
+    @tool(args_schema=_ProposeFeature)
+    def propose_feature(name: str, op: str, inputs: List[str], rationale: str = "") -> dict:
+        """Propose ONE executable, deterministic feature to engineer. Call up to 3 times.
+
+        Pick an `op` from the fixed palette and reference the EXACT existing columns you saw:
+          - ratio(a, b)       → a / |b|   (scale-invariant signals, e.g. max_amount / avg_amount)
+          - product(a, b)     → a * b
+          - difference(a, b)  → a - b
+          - zscore(a)         → standardized a (how far from the population mean)
+          - log(a)            → log1p of a (compress heavy-tailed amounts)
+        Only propose a feature when your data investigation showed it carries signal. Do NOT use
+        the target column or anything derived from it as an input (leakage)."""
+        return {"status": "recorded", "name": name}
+
     system_prompt = (
         f"You are the {expert.name} of a Merchant Intelligence Engine for financial/payments data.\n"
         f"Persona: {expert.summary}\n"
@@ -101,23 +122,52 @@ def _build_expert_agent(expert, run_sql_tool):
         "2. Ground every claim in numbers you actually retrieved — do not guess.\n"
         "3. Call record_query (up to 3 times) for each query you ran that revealed a genuinely useful "
         "pattern, risk, or business insight. Include the exact SQL you used.\n"
-        "4. Finally call record_findings EXACTLY ONCE with your structured conclusions "
+        "4. Call propose_feature (up to 3 times) for executable features your investigation justifies — "
+        "YOU decide which transforms matter for THIS dataset, referencing the real columns. The pipeline "
+        "will build exactly these deterministically. Never use the target (or its derivatives) as an input.\n"
+        "5. Finally call record_findings EXACTLY ONCE with your structured conclusions "
         "(summary, key_signals with numbers, recommended_target, recommended_features, risks, "
         "interpretation_notes). Do not call run_sql after record_findings.\n"
         "Only reference columns/tables that exist in the schema below."
     )
 
-    agent = create_agent(model=get_llm(temperature=0), tools=[run_sql_tool, record_findings, record_query], system_prompt=system_prompt)
+    agent = create_agent(
+        model=get_llm(temperature=0),
+        tools=[run_sql_tool, record_findings, record_query, propose_feature],
+        system_prompt=system_prompt,
+    )
     return agent
 
 
+_VALID_FEATURE_OPS = {"ratio", "product", "difference", "zscore", "log"}
+_FEATURE_OP_ARITY = {"ratio": 2, "product": 2, "difference": 2, "zscore": 1, "log": 1}
+
+
+def _parse_feature_spec(args: dict):
+    """Build a validated FeatureSpec from a propose_feature tool call, or None."""
+    from src.domains.schemas import FeatureSpec
+
+    name = (args.get("name") or "").strip()
+    op = (args.get("op") or "").strip().lower()
+    inputs = [str(c).strip() for c in (args.get("inputs") or []) if str(c).strip()]
+    if not name or op not in _VALID_FEATURE_OPS:
+        return None
+    if len(inputs) != _FEATURE_OP_ARITY[op]:
+        return None
+    try:
+        return FeatureSpec(name=name, op=op, inputs=inputs, rationale=args.get("rationale", ""))
+    except Exception:
+        return None
+
+
 def _extract_finding(expert_key: str, result: dict) -> ExpertFinding:
-    """Pull the record_findings args + run_sql audit trail + record_query calls from the agent transcript."""
-    from src.domains.schemas import DiscoveredQuery
+    """Pull the record_findings args + run_sql audit trail + record_query/propose_feature calls."""
+    from src.domains.schemas import DiscoveredQuery, FeatureSpec
 
     findings_args: Optional[dict] = None
     queries: list[str] = []
     discovered: list[DiscoveredQuery] = []
+    feature_specs: list[FeatureSpec] = []
 
     for msg in result.get("messages", []):
         for tc in (getattr(msg, "tool_calls", None) or []):
@@ -133,13 +183,18 @@ def _extract_finding(expert_key: str, result: dict) -> ExpertFinding:
                     description=args.get("description", ""),
                     sql=args["sql"],
                 ))
+            elif name == "propose_feature":
+                spec = _parse_feature_spec(args)
+                if spec is not None:
+                    feature_specs.append(spec)
 
     if findings_args is None:
         last = result.get("messages", [])[-1] if result.get("messages") else None
         text = getattr(last, "content", "") if last else ""
         if isinstance(text, list):
             text = " ".join(str(p) for p in text)
-        return ExpertFinding(expert=expert_key, summary=str(text)[:1000], queries_used=queries, discovered_queries=discovered)
+        return ExpertFinding(expert=expert_key, summary=str(text)[:1000], queries_used=queries,
+                             discovered_queries=discovered, feature_specs=feature_specs)
 
     return ExpertFinding(
         expert=expert_key,
@@ -151,6 +206,7 @@ def _extract_finding(expert_key: str, result: dict) -> ExpertFinding:
         queries_used=queries,
         interpretation_notes=findings_args.get("interpretation_notes", ""),
         discovered_queries=discovered,
+        feature_specs=feature_specs,
     )
 
 

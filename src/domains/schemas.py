@@ -8,9 +8,30 @@ four touch points (intent / query / feature engineering / interpretation).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+# The safe, parameterized op palette an expert agent may compose. Each op is a
+# deterministic, leakage-checkable transform — the agent never writes raw code.
+FeatureOp = Literal["ratio", "product", "difference", "zscore", "log"]
+
+
+class FeatureSpec(BaseModel):
+    """An executable feature the expert agent *decided* to build.
+
+    The agent picks an ``op`` from the fixed palette and names the REAL input
+    columns it saw while investigating the data — so there is no dependency on
+    any internal naming convention. The feature builder validates the spec
+    against the actual schema (columns exist, not the target/leaky) and applies
+    the op deterministically. Invalid specs are skipped, never executed.
+    """
+
+    name: str = Field(description="Output column name, e.g. 'amount_to_balance_ratio'")
+    op: FeatureOp = Field(description="Transform: ratio|product|difference (2 inputs), zscore|log (1 input)")
+    inputs: list[str] = Field(description="Existing column name(s) the op consumes, in order")
+    rationale: str = Field(default="", description="Why this feature matters for this dataset")
 
 
 class DiscoveredQuery(BaseModel):
@@ -48,6 +69,10 @@ class ExpertFinding(BaseModel):
     discovered_queries: list[DiscoveredQuery] = Field(
         default_factory=list,
         description="Useful analytical queries the expert saved for reuse",
+    )
+    feature_specs: list[FeatureSpec] = Field(
+        default_factory=list,
+        description="Executable feature specs the expert decided to build (agent-driven)",
     )
 
 
