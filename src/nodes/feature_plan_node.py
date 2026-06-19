@@ -223,14 +223,24 @@ def _validate_target_selection(
     db_intelligence: dict,
     target_definition: dict | None = None,
 ) -> None:
-    current_target = plan_dict.get("target", {}).get("column_name", "")
+    target_block   = plan_dict.get("target", {})
+    current_target = target_block.get("column_name", "")
     all_cols       = db_intelligence.get("columns", [])
     target_def     = target_definition or {}
     discovery_target = target_def.get("column_name", "")
     confidence       = target_def.get("confidence", 0.0)
-    
+
     print(f"[DEBUG VALIDATE] target_definition param = {target_definition}")
     print(f"[DEBUG VALIDATE] discovery_target = '{discovery_target}', confidence = {confidence}")
+
+    # ── GUARD: türetilmiş hedef tanım gereği MEVCUT KOLON DEĞİLDİR ──
+    # (ör. churn: veride churn kolonu yok, date + cust_id'den türetilecek). Bunu
+    # 'halüsinasyon' sanıp override etme/silme — LLM bilinçli olarak türetmeyi seçti.
+    if target_block.get("is_derived", False):
+        print(f"[feature_plan] Hedef '{current_target}' türetilmiş "
+              f"(derivation_type={target_block.get('derivation_type', '?')}) — "
+              f"kolon-varlık doğrulaması atlanıyor.")
+        return
     # ── GUARD: target_discovery karar verdiyse, DOKUNMA ──
     if discovery_target and confidence >= 0.4:
         # db'de var mı sadece onu kontrol et
