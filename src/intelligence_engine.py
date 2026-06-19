@@ -53,6 +53,71 @@ class SchemaGraph(BaseModel):
     nodes: List[str] = Field(description="List of tables and/or columns as nodes")
     edges: List[str] = Field(description="List of relationships/joins between nodes")
 
+
+# Tables that are ML artifacts (test split / submission template), NOT training
+# tables — they must never be auto-joined into the feature/label set.
+_ARTIFACT_TABLE_RE = re.compile(r"(?:^|_)(test|submission|holdout)(?:$|_)", re.IGNORECASE)
+
+
+def _is_artifact_table(name: str) -> bool:
+    return bool(_ARTIFACT_TABLE_RE.search(name or ""))
+
+
+def _looks_like_join_key(column_name: str, semantic_type: str) -> bool:
+    """A column usable as a cross-table join key: an identifier or an *_id name."""
+    n = (column_name or "").strip().lower()
+    if not n:
+        return False
+    if (semantic_type or "").lower() == "identifier":
+        return True
+    return n == "id" or n.endswith("_id")
+
+
+def _augment_shared_key_relationships(model: "DatabaseIntelligenceModel") -> "DatabaseIntelligenceModel":
+    """Deterministically add relationships the LLM missed: when two NON-artifact
+    tables share an identifier column (e.g. ``cust_id``), link them so the executor
+    will join them. Artifact tables (``*_test``, ``sample_submission`` …) are skipped
+    so a label/feature join never pulls in the test split or submission template.
+
+    Idempotent: only adds pairs that don't already exist; safe to run after the LLM.
+    """
+    # key column (lowercased) -> ordered unique [(table, original_col), ...] (non-artifact)
+    by_key: dict[str, list[tuple[str, str]]] = {}
+    for c in model.columns:
+        if not _looks_like_join_key(c.column_name, getattr(c, "semantic_type", "")):
+            continue
+        if _is_artifact_table(c.table_name):
+            continue
+        entries = by_key.setdefault(c.column_name.strip().lower(), [])
+        if not any(t == c.table_name for t, _ in entries):
+            entries.append((c.table_name, c.column_name))
+
+    existing = {
+        frozenset([(r.source_table, r.source_column), (r.target_table, r.target_column)])
+        for r in model.relationships
+    }
+
+    added: list[tuple[str, str, str]] = []
+    for key, tabs in by_key.items():
+        if len(tabs) < 2:
+            continue
+        anchor_t, anchor_c = tabs[0]               # star-link the rest to the first
+        for t, col in tabs[1:]:
+            pair = frozenset([(anchor_t, anchor_c), (t, col)])
+            if pair in existing:
+                continue
+            model.relationships.append(Relationship(
+                source_table=anchor_t, source_column=anchor_c,
+                target_table=t, target_column=col,
+                relationship_type="many-to-many",
+            ))
+            existing.add(pair)
+            added.append((anchor_t, t, key))
+
+    if added:
+        print(f"[intelligence] Shared-key ilişkileri eklendi (artifact hariç): {added}")
+    return model
+
 class DatabaseIntelligenceModel(BaseModel):
     tables: List[TableUnderstanding]
     columns: List[ColumnProfile]
@@ -299,5 +364,13 @@ For each column, assign semantic_type using this strict decision tree:
             "foreign_keys": foreign_keys or "No explicit foreign keys provided.",
             "format_instructions": parser.get_format_instructions()
         })
-        
+
+        # Deterministic safety net: link tables sharing an identifier key that the
+        # LLM may have missed (e.g. label table ↔ feature tables on cust_id),
+        # while excluding test/submission artifacts.
+        try:
+            response = _augment_shared_key_relationships(response)
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[intelligence] Shared-key augmentation atlandı: {e}")
+
         return response

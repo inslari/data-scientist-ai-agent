@@ -98,6 +98,35 @@ class InterpretLens:
         return bool(self.system_suffix.strip())
 
 
+class FeatureRecipe:
+    """A deterministic, executable feature transform contributed by a pack.
+
+    Unlike the text hooks (which only *nudge* the LLM via prompt text), a recipe
+    **guarantees** the feature is materialized whenever its inputs are present —
+    no LLM in the loop. Recipes run at model grain inside the feature builder,
+    at the same point as the plan's ``math_interactions``.
+
+    Contract (duck-typed; ``df`` is a pandas DataFrame, ``meta`` is optional and
+    pack-defined — kept untyped here so ``base`` stays import-light):
+
+    * :meth:`applies` — cheap guard: do the required input columns exist?
+    * :meth:`build`   — return ``{new_column_name: pandas.Series}`` to add.
+
+    Both must be pure and must never raise on the happy path; the builder also
+    wraps every recipe in try/except so a bad recipe can't break the pipeline.
+    """
+
+    name: str = "recipe"
+    description: str = ""
+    leakage_safe: bool = True   # False → builder may skip it under leakage pressure
+
+    def applies(self, df, meta=None) -> bool:  # noqa: ANN001
+        return True
+
+    def build(self, df, meta=None) -> dict:  # noqa: ANN001
+        return {}
+
+
 class DomainPack(ABC):
     """Base class for all sector packs.
 
@@ -151,6 +180,21 @@ class DomainPack(ABC):
         this. Returning None makes the hooks fall back to their static text.
         """
         return None
+
+    # ── Deterministic feature recipes (executable, not prompt text) ──────────
+    def feature_recipes(
+        self,
+        ctx: MerchantContext,
+        db_intelligence: Optional[dict] = None,
+        analysis=None,
+    ) -> list["FeatureRecipe"]:
+        """Return deterministic feature transforms to materialize for this query.
+
+        Default: none. Packs that override this *guarantee* their features get
+        built (when inputs exist), as opposed to :meth:`feature_hints` which only
+        suggests features to the LLM.
+        """
+        return []
 
     # ── Touch point 1: intent discovery ─────────────────────────────────────
     def enrich_intent_prompt(self, ctx: MerchantContext, domain_doc: str = "") -> str:

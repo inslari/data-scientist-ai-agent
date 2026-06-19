@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-from src.domains.base import DomainPack, InterpretLens, MerchantContext, trim_doc
+from src.domains.base import DomainPack, FeatureRecipe, InterpretLens, MerchantContext, trim_doc
 from src.domains.schemas import MerchantAnalysis
 from . import router as _router
 from .experts import ALL_EXPERTS
+from .feature_recipes import recipes_for
 
 
 class FinancialPack(DomainPack):
@@ -63,6 +64,19 @@ class FinancialPack(DomainPack):
     def _expert_names(self, ctx: MerchantContext) -> str:
         experts = self.active_experts(ctx)
         return ", ".join(e.name for e in experts) if experts else "Financial Analyst"
+
+    # ── Deterministic feature recipes (executable, not prompt text) ──────────
+    def feature_recipes(self, ctx, db_intelligence=None, analysis=None) -> list[FeatureRecipe]:
+        """Guaranteed risk/revenue features derived from the aggregated metrics.
+
+        Gated on the active expert(s): only fires for fraud/revenue/payment, where
+        volatility and amount-spike signals are meaningful.
+        """
+        keys: list[str] = []
+        if ctx is not None:
+            keys = ctx.council if (ctx.is_council and ctx.council) else [ctx.primary_expert]
+        keys = [k for k in keys if k]
+        return recipes_for(keys)
 
     # ── Touch point 1: intent discovery ──────────────────────────────────────
     def enrich_intent_prompt(self, ctx: MerchantContext, domain_doc: str = "") -> str:

@@ -18,7 +18,7 @@ Add a new sector by creating ``src/domains/<sector>/pack.py`` and registering it
 in ``registry.py``.
 """
 
-from .base import DomainPack, Expert, MerchantContext, InterpretLens
+from .base import DomainPack, Expert, MerchantContext, InterpretLens, FeatureRecipe
 from .null_pack import NullDomainPack
 from .registry import get_active_pack, register_pack, list_packs
 
@@ -27,6 +27,7 @@ __all__ = [
     "Expert",
     "MerchantContext",
     "InterpretLens",
+    "FeatureRecipe",
     "NullDomainPack",
     "get_active_pack",
     "register_pack",

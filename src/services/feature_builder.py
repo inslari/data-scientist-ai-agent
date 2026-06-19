@@ -340,7 +340,7 @@ def _resolve_target(
         return _derive_threshold_target(df, target)
 
     print(f"[feature_eng] UYARI: '{target_name}' bulunamadi, aday araniyor...")
-    return _find_best_target_candidate(df)
+    return _find_best_target_candidate(df, planned_target=target_name)
 
 
 def _find_related_target_cols(df: pd.DataFrame, target_name: str) -> list[str]:
@@ -362,7 +362,8 @@ def _derive_time_based_target(
     group_by      = plan.get("aggregation",{}).get("group_by_column","")
 
     if date_col not in df.columns:
-        return _find_best_target_candidate(df)
+        print(f"[feature_eng] UYARI: time_based date_column '{date_col}' yok, aday araniyor...")
+        return _find_best_target_candidate(df, planned_target=target_name)
 
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     if plan.get("use_data_split_for_label") or threshold_days == 0:
@@ -390,21 +391,32 @@ def _derive_threshold_target(
     threshold_value = target.get("threshold_value",0.0)
     source_col      = target_name.replace("_binary","").replace("_label","")
     if source_col not in df.columns:
-        return _find_best_target_candidate(df)
+        print(f"[feature_eng] UYARI: threshold source kolonu '{source_col}' yok, aday araniyor...")
+        return _find_best_target_candidate(df, planned_target=target_name)
     y = (df[source_col] > threshold_value).astype(int)
     df = df.drop(columns=[source_col], errors="ignore")
     print(f"[feature_eng] Hedef: '{target_name}' (threshold={threshold_value}) | {y.value_counts().to_dict()}")
     return df, pd.Series(y, name=target_name), target_name
 
 
-def _find_best_target_candidate(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, str]:
+def _find_best_target_candidate(df: pd.DataFrame, planned_target: str = "") -> tuple[pd.DataFrame, pd.Series, str]:
     for col in df.columns:
         if df[col].nunique() == 2 and df[col].dtype in [np.int64, np.float64, int, float]:
             y = df[col].copy()
             df = df.drop(columns=[col])
             print(f"[feature_eng] Fallback hedef: '{col}'")
             return df, y, col
-    raise ValueError("Hedef değişken bulunamadı.")
+    # Tanılayıcı: planlanan hedef ile gerçekte yüklenen kolonları göster ki
+    # uyumsuzluğun nedeni (SQL hedefi seçmedi / ad normalize oldu / vb.) anlaşılsın.
+    available = ", ".join(f"{c}({df[c].dtype}, n={df[c].nunique()})" for c in df.columns) or "<bos>"
+    raise ValueError(
+        "Hedef değişken bulunamadı. "
+        f"Planlanan hedef: '{planned_target or '?'}' — yüklenen veride yok ve türetilemiyor; "
+        "binary numeric fallback aday da bulunamadı. "
+        f"Mevcut kolonlar: [{available}]. "
+        "Olası neden: SQL hedef kolonu seçmedi, kolon adı normalize edilince değişti, "
+        "ya da unsupervised bir intent için target aranıyor."
+    )
 
 
 # ── Aggregation ──────────────────────────────────────────────
@@ -694,6 +706,103 @@ def _detect_leakage(
 
 
 # ── MAIN NODE ────────────────────────────────────────────────
+_FEATURE_SPEC_EPS = 1e-9
+
+# Safe, deterministic op palette an expert agent may compose via FeatureSpec.
+# (arity, fn) — fn receives that many pandas Series and returns one Series.
+_FEATURE_OPS = {
+    "ratio":      (2, lambda a, b: a / (b.abs() + _FEATURE_SPEC_EPS)),
+    "product":    (2, lambda a, b: a * b),
+    "difference": (2, lambda a, b: a - b),
+    "zscore":     (1, lambda a: (a - a.mean()) / (a.std(ddof=0) + _FEATURE_SPEC_EPS)),
+    "log":        (1, lambda a: np.log1p(a.clip(lower=0))),
+}
+
+
+def _apply_feature_specs(df: pd.DataFrame, state: dict, disallowed: set) -> list[str]:
+    """Apply agent-decided ``FeatureSpec``s (from ``merchant_analysis``) in place.
+
+    This is the "agent decides, builder executes" path: the expert agent chose
+    these transforms over the REAL columns it investigated. Each spec is validated
+    against the actual schema + a leakage denylist before its op runs; anything
+    invalid or unsafe is skipped, never executed. Returns the columns added.
+    """
+    from src.domains.schemas import MerchantAnalysis
+
+    analysis = MerchantAnalysis.from_dict(state.get("merchant_analysis"))
+    if analysis is None:
+        return []
+    specs = [s for f in analysis.findings for s in (f.feature_specs or [])]
+    if not specs:
+        return []
+
+    deny = {c for c in (disallowed or set()) if c}
+    added: list[str] = []
+    for spec in specs:
+        try:
+            entry = _FEATURE_OPS.get(spec.op)
+            if entry is None:
+                continue
+            arity, fn = entry
+            if len(spec.inputs) != arity or spec.name in df.columns or spec.name in added:
+                continue
+            missing = [c for c in spec.inputs if c not in df.columns]
+            if missing:
+                print(f"[feature_eng] FeatureSpec '{spec.name}' atlandi: kolon yok {missing}")
+                continue
+            leaky = [c for c in spec.inputs if c in deny]
+            if leaky:
+                print(f"[feature_eng] FeatureSpec '{spec.name}' atlandi: leakage girdisi {leaky}")
+                continue
+            cols = [pd.to_numeric(df[c], errors="coerce") for c in spec.inputs]
+            series = fn(*cols)
+            df[spec.name] = series.replace([np.inf, -np.inf], 0).fillna(0)
+            added.append(spec.name)
+            print(f"[feature_eng] Ajan feature'i uygulandi: {spec.name} = {spec.op}{tuple(spec.inputs)}")
+        except Exception as e:
+            print(f"[feature_eng] FeatureSpec '{getattr(spec, 'name', '?')}' hatasi: {e}")
+    return added
+
+
+def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata") -> list[str]:
+    """Run the active domain pack's deterministic FeatureRecipes on ``df`` in place.
+
+    Returns the names of columns actually added. No-op (returns ``[]``) when no
+    pack is active. Each recipe is individually guarded so one bad recipe can
+    never block the others or the pipeline.
+    """
+    from src.domains import get_active_pack
+    from src.domains.base import MerchantContext
+    from src.domains.schemas import MerchantAnalysis
+
+    pack = get_active_pack(state.get("domain_pack"))
+    if pack.name == "none":
+        return []
+
+    ctx = MerchantContext.from_dict(state.get("merchant_context"))
+    analysis = MerchantAnalysis.from_dict(state.get("merchant_analysis"))
+    try:
+        recipes = pack.feature_recipes(ctx, state.get("db_intelligence"), analysis) or []
+    except Exception as e:
+        print(f"[feature_eng] feature_recipes() hatasi ({e}); atlaniyor.")
+        return []
+
+    added: list[str] = []
+    for r in recipes:
+        try:
+            if not r.applies(df, meta):
+                continue
+            cols = r.build(df, meta) or {}
+            for name, series in cols.items():
+                if name in df.columns:
+                    continue
+                df[name] = series
+                added.append(name)
+        except Exception as e:
+            print(f"[feature_eng] Recipe '{getattr(r, 'name', '?')}' hatasi: {e}")
+    return added
+
+
 def build_features(state: dict) -> dict:
     """
     Feature Engineering Service — BigData Edition
@@ -820,6 +929,22 @@ def build_features(state: dict) -> dict:
         except Exception as e:
             print(f"[feature_eng] Math interaction hatasi ({expr}): {e}")
 
+    # Domain pack feature'ları (additive + guarded). Pack 'none' ise hiç çalışmaz.
+    #   (a) Ajan-karar yolu: expert ajanının propose_feature ile seçtiği FeatureSpec'ler,
+    #       gerçek şemaya + leakage denylist'e karşı doğrulanıp deterministik uygulanır.
+    #   (b) Statik fallback: ajan bir şey üretmediyse, convention-bazlı recipe'ler devreye girer.
+    domain_feature_cols: list[str] = []
+    try:
+        disallowed = {target_name, target_col} | set(related) | set(leaky_cols_high)
+        agent_cols = _apply_feature_specs(df, state, disallowed)
+        domain_feature_cols.extend(agent_cols)
+        if not agent_cols:
+            domain_feature_cols.extend(_apply_domain_recipes(df, state, meta))
+        if domain_feature_cols:
+            print(f"[feature_eng] Domain feature'lari: {domain_feature_cols}")
+    except Exception as e:
+        print(f"[feature_eng] Domain feature hatasi ({e}); atlaniyor.")
+
     # Encoding
     df = _encode_categorical(df, y)
 
@@ -880,6 +1005,7 @@ def build_features(state: dict) -> dict:
         "total_rows_available":     None,  # execution_node profiling'den alınabilir
         "leakage_dropped":          leakage_report["dropped"],
         "leakage_suspected":        leakage_report["suspected"],
+        "domain_features":          [c for c in domain_feature_cols if c in X_train.columns],
     }
 
     return {
