@@ -353,6 +353,27 @@ def _find_related_target_cols(df: pd.DataFrame, target_name: str) -> list[str]:
     return cols
 
 
+def _resolve_time_col(df: pd.DataFrame, time_col: str) -> str | None:
+    """Kullanıcının UI'dan seçtiği ham time_col adını df'teki gerçek kolona eşle.
+    _normalize_column_names sonrası adlar değişmiş olabilir → exact, sonra
+    case-insensitive/trimmed eşleme dene. Bulunamazsa None."""
+    if not time_col:
+        return None
+    if time_col in df.columns:
+        return time_col
+    lookup = {str(c).lower().strip(): c for c in df.columns}
+    return lookup.get(time_col.lower().strip())
+
+
+def _chronological_order(time_sort_key: pd.Series, index) -> np.ndarray:
+    """time_sort_key'i verilen satır index'ine hizala ve eski→yeni KARARLI pozisyonel
+    sıra döndür (np.argsort mergesort = stabil, deterministik). Parse edilemeyen az
+    sayıda satır (NaT) en eski tarihe atanır → train tarafında kalır, test'i kirletmez."""
+    key = time_sort_key.reindex(index)
+    key = key.fillna(key.min())
+    return np.argsort(key.to_numpy(), kind="mergesort")
+
+
 def _derive_time_based_target(
     df: pd.DataFrame, target: dict, plan: dict
 ) -> tuple[pd.DataFrame, pd.Series, str]:
@@ -822,7 +843,12 @@ def build_features(state: dict) -> dict:
     profiling_report = state.get("profiling_report",{})
     db_intelligence  = state.get("db_intelligence",{})
     feature_plan     = state.get("feature_plan",{})
-    
+
+    # Modality ekseni (domain_pack'ten bağımsız). Boş/"tabular" = mevcut davranış;
+    # "timeseries" → holdout split kronolojik olur (geçmişle eğit, gelecekte test).
+    modality         = (state.get("modality") or "").strip().lower()
+    time_col         = (state.get("time_col") or "").strip()
+
     if not feature_plan:
         return {"error":"Feature plan yok."}
 
@@ -895,6 +921,27 @@ def build_features(state: dict) -> dict:
                 df[f"{col}_dayofweek"] = dt.dt.dayofweek
             except Exception:
                 pass
+
+    # Timeseries: kronolojik split anahtarını drop'tan ÖNCE yakala — aşağıdaki blok
+    # timestamp kolonlarını drop ediyor + duckdb USING SAMPLE satır sırasını bozduğu
+    # için satır sırasına GÜVENİLMEZ; gerçek tarih değerine göre sıralanmalı. Anahtar
+    # df.index'e hizalı tutulur (sonraki adımlar yalnızca kolon ekler/atar, satır ve
+    # index'i korur), split anında pozisyonel olarak yeniden hizalanır.
+    time_sort_key = None
+    if modality == "timeseries":
+        resolved_time_col = _resolve_time_col(df, time_col)
+        if resolved_time_col is None:
+            print(f"[feature_eng] WARN timeseries: time_col '{time_col}' df'te bulunamadı → RASTGELE split fallback")
+        else:
+            parsed = pd.to_datetime(df[resolved_time_col], errors="coerce")
+            valid_ratio = float(parsed.notna().mean())
+            if valid_ratio < 0.5:
+                print(f"[feature_eng] WARN timeseries: '{resolved_time_col}' tarih olarak parse edilemedi "
+                      f"(%{valid_ratio*100:.0f} geçerli) → RASTGELE split fallback")
+            else:
+                time_sort_key = parsed
+                print(f"[feature_eng] timeseries: kronolojik anahtar '{resolved_time_col}' yakalandı "
+                      f"({parsed.notna().sum()}/{len(parsed)} geçerli tarih)")
 
     # Drop identifier / timestamp / target kolonları
     target_col = feature_plan.get("target",{}).get("column_name","")
@@ -970,6 +1017,17 @@ def build_features(state: dict) -> dict:
         X_train = X_test = df.copy()
         y_train = y_test = pd.Series([], dtype=int)
         print(f"[feature_eng] Unsupervised — split atlandi")
+    elif modality == "timeseries" and time_sort_key is not None:
+        # Kronolojik holdout: geçmişle eğit, gelecekte test. shuffle/stratify YOK.
+        # Pozisyonel sırala (df ve y konum bazlı hizalı) → index etiketlerinden bağımsız.
+        order_pos = _chronological_order(time_sort_key, df.index)
+        df_sorted = df.iloc[order_pos]
+        y_sorted  = y.iloc[order_pos]
+        n_test = max(1, int(round(len(df_sorted) * TEST_SIZE)))
+        X_train, X_test = df_sorted.iloc[:-n_test], df_sorted.iloc[-n_test:]
+        y_train, y_test = y_sorted.iloc[:-n_test], y_sorted.iloc[-n_test:]
+        print(f"[feature_eng] KRONOLOJIK split (timeseries): son %{int(TEST_SIZE*100)} = test "
+              f"(n_train={len(X_train)}, n_test={len(X_test)}), shuffle/stratify YOK")
     else:
         stratify_arg = y if intent.strip().lower() == "classification" else None
         try:
