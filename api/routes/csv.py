@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from typing import List
 
 from api.core.database import get_db, DATA_DIR
+from api.core.jobs import enqueue_ttd_suggestions
 from api.core.storage import storage
 from api.models.csv import CSVFileModel
 from api.models.data_group import DataGroupModel
@@ -83,8 +84,9 @@ async def upload_csv(
         contents = await file.read()
         file_size = len(contents)
 
-        # Upload to storage (MinIO or local disk)
-        file_ref = storage.upload(contents, object_key)
+        # Upload to storage (MinIO or local disk). storage.upload senkron (boto3 put /
+        # disk yazma) → event loop'u bloklamamak için threadpool'da çalıştır.
+        file_ref = await run_in_threadpool(storage.upload, contents, object_key)
 
         # Process CSV (schema + stats) using a temp file when using MinIO
         def process_csv_bytes(csv_bytes: bytes):
@@ -133,7 +135,12 @@ async def upload_csv(
     # Clear cache if adding to an existing data group
     if data_group_id and uploaded_files:
         _clear_db_cache(db, data_group)
-        
+
+    # Yeni bir data group oluşturulduysa (mevcut gruba ekleme değil) ve en az bir
+    # dosya yüklendiyse, Talk-to-Data örnek sorularını arka planda üret.
+    if not data_group_id and uploaded_files:
+        enqueue_ttd_suggestions(db, data_group.id)
+
     return {
         "status": "success" if uploaded_files else "error",
         "message": f"Successfully uploaded {len(uploaded_files)} files." + (f" ({len(errors)} errors)" if errors else ""),
@@ -261,9 +268,14 @@ async def get_csv_column_stats(file_id: int, db: Session = Depends(get_db), curr
         stats_df.rename(columns={'index': 'column_name'}, inplace=True)
         return stats_df.to_dict(orient="records")
 
+    # İndirme (storage.download_to_tempfile) ve okuma birlikte threadpool'da çalışsın;
+    # böylece senkron indirme de event loop'u bloklamaz.
+    def download_and_calculate(file_ref: str):
+        with storage.download_to_tempfile(file_ref) as tmp_path:
+            return calculate_stats(tmp_path)
+
     try:
-        with storage.download_to_tempfile(db_file.file_path) as tmp_path:
-            stats_list = await run_in_threadpool(calculate_stats, tmp_path)
+        stats_list = await run_in_threadpool(download_and_calculate, db_file.file_path)
 
         # Cache it for future
         db_file.column_stats_cache = stats_list

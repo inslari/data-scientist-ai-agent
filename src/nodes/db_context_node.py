@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+
 from langchain_core.runnables import RunnableConfig
 
 from src.core.config import settings
-from src.intelligence_engine import DatabaseIntelligenceEngine  # type: ignore[import-not-found]
+from src.intelligence_engine import DatabaseIntelligenceEngine, DatabaseIntelligenceModel  # type: ignore[import-not-found]
 from src.state import AgentState  # type: ignore[import-not-found]
 
 from api.core.database import SessionLocal
 from api.schemas.data_group import get_data_group_schema_logic, run_data_group_query_logic, QueryRequest
 from api.models.data_group import DataGroupModel
+from api.models.db_intelligence_cache import DbIntelligenceCacheModel
 
 async def db_context_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """Async node — LangGraph ainvoke ile uyumlu."""
@@ -24,21 +27,42 @@ async def db_context_node(state: AgentState, config: RunnableConfig) -> AgentSta
     raw_schema, sample_data = await _fetch_schema_and_samples(data_group_id)
     print(">>> Sema basariyla cekildi. Uzunluk:", len(raw_schema))
 
-    engine   = DatabaseIntelligenceEngine()
-    print(">>> DatabaseIntelligenceEngine baslatildi. Sema analizi icin LLM'e istek atiliyor (Bu islem uzun surebilir)...")
-    try:
-        db_model = engine.analyze_schema(
-            schema_text=raw_schema,
-            sample_data=sample_data,
-        )
-    except Exception as e:
-        print(f">>> LLM analizi basarisiz oldu: {str(e)[:200]}")
-        print(">>> Fallback moduna geciliyor (ornek veri olmadan tekrar deneniyor)...")
-        db_model = engine.analyze_schema(
-            schema_text=raw_schema,
-            sample_data="Örnek veri çok uzun olduğu için LLM halüsinasyonuna yol açtı, çıkarıldı.",
-        )
-    print(">>> LLM analizi basariyla tamamlandi!")
+    # Project bazlı cache: aynı şema için pahalı analyze_schema LLM çağrısını atla.
+    # thread_id == project_id (api/core/worker.py).
+    project_id = _coerce_project_id(config.get("configurable", {}).get("thread_id"))
+    cache_enabled = settings.ENABLE_INTELLIGENCE_CACHE and project_id is not None
+    cache_key = _intelligence_cache_key(raw_schema) if cache_enabled else None
+
+    db_model = None
+    if cache_enabled:
+        cached = _load_cached_intelligence(project_id, cache_key)
+        if cached is not None:
+            try:
+                db_model = DatabaseIntelligenceModel.model_validate(cached)
+                print(f">>> db_intelligence cache HIT (project {project_id}) — LLM analizi atlandi.")
+            except Exception as e:  # bozuk/uyumsuz payload → yeniden hesapla
+                print(f">>> Cache payload gecersiz, yeniden hesaplaniyor: {str(e)[:150]}")
+                db_model = None
+
+    if db_model is None:
+        engine = DatabaseIntelligenceEngine()
+        print(">>> DatabaseIntelligenceEngine baslatildi. Sema analizi icin LLM'e istek atiliyor (Bu islem uzun surebilir)...")
+        try:
+            db_model = engine.analyze_schema(
+                schema_text=raw_schema,
+                sample_data=sample_data,
+            )
+        except Exception as e:
+            print(f">>> LLM analizi basarisiz oldu: {str(e)[:200]}")
+            print(">>> Fallback moduna geciliyor (ornek veri olmadan tekrar deneniyor)...")
+            db_model = engine.analyze_schema(
+                schema_text=raw_schema,
+                sample_data="Örnek veri çok uzun olduğu için LLM halüsinasyonuna yol açtı, çıkarıldı.",
+            )
+        print(">>> LLM analizi basariyla tamamlandi!")
+        if cache_enabled:
+            _save_cached_intelligence(project_id, cache_key, db_model.model_dump())
+            print(f">>> db_intelligence cache yazildi (project {project_id}).")
 
 
     intent          = state.get("intent", "eda")
@@ -93,6 +117,57 @@ async def _fetch_schema_and_samples(data_group_id: int) -> tuple[str, str]:
 
         sample_data = "\n\n".join(sample_parts) if sample_parts else "No sample data."
         return raw_schema, sample_data
+    finally:
+        db.close()
+
+
+# ── Project-bazlı intelligence cache (application DB) ─────────
+def _coerce_project_id(raw) -> int | None:
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _intelligence_cache_key(raw_schema: str) -> str:
+    """hash(intelligence model + raw_schema). Şema/model değişince eşleşmez → recompute."""
+    payload = f"{settings.INTELLIGENCE_ENGINE_MODEL}\x00{raw_schema or ''}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_cached_intelligence(project_id: int, cache_key: str) -> dict | None:
+    db = SessionLocal()
+    try:
+        row = db.query(DbIntelligenceCacheModel).filter(
+            DbIntelligenceCacheModel.project_id == project_id
+        ).first()
+        if row and row.cache_key == cache_key:
+            return row.payload
+        return None
+    except Exception as e:  # cache okuması asla pipeline'ı düşürmemeli
+        print(f">>> db_intelligence cache okunamadi: {str(e)[:150]}")
+        return None
+    finally:
+        db.close()
+
+
+def _save_cached_intelligence(project_id: int, cache_key: str, payload: dict) -> None:
+    db = SessionLocal()
+    try:
+        row = db.query(DbIntelligenceCacheModel).filter(
+            DbIntelligenceCacheModel.project_id == project_id
+        ).first()
+        if row:
+            row.cache_key = cache_key
+            row.payload = payload
+        else:
+            db.add(DbIntelligenceCacheModel(
+                project_id=project_id, cache_key=cache_key, payload=payload,
+            ))
+        db.commit()
+    except Exception as e:  # cache yazımı asla pipeline'ı düşürmemeli
+        db.rollback()
+        print(f">>> db_intelligence cache yazilamadi: {str(e)[:150]}")
     finally:
         db.close()
 

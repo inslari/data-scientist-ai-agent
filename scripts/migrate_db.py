@@ -1,3 +1,10 @@
+import os
+import sys
+
+# Proje kökünü sys.path'e ekle ki 'scripts/' içinden çalıştırıldığında da
+# 'api' paketi import edilebilsin (python scripts/migrate_db.py).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from api.core.database import engine
 from sqlalchemy import inspect
 from sqlalchemy import text
@@ -47,6 +54,11 @@ with engine.connect() as conn:
     if "domain_doc" not in data_group_cols:
         print("Adding 'domain_doc' column to 'data_groups'...")
         conn.execute(text("ALTER TABLE data_groups ADD COLUMN domain_doc TEXT"))
+
+    # Talk-to-Data örnek soru önerileri (LLM ile arka planda üretilir)
+    if "ttd_suggestions" not in data_group_cols:
+        print("Adding 'ttd_suggestions' column to 'data_groups'...")
+        conn.execute(text("ALTER TABLE data_groups ADD COLUMN ttd_suggestions JSON"))
 
     conn.commit()
 

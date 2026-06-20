@@ -208,7 +208,7 @@ class DatabaseIntelligenceEngine:
         """
         Analyzes a database schema and returns a structured intelligence representation.
         """
-        
+
         system_prompt = """You are a Database Exploration and Intelligence Engine.
         
 # ROLE

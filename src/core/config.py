@@ -55,6 +55,12 @@ class Settings:
     INTELLIGENCE_ENGINE_MODEL: str = os.getenv("INTELLIGENCE_ENGINE_MODEL", "gpt-4o")
     DEFAULT_TEMPERATURE: float = 0.0
 
+    # Intelligence Engine schema-analysis cache (project bazlı, application DB'de).
+    # analyze_schema çıktısı aynı şema için deterministik (temperature=0); cache
+    # pahalı LLM çağrısını tekrar etmeyi önler. Cache key (model + şema) hash'i
+    # olduğu için şema/dataset değişince otomatik invalidate olur.
+    ENABLE_INTELLIGENCE_CACHE: bool = os.getenv("ENABLE_INTELLIGENCE_CACHE", "true").lower() in ("1", "true", "yes")
+
     # Domain (Sector) Pack Configuration
     # Selects the active Merchant/Domain Intelligence pack that augments the
     # pipeline (intent → query → feature engineering → interpretation).
