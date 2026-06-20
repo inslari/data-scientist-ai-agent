@@ -440,6 +440,123 @@ def _find_best_target_candidate(df: pd.DataFrame, planned_target: str = "") -> t
     )
 
 
+# ── Time-series lag features (FAZ A: cekirdek) ───────────────
+_TS_MAX_FEATURE_COLS = 5   # hedef disinda laglenecek en fazla sayisal kolon (feature patlamasi korumasi)
+
+
+def _detect_frequency(parsed: pd.Series) -> tuple[str, list[int]]:
+    """Ardisik tarih farklarinin medyanindan veri sikligini ve dinamik lag pencerelerini turet.
+
+    FAZ A: fark GLOBAL aliniyor. Panel/cok-entity veride bir entity'nin son tarihi ile
+    digerinin ilki arasindaki sicrama medyani hafif bozabilir; grup-ici diff = FAZ B.
+    """
+    deltas = parsed.dropna().sort_values().diff().dropna()
+    if len(deltas) == 0:
+        print("[feature_eng] timeseries: frekans icin yeterli tarih farki yok → varsayilan [1]")
+        return "unknown", [1]
+    days = deltas.median() / pd.Timedelta(days=1)
+    if 0.5 <= days <= 1.5:
+        return "daily", [1, 7, 30]
+    if 5 <= days <= 9:
+        return "weekly", [1, 4, 12]
+    if 26 <= days <= 32:
+        return "monthly", [1, 3, 12]
+    print(f"[feature_eng] timeseries: taninmayan frekans (medyan ~{days:.1f} gun) → varsayilan [1] + WARN")
+    return "unknown", [1]
+
+
+def _build_lag_features(
+    df: pd.DataFrame, feature_plan: dict, resolved_time_col: str, meta: "ColumnMetadata"
+) -> tuple[pd.DataFrame, dict]:
+    """Zaman anahtarina gore sirala, frekansi tespit et, hedef + sayisal feature'larin
+    lag'lerini uret, NaN-lead satirlari at. Hedefin yalnizca GECMISI feature olur
+    (shift>0 = past); gelecek deger sizdirilmaz. y henuz ayrilmadi → tek df maskesi."""
+    parsed = pd.to_datetime(df[resolved_time_col], errors="coerce")
+    freq, windows = _detect_frequency(parsed)
+
+    # Cok-entity (panel) uyarisi: FAZ A GLOBAL shift uygular; entity sinirinda bir
+    # entity'nin son satiri digerinin lag'ine sizar. Sessiz kalmasin diye, identifier
+    # kolonu varsa ACIK WARN bas (grup-ici/per-entity lag = FAZ B).
+    id_cols = [c for c, info in meta.columns.items()
+               if info.get("semantic_type") == "identifier" and c in df.columns]
+    if id_cols:
+        ex = id_cols[0]
+        try:
+            n_ent = int(df[ex].nunique())
+        except Exception:
+            n_ent = -1
+        print(f"[feature_eng] WARN timeseries lag: identifier kolon(lar) tespit edildi {id_cols} "
+              f"(orn. '{ex}' → {n_ent} entity). FAZ A GLOBAL shift uyguluyor; entity sinirinda "
+              f"lag sizmasi olabilir. Grup-ici (per-entity) lag = FAZ B.")
+
+    # Kararli (stabil) kronolojik sirala: eski→yeni. NaT'lar en eskiye.
+    order = np.argsort(parsed.fillna(parsed.min()).to_numpy(), kind="mergesort")
+    df = df.iloc[order].reset_index(drop=True)
+
+    n = len(df)
+    windows = [w for w in windows if w < n]   # veri boyutunu asan pencereyi ele (hepsini dropdan kacin)
+    if not windows:
+        print(f"[feature_eng] timeseries: veri ({n} satir) lag pencereleri icin cok kucuk → lag atlandi")
+        return df, {"frequency": freq, "windows": [], "lag_columns": [],
+                    "lag_base_columns": [], "dropped_lead_rows": 0}
+
+    target_name = feature_plan.get("target", {}).get("column_name", "")
+    skip = {resolved_time_col}
+    for col, info in meta.columns.items():
+        if info.get("semantic_type") in ("identifier", "timestamp"):
+            skip.add(col)
+
+    numeric_cols = [c for c in df.select_dtypes(include="number").columns
+                    if c not in skip and c != target_name]
+
+    # Kolon SECIMI (cok sayisal kolon varsa feature patlamasini onle): deterministik,
+    # VERIYE DAYALI kriter = min-max normalize edilmis varyans (olcek-bagimsiz yayilim).
+    # Model feature importance bu asamada YOK; IE importance_score'a guvenmiyoruz (cogu
+    # zaman 0.5'e duser → sessizce "ilk 5 kolon" secimi). Yayilimi yuksek kolonlar
+    # (lag'lemeye deger sinyal) once gelir; esitlikte kolon adina gore stabil siralanir.
+    if len(numeric_cols) > _TS_MAX_FEATURE_COLS:
+        def _norm_var(c: str) -> float:
+            s = pd.to_numeric(df[c], errors="coerce")
+            lo, hi = s.min(), s.max()
+            if pd.isna(lo) or pd.isna(hi) or hi == lo:
+                return 0.0
+            return float(((s - lo) / (hi - lo)).var())
+        ranked = sorted(numeric_cols, key=lambda c: (-_norm_var(c), c))
+        lag_base_cols = ranked[:_TS_MAX_FEATURE_COLS]
+        print(f"[feature_eng] timeseries lag: {len(numeric_cols)} sayisal kolondan "
+              f"normalize-varyans (yayilim) ile {_TS_MAX_FEATURE_COLS} secildi: {lag_base_cols}")
+    else:
+        lag_base_cols = list(numeric_cols)
+
+    # Hedef sayisalsa onu da ekle: gecmis target (lag_k_target) mesru feature
+    if target_name in df.columns and pd.api.types.is_numeric_dtype(df[target_name]):
+        lag_base_cols = [target_name] + lag_base_cols
+
+    lag_cols_created: list[str] = []
+    for col in lag_base_cols:
+        for k in windows:
+            new_col = f"lag_{k}_{col}"
+            if new_col in df.columns:
+                continue
+            df[new_col] = df[col].shift(k)   # shift>0 = gecmis; gelecek sizmaz
+            lag_cols_created.append(new_col)
+
+    # NaN-lead drop: lag'lerin NaN urettigi ilk satirlari at — fillna/to_numeric'ten ONCE
+    # (yoksa lead satirlar sahte 0 lag ile modele girer). y henuz df icinde → hizalama derdi yok.
+    before = len(df)
+    if lag_cols_created:
+        df = df.dropna(subset=lag_cols_created).reset_index(drop=True)
+    dropped = before - len(df)
+
+    info = {
+        "frequency": freq, "windows": windows, "lag_columns": lag_cols_created,
+        "lag_base_columns": lag_base_cols, "dropped_lead_rows": dropped,
+    }
+    print(f"[feature_eng] timeseries lag: frekans={freq}, pencereler={windows}, "
+          f"{len(lag_cols_created)} lag kolonu uretildi, {dropped} lead satir atildi")
+    return df, info
+
+
 # ── Aggregation ──────────────────────────────────────────────
 def _aggregate_if_needed(
     df: pd.DataFrame, y: pd.Series, plan: dict, meta: ColumnMetadata,
@@ -665,16 +782,23 @@ def _detect_leakage(
     df: pd.DataFrame,
     y: pd.Series,
     meta=None,  # ColumnMetadata, identifier tespiti için
+    protected_high_card=None,  # SADECE kardinalite (KESİN 2) kuralından muaf kolonlar
 ) -> tuple[pd.DataFrame, dict]:
     """
     Leakage tespiti — iki seviyeli:
       KESİN  → otomatik drop (identifier, ~birebir korelasyon)
       ŞÜPHELİ → drop etme, uyarı listesine ekle
 
+    ``protected_high_card``: time-series lag kolonlari gibi deterministik turetilmis,
+    continuous oldugu icin dogal olarak yuksek-kardinaliteli ama ID OLMAYAN kolonlar.
+    Bunlar YALNIZCA KESİN 2 (kardinalite) heuristiginden muaftir; identifier (KESİN 1)
+    ve korelasyon/sizinti kontrolu onlara da AYNEN uygulanir.
+
     Dönüş:
       df              : temizlenmiş dataframe
       leakage_report  : {"dropped": [...], "suspected": [...]}
     """
+    protected_high_card = protected_high_card or set()
     dropped = []      # otomatik atılanlar (kesin)
     suspected = []    # şüpheli, kullanıcıya raporlanacak
     n_rows = len(df)
@@ -700,8 +824,11 @@ def _detect_leakage(
                 continue
 
         # ── KESİN 2: Aşırı yüksek kardinalite (ID-benzeri) ──
+        # Time-series lag kolonlari MUAF: deterministik turetildi, continuous olmalari
+        # dogal (her satir farkli) → ID degiller. SADECE bu kuraldan muaf; korelasyon/
+        # sizinti kontrolu (asagida) onlara da aynen uygulanir.
         nunique = df[col].nunique()
-        if n_rows > 0 and nunique / n_rows > 0.95:
+        if col not in protected_high_card and n_rows > 0 and nunique / n_rows > 0.95:
             df = df.drop(columns=[col], errors="ignore")
             dropped.append({"column": col, "reason": f"asiri kardinalite ({nunique}/{n_rows})"})
             print(f"[leakage] KESIN drop: '{col}' (kardinalite orani {nunique/n_rows:.2f})")
@@ -900,12 +1027,31 @@ def build_features(state: dict) -> dict:
     # Temizlik
     df = _clean_data(df)
 
+    # ── Time-series lag katmani (FAZ A) ──────────────────────────
+    # Yalnizca modality==timeseries; tabular yol bu blogu hic gormez.
+    # Konum: _clean_data sonrasi, _resolve_target ONCESI → target hala df'te
+    # (gecmis target = mesru feature), degerler henuz scale/encode edilmemis,
+    # zaman kolonu henuz drop edilmemis. NaN-lead drop fillna'dan (~asagida) ONCE.
+    ts_lag_info = None
+    if modality == "timeseries":
+        resolved_time_col = _resolve_time_col(df, time_col)
+        if resolved_time_col is None:
+            print(f"[feature_eng] WARN timeseries lag: time_col '{time_col}' df'te yok → lag atlandi")
+        elif float(pd.to_datetime(df[resolved_time_col], errors="coerce").notna().mean()) < 0.5:
+            print(f"[feature_eng] WARN timeseries lag: '{resolved_time_col}' parse edilemedi → lag atlandi")
+        else:
+            df, ts_lag_info = _build_lag_features(df, feature_plan, resolved_time_col, meta)
+
     # Hedef değişken
     df, y, target_name = _resolve_target(df, feature_plan, intent)
 
-    # Aggregation
-    entity_resolution = state.get("entity_resolution") or {}
-    df, y = _aggregate_if_needed(df, y, feature_plan, meta, entity_resolution=entity_resolution)
+    # Aggregation — timeseries'te zaman eksenini korumak icin ATLANIR (kapatinca
+    # domain recipe'leri de inert kalir: avg_/std_ kolonlari olusmaz → onlara dokunmuyoruz).
+    if modality == "timeseries":
+        print("[feature_eng] timeseries: aggregation atlandi (zaman ekseni korunuyor)")
+    else:
+        entity_resolution = state.get("entity_resolution") or {}
+        df, y = _aggregate_if_needed(df, y, feature_plan, meta, entity_resolution=entity_resolution)
 
     if df.empty or len(df) < 5:
         return {"error": f"İşlemler sonrası yetersiz veri sayısı ({len(df)} satır). Model kurulamıyor."}
@@ -1016,8 +1162,10 @@ def build_features(state: dict) -> dict:
     # Final NaN temizliği
     df = df.apply(pd.to_numeric, errors="coerce").fillna(0)
 
-    # Leakage detection
-    df, leakage_report = _detect_leakage(df, y, meta)
+    # Leakage detection — time-series lag kolonlari SADECE kardinalite kuralindan muaf
+    # (continuous lag'ler ID degil); korelasyon/sizinti kontrolu onlara da uygulanir.
+    ts_lag_cols = set(ts_lag_info["lag_columns"]) if ts_lag_info else set()
+    df, leakage_report = _detect_leakage(df, y, meta, protected_high_card=ts_lag_cols)
 
     df, domain_dropped = _apply_domain_leakage_drops(df, domain_leakage_report)
 
@@ -1076,6 +1224,7 @@ def build_features(state: dict) -> dict:
         "leakage_dropped":          leakage_report["dropped"],
         "leakage_suspected":        leakage_report["suspected"],
         "domain_features":          [c for c in domain_feature_cols if c in X_train.columns],
+        "timeseries_lag":           ts_lag_info,
     }
 
     return {

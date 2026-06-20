@@ -1,0 +1,16 @@
+Project ID: 17
+Status: completed
+Node: intent_node
+Node: db_context_node
+Node: merchant_intelligence_node
+Node: planner_node
+Node: execution_node
+  Error: Execution hatası: Parser Error: syntax error at or near "1"
+
+LINE 1: COPY 1_daily_minimum_temps TO 'C:\Users\Burak\AppData\Local\Temp...
+             ^
+Node: report_node
+  Error: Execution hatası: Parser Error: syntax error at or near "1"
+
+LINE 1: COPY 1_daily_minimum_temps TO 'C:\Users\Burak\AppData\Local\Temp...
+             ^

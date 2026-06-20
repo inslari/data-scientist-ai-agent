@@ -48,6 +48,11 @@ PARQUET_DIR.mkdir(exist_ok=True)
 
 
 
+def _make_safe(name: str) -> str:
+    s = name.replace(".", "_").replace("-", "_")
+    return f"t_{s}" if s and s[0].isdigit() else s
+
+
 def _coerce_scalar(p: str):
     """
     Repr wrapper'larını gerçek değere indirger:
@@ -399,7 +404,7 @@ class DuckDBEngine:
 
     def load(self, name: str, df: pd.DataFrame) -> None:
         """DataFrame'i DuckDB'ye yükle."""
-        safe_name = name.replace(".", "_").replace("-", "_")
+        safe_name = _make_safe(name)
         self.conn.register(safe_name, df)
         self._tables.add(safe_name)
         print(f"[duckdb] '{safe_name}' yüklendi: {len(df):,} satır × {len(df.columns)} kolon")
@@ -413,7 +418,7 @@ class DuckDBEngine:
         DuckDB üzerinde hızlı profiling.
         Full scan yapar ama columnar olduğu için hızlı.
         """
-        safe = name.replace(".", "_").replace("-", "_")
+        safe = _make_safe(name)
         if safe not in self._tables:
             raise ValueError(f"'{safe}' DuckDB'de yok.")
 
@@ -542,7 +547,7 @@ class DuckDBEngine:
         Stratified sample üretir.
         target_col varsa sınıf dağılımını korur.
         """
-        safe = name.replace(".", "_").replace("-", "_")
+        safe = _make_safe(name)
         total_row = self.conn.execute(f"SELECT COUNT(*) FROM {safe}").fetchone()
         total = total_row[0] if total_row else 0
 
@@ -579,7 +584,7 @@ class DuckDBEngine:
 
     def to_parquet(self, name: str, path: Path) -> None:
         """DuckDB tablosunu parquet'e yaz."""
-        safe = name.replace(".", "_").replace("-", "_")
+        safe = _make_safe(name)
         self.conn.execute(f"COPY {safe} TO '{path}' (FORMAT PARQUET)")
         print(f"[duckdb] '{safe}' → {path} ({path.stat().st_size//1024:,} KB)")
 
@@ -836,7 +841,7 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                 else:
                     # Tek tablo — zaten yukarıda duck.load() ile yüklendi
                     single_name = list(dfs.keys())[0]
-                    merged_table = single_name.replace(".", "_").replace("-", "_")
+                    merged_table = _make_safe(single_name)
 
                 print(f"[execution] Merged table: '{merged_table}'")
 
@@ -906,15 +911,15 @@ def _merge_with_duckdb(
 
     # Tüm tabloları DuckDB'de zaten var
     # SQL JOIN zinciri oluştur
-    safe_anchor = anchor.replace(".","_").replace("-","_")
+    safe_anchor = _make_safe(anchor)
     select_parts = [f"{safe_anchor}.*"]
     join_parts   = []
 
     for op in merge_ops:
-        rt   = op["right"].replace(".","_").replace("-","_")
+        rt   = _make_safe(op["right"])
         lo   = op["left_on"]
         ro   = op["right_on"]
-        left = op["left"].replace(".","_").replace("-","_")
+        left = _make_safe(op["left"])
 
         # Overlap kolonları prefix'le
         rdf_cols = duck._get_columns(rt)
