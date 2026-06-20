@@ -175,6 +175,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     project_target_col = None
     project_modality = None
     project_time_col = None
+    project_entity_col = None
     try:
         project: ProjectModel | None = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
         if not project:
@@ -187,6 +188,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
         project_target_col = getattr(project, "target_col", None)
         project_modality = getattr(project, "modality", None)
         project_time_col = getattr(project, "time_col", None)
+        project_entity_col = getattr(project, "entity_col", None)
 
         dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first() if data_group_id else None
         if project.domain_pack:
@@ -242,7 +244,11 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                 initial_state["modality"] = project_modality
             if project_time_col:
                 initial_state["time_col"] = project_time_col
-            print(f"[Worker] modality='{project_modality or 'tabular'}', time_col='{project_time_col or '-'}' for project {project_id}")
+            # entity_col (FAZ B2-b): boş → GLOBAL (tek seri); dolu → feature_builder
+            # lag/rolling/frekans/split'i entity grubu içinde hesaplar.
+            if project_entity_col:
+                initial_state["entity_col"] = project_entity_col
+            print(f"[Worker] modality='{project_modality or 'tabular'}', time_col='{project_time_col or '-'}', entity_col='{project_entity_col or '-'}' for project {project_id}")
 
             if is_resume:
                 try:

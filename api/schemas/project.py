@@ -23,6 +23,7 @@ class ProjectBase(BaseModel):
     domain_pack: Optional[str] = None   # None/empty = inherit (data group → global)
     modality: Optional[str] = None      # None/empty = "tabular" (default). "timeseries" → chronological split
     time_col: Optional[str] = None      # time column used to order rows for the chronological split
+    entity_col: Optional[str] = None    # None/empty = GLOBAL (single series). Set → group lag/rolling/split per entity
 
 class ProjectCreate(ProjectBase):
     pass
@@ -37,6 +38,7 @@ class ProjectUpdate(BaseModel):
     domain_pack: Optional[str] = None
     modality: Optional[str] = None
     time_col: Optional[str] = None
+    entity_col: Optional[str] = None
 
 class ProjectResponse(ProjectBase):
     id: int

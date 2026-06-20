@@ -28,6 +28,7 @@ class AgentState(TypedDict, total=False):
     # Veri modality ekseni (domain_pack'ten bağımsız) — UI'dan gelir
     modality: str                    # "" / "tabular" (varsayılan) | "timeseries"
     time_col: str                    # timeseries için kronolojik split'te satırları sıralayan zaman sütunu
+    entity_col: str                  # opsiyonel multi-entity gruplama sütunu — "" = GLOBAL (tek seri); dolu = grup-içi lag/rolling/split
 
     # Target Discovery Node output
     target_definition: dict          # Target definition for modeling

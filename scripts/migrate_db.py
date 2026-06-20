@@ -61,6 +61,10 @@ with engine.connect() as conn:
         print("Adding 'time_col' column to 'projects'...")
         conn.execute(text("ALTER TABLE projects ADD COLUMN time_col VARCHAR"))
 
+    if "entity_col" not in existing_cols:
+        print("Adding 'entity_col' column to 'projects'...")
+        conn.execute(text("ALTER TABLE projects ADD COLUMN entity_col VARCHAR"))
+
     if "domain_pack" not in data_group_cols:
         print("Adding 'domain_pack' column to 'data_groups'...")
         conn.execute(text("ALTER TABLE data_groups ADD COLUMN domain_pack VARCHAR"))

@@ -18,6 +18,10 @@ class ProjectModel(Base):
     # time_col is the user-picked time column used to order rows for that split.
     modality = Column(String, nullable=True)
     time_col = Column(String, nullable=True)
+    # entity_col is the user-picked grouping column for multi-entity (panel)
+    # timeseries: lag/rolling/frequency computed within each entity. NULL/empty =
+    # GLOBAL path (single-series default).
+    entity_col = Column(String, nullable=True)
 
     data_group_id = Column(Integer, ForeignKey("data_groups.id", ondelete="SET NULL"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
