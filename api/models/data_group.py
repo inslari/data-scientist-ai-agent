@@ -19,6 +19,10 @@ class DataGroupModel(Base):
     # Long-term memory for Talk to Data
     long_term_memory = Column(String, nullable=True)
 
+    # Talk-to-Data örnek soru önerileri (data group'a özel, LLM ile arka planda
+    # üretilir). NULL = henüz üretilmedi → UI boş liste gösterir. list[str].
+    ttd_suggestions = Column(JSON, nullable=True)
+
     # Domain (sector) pack for this dataset. Used by Talk-to-Data chat and as the
     # fallback for projects on this data group. NULL/empty = global DOMAIN_PACK.
     domain_pack = Column(String, nullable=True)

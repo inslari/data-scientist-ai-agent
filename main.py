@@ -9,6 +9,7 @@ from api.models.project import ProjectModel
 from api.models.user import UserModel
 from api.models.job import BackgroundJobModel  # Must be imported so the table is created
 from api.models.data_group_query import DataGroupQueryModel  # Must be imported so the table is created
+from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # Must be imported so the table is created
 
 # Create all DB tables
 Base.metadata.create_all(bind=engine)
