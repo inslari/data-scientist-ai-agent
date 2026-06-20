@@ -25,6 +25,10 @@ class AgentState(TypedDict, total=False):
     # Manuel hedef seçimi (UI'dan gelir) — doluysa target_discovery_node bypass edilir
     target_col: str                  # Kullanıcının UI'dan el ile seçtiği hedef sütun
 
+    # Veri modality ekseni (domain_pack'ten bağımsız) — UI'dan gelir
+    modality: str                    # "" / "tabular" (varsayılan) | "timeseries"
+    time_col: str                    # timeseries için kronolojik split'te satırları sıralayan zaman sütunu
+
     # Target Discovery Node output
     target_definition: dict          # Target definition for modeling
 

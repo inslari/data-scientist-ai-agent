@@ -12,6 +12,13 @@ class ProjectModel(Base):
     query = Column(Text, nullable=True)
     intent = Column(String, nullable=True)
     target_col = Column(String, nullable=True)
+
+    # Data modality (structure axis, orthogonal to domain_pack). NULL/empty =
+    # "tabular" (default, existing behavior). "timeseries" → chronological split.
+    # time_col is the user-picked time column used to order rows for that split.
+    modality = Column(String, nullable=True)
+    time_col = Column(String, nullable=True)
+
     data_group_id = Column(Integer, ForeignKey("data_groups.id", ondelete="SET NULL"), nullable=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
 

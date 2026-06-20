@@ -121,6 +121,8 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     db = SessionLocal()
     project_intent = None
     project_target_col = None
+    project_modality = None
+    project_time_col = None
     try:
         project: ProjectModel | None = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
         if not project:
@@ -131,6 +133,8 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
         project_intent = getattr(project, "intent", None)
         # DetachedInstanceError'dan kaçınmak için session AÇIKKEN lokal değişkene oku
         project_target_col = getattr(project, "target_col", None)
+        project_modality = getattr(project, "modality", None)
+        project_time_col = getattr(project, "time_col", None)
 
         dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first() if data_group_id else None
         if project.domain_pack:
@@ -179,6 +183,14 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                     "confidence": 1.0,
                     "confirmed": True,
                 }
+
+            # Veri modality ekseni (domain_pack'ten bağımsız). Boş/"tabular" =
+            # mevcut davranış; "timeseries" feature_builder'da kronolojik split tetikler.
+            if project_modality:
+                initial_state["modality"] = project_modality
+            if project_time_col:
+                initial_state["time_col"] = project_time_col
+            print(f"[Worker] modality='{project_modality or 'tabular'}', time_col='{project_time_col or '-'}' for project {project_id}")
 
             if is_resume:
                 try:

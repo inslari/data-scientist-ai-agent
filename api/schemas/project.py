@@ -21,6 +21,8 @@ class ProjectBase(BaseModel):
     intent: Optional[str] = None
     target_col: Optional[str] = None
     domain_pack: Optional[str] = None   # None/empty = inherit (data group → global)
+    modality: Optional[str] = None      # None/empty = "tabular" (default). "timeseries" → chronological split
+    time_col: Optional[str] = None      # time column used to order rows for the chronological split
 
 class ProjectCreate(ProjectBase):
     pass
@@ -33,6 +35,8 @@ class ProjectUpdate(BaseModel):
     intent: Optional[str] = None
     target_col: Optional[str] = None
     domain_pack: Optional[str] = None
+    modality: Optional[str] = None
+    time_col: Optional[str] = None
 
 class ProjectResponse(ProjectBase):
     id: int

@@ -1,6 +1,11 @@
 from api.core.database import engine
+from api.core.db_safety import assert_local_db
 from sqlalchemy import inspect
 from sqlalchemy import text
+
+# GÜVENLİK: remote (production) DB'ye yanlışlıkla migration uygulanmasını engelle.
+# Bağlantı açılmadan, hiçbir ALTER çalışmadan önce durur. Bilinçli remote için ALLOW_REMOTE_DB_OPS=1.
+assert_local_db(engine.url, context="migrate_db.py")
 
 inspector = inspect(engine)
 
@@ -39,6 +44,15 @@ with engine.connect() as conn:
     if "domain_pack" not in existing_cols:
         print("Adding 'domain_pack' column to 'projects'...")
         conn.execute(text("ALTER TABLE projects ADD COLUMN domain_pack VARCHAR"))
+
+    # Data modality axis (tabular | timeseries) + the time column for chronological split
+    if "modality" not in existing_cols:
+        print("Adding 'modality' column to 'projects'...")
+        conn.execute(text("ALTER TABLE projects ADD COLUMN modality VARCHAR"))
+
+    if "time_col" not in existing_cols:
+        print("Adding 'time_col' column to 'projects'...")
+        conn.execute(text("ALTER TABLE projects ADD COLUMN time_col VARCHAR"))
 
     if "domain_pack" not in data_group_cols:
         print("Adding 'domain_pack' column to 'data_groups'...")

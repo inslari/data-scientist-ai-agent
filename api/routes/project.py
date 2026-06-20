@@ -101,6 +101,8 @@ def create_project(
         query=project.query,
         intent=project.intent,
         target_col=project.target_col,
+        modality=project.modality or None,
+        time_col=project.time_col or None,
         data_group_id=project.data_group_id,
         domain_pack=project.domain_pack or None,
         user_id=current_user.id,
@@ -171,6 +173,10 @@ def update_project(
         db_project.data_group_id = project.data_group_id
     if "domain_pack" in project.model_fields_set:
         db_project.domain_pack = project.domain_pack or None
+    if "modality" in project.model_fields_set:
+        db_project.modality = project.modality or None
+    if "time_col" in project.model_fields_set:
+        db_project.time_col = project.time_col or None
 
     db_project.updated_at = int(time.time())
     db.commit()
