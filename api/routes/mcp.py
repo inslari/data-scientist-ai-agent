@@ -12,6 +12,7 @@ from mcp.client.stdio import stdio_client, StdioServerParameters, get_default_en
 from mcp.client.streamable_http import streamable_http_client
 
 from api.core.database import get_db
+from api.core.jobs import enqueue_ttd_suggestions
 from api.models.mcp import MCPConfigModel
 from api.models.data_group import DataGroupModel
 from api.schemas.mcp import (
@@ -100,6 +101,10 @@ def create_mcp_config(config: MCPConfigCreate, db: Session = Depends(get_db), cu
     db.add(new_config)
     db.commit()
     db.refresh(new_config)
+
+    # Talk-to-Data örnek sorularını arka planda üret (best-effort, async worker job'ı)
+    enqueue_ttd_suggestions(db, data_group.id)
+
     return new_config
 
 @router.get("/config", response_model=list[MCPConfigResponse])

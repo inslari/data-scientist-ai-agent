@@ -13,6 +13,7 @@ from api.models.csv import CSVFileModel
 from api.models.data_group import DataGroupModel
 from api.models.user import UserModel
 from api.models.mcp import MCPConfigModel
+from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # table auto-created via create_all
 from api.core.worker import job_worker_loop
 
 def recover_interrupted_jobs():

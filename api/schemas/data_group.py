@@ -24,6 +24,9 @@ class DataGroupResponse(DataGroupBase):
     # Domain/dataset description (markdown) used as pipeline context. None = none.
     domain_doc: Optional[str] = None
 
+    # Talk-to-Data örnek soru önerileri. None/[] = henüz üretilmedi → UI boş gösterir.
+    ttd_suggestions: Optional[List[str]] = None
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -40,6 +43,7 @@ import re
 import duckdb
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
+from fastapi.concurrency import run_in_threadpool
 from api.models.data_group import DataGroupModel
 from api.routes.mcp import _call_mcp_tool
 
@@ -86,35 +90,43 @@ async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Sessi
         
     elif db_group.source_type == "csv":
         from api.core.storage import storage
-        # For each CSV, download to a temp file if on MinIO, then register in DuckDB
-        tmp_paths: list[tuple[str, object]] = []  # (local_path, context_manager_or_none)
-        context_managers = []
-        try:
-            con = duckdb.connect(database=':memory:')
-            for csv_file in db_group.csv_files:
-                table_name = os.path.splitext(csv_file.filename)[0].lower()
-                table_name = re.sub(r'[^a-z0-9_]', '_', table_name)
+        # SQLAlchemy ilişkisi (csv_files) ve tablo adlarını, thread'e geçmeden ÖNCE
+        # düz veriye çıkar (session thread-safe değil). Bloklayan storage indirme +
+        # senkron duckdb işini ayrı bir thread'de çalıştır → event loop bloklanmaz.
+        csv_specs = [
+            (re.sub(r'[^a-z0-9_]', '_', os.path.splitext(f.filename)[0].lower()), f.file_path)
+            for f in db_group.csv_files
+        ]
+        query = req.query
 
-                ctx = storage.download_to_tempfile(csv_file.file_path)
-                local_path = ctx.__enter__()
-                context_managers.append(ctx)
+        def _run_csv_query() -> dict:
+            # For each CSV, download to a temp file if on MinIO, then register in DuckDB
+            context_managers = []
+            try:
+                con = duckdb.connect(database=':memory:')
+                for table_name, file_path in csv_specs:
+                    ctx = storage.download_to_tempfile(file_path)
+                    local_path = ctx.__enter__()
+                    context_managers.append(ctx)
 
-                con.execute(f'CREATE VIEW "{table_name}" AS SELECT * FROM read_csv_auto(\'{local_path}\')')
+                    con.execute(f'CREATE VIEW "{table_name}" AS SELECT * FROM read_csv_auto(\'{local_path}\')')
 
-            result_df = con.execute(req.query).df()
+                result_df = con.execute(query).df()
 
-            columns = result_df.columns.tolist()
-            output_lines = [f"Columns: {', '.join(columns)}"]
-            for row in result_df.itertuples(index=False, name=None):
-                output_lines.append(str(row))
-            return {"status": "success", "result": "\n".join(output_lines)}
-        except Exception as e:
-            return {"status": "error", "result": f"SQL Error: {str(e)}"}
-        finally:
-            for ctx in context_managers:
-                try:
-                    ctx.__exit__(None, None, None)
-                except Exception:
-                    pass
-            
+                columns = result_df.columns.tolist()
+                output_lines = [f"Columns: {', '.join(columns)}"]
+                for row in result_df.itertuples(index=False, name=None):
+                    output_lines.append(str(row))
+                return {"status": "success", "result": "\n".join(output_lines)}
+            except Exception as e:
+                return {"status": "error", "result": f"SQL Error: {str(e)}"}
+            finally:
+                for ctx in context_managers:
+                    try:
+                        ctx.__exit__(None, None, None)
+                    except Exception:
+                        pass
+
+        return await run_in_threadpool(_run_csv_query)
+
     raise HTTPException(status_code=400, detail="Unknown source type")

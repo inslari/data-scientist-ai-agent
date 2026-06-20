@@ -1,4 +1,5 @@
 import json
+import re
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import HumanMessage
 
@@ -21,7 +22,20 @@ Rules:
 
 ---
 Additionally, you have access to a "Long-Term Memory". If the user expresses a general preference (e.g., "always show me USD", "I prefer line charts", "don't show me empty rows"), update the long-term memory string. If there are no new preferences, return the existing memory exactly as it is.
+
+IMPORTANT: The `summary` field must contain ONLY the natural-language interpretation shown to the user. NEVER include, mention, echo, or print the long-term memory (e.g. a line like "Long-Term Memory: None") inside `summary`. The memory belongs solely in the separate `updated_long_term_memory` field.
 """
+
+# Güvenlik ağı: LLM yapısal çıktı yerine düz metin döndürüp memory'i cevaba
+# sızdırırsa (örn. sonda "Long-Term Memory: None"), kullanıcıya gitmeden temizle.
+_MEMORY_ECHO_RE = re.compile(
+    r"\n+\s*(?:long[-\s]?term\s+memory|user\s+preferences)\s*[:\-].*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_memory_echo(text: str) -> str:
+    return _MEMORY_ECHO_RE.sub("", text or "").strip()
 
 async def ttd_interpreter_node(state: TTDState, config: RunnableConfig) -> TTDState:
     """
@@ -83,17 +97,24 @@ async def ttd_interpreter_node(state: TTDState, config: RunnableConfig) -> TTDSt
                 "Please interpret this data and update the long-term memory if needed."
             )
 
-        raw_response = llm.invoke([
+        messages = [
             ("system", system_prompt),
             HumanMessage(content=user_msg),
-        ])
-        # Accept both JSON and plain-text responses from the LLM
-        response: _InterpreterResult = _StructuredJsonParser(
-            pydantic_object=_InterpreterResult,
-            fallback_field="summary",
-        ).parse(raw_response.content)  # type: ignore
+        ]
+        # Önce yapısal çıktıyı zorla → summary ve memory ayrı alanlara düşer,
+        # böylece memory cevaba sızmaz. Başarısız olursa metin-parser'a düş.
+        try:
+            response: _InterpreterResult = llm.with_structured_output(_InterpreterResult).invoke(messages)  # type: ignore
+        except Exception as e_struct:
+            print(f"[TTD] structured interpreter başarısız ({type(e_struct).__name__}); metin-parser fallback")
+            raw_response = llm.invoke(messages)
+            response = _StructuredJsonParser(
+                pydantic_object=_InterpreterResult,
+                fallback_field="summary",
+            ).parse(raw_response.content)  # type: ignore
 
-        summary        = response.summary.strip()
+        # Güvenlik ağı: fallback yolunda memory cevaba sızmışsa temizle.
+        summary        = _strip_memory_echo(response.summary)
         updated_memory = response.updated_long_term_memory
     except Exception as e:
         print(f"[TTD] interpreter error: {e}")

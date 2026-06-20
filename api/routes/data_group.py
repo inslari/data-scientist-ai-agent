@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -275,7 +276,15 @@ async def chat_with_data_group(
             print(f"[ttd chat] SQLite cache miss: group_id={group_id} — ttd_db_context_node çalışacak")
 
         config = {"configurable": {"data_group_id": group_id, "user_id": current_user.id}}
-        result = await graph.ainvoke(initial_state, config=config)
+        # TTD graph'ı içindeki LLM/SQL/MCP çağrıları senkron ve uzun sürüyor
+        # (node'lar async ama içeride bloklayan .invoke() çağırıyor). Bunları
+        # API'nin event loop'unda çalıştırmak loop'u bloklar → o istek bitene
+        # kadar TÜM diğer istekler bekler. Tüm graph yürütmesini ayrı bir worker
+        # thread'ine (kendi event loop'uyla) taşıyoruz; böylece main event loop
+        # serbest kalır ve diğer istekler bu sırada karşılanmaya devam eder.
+        result = await asyncio.to_thread(
+            lambda: asyncio.run(graph.ainvoke(initial_state, config=config))
+        )
 
         # ── SQLite'a yaz (ttd_db_context_node çalıştıysa) ──────────────────
         if not cached and result.get("db_intelligence") and result.get("raw_schema"):

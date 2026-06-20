@@ -98,8 +98,60 @@ async def _execute_job(job: BackgroundJobModel) -> None:
     """
     if job.task_type == "run_project":
         await _run_project_job(job)
+    elif job.task_type == "generate_ttd_suggestions":
+        await _generate_ttd_suggestions_job(job)
     else:
         _mark_job(job.id, "failed", f"Unknown task_type: {job.task_type}")
+
+
+async def _generate_ttd_suggestions_job(job: BackgroundJobModel) -> None:
+    """
+    Bir data group için Talk-to-Data örnek sorularını üretir ve
+    DataGroupModel.ttd_suggestions kolonuna yazar. Best-effort: hata olsa bile
+    job 'completed' işaretlenir (öneriler kritik değil, boş liste kabul edilebilir).
+    """
+    data_group_id = job.data_group_id
+    if not data_group_id:
+        _mark_job(job.id, "failed", "generate_ttd_suggestions: data_group_id missing")
+        return
+
+    # user_id'yi data group'tan çöz (schema logic yetki kontrolü için kullanır)
+    db = SessionLocal()
+    try:
+        dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+        if not dg:
+            _mark_job(job.id, "failed", f"Data group {data_group_id} not found")
+            return
+        user_id = dg.user_id
+    finally:
+        db.close()
+
+    suggestions: list[str] = []
+    try:
+        from src.services.ttd_suggestion_generator import generate_ttd_suggestions
+        db = SessionLocal()
+        try:
+            suggestions = await generate_ttd_suggestions(data_group_id, db, user_id)
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"[Worker] TTD öneri üretimi hata (group {data_group_id}): {str(e)[:200]}")
+
+    # Sonucu yaz (boş liste de yazılır → 'üretildi ama soru çıkmadı' ile 'henüz üretilmedi/NULL' ayrışır)
+    db = SessionLocal()
+    try:
+        dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+        if dg:
+            dg.ttd_suggestions = suggestions
+            db.commit()
+            print(f"[Worker] TTD önerileri kaydedildi (group {data_group_id}): {len(suggestions)} adet")
+    except Exception as e:
+        db.rollback()
+        print(f"[Worker] TTD öneri kaydı başarısız (group {data_group_id}): {str(e)[:200]}")
+    finally:
+        db.close()
+
+    _mark_job(job.id, "completed")
 
 
 async def _run_project_job(job: BackgroundJobModel) -> None:

@@ -539,6 +539,18 @@ def _encode_categorical(df: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
 def _scale_features(df: pd.DataFrame, outlier_cols: list[str]) -> pd.DataFrame:
     num = df.select_dtypes(include="number").columns.tolist()
     if not num: return df
+    # inf temizliği: ratio/math_interaction kolonları 0'a bölünmeden inf üretebilir.
+    # Scaler inf kabul etmez → inf'leri NaN'a, sonra kolon medyanına (yoksa 0) çevir.
+    # Not: kolonlar nullable/object dtype olabilir (Int64, Float64, ratio çıktıları),
+    # bu yüzden isinf öncesi her kolonu güvenle float'a coerce ediyoruz.
+    inf_cols = [
+        c for c in num
+        if np.isinf(pd.to_numeric(df[c], errors="coerce").to_numpy(dtype="float64")).any()
+    ]
+    if inf_cols:
+        df[inf_cols] = df[inf_cols].replace([np.inf, -np.inf], np.nan)
+        df[inf_cols] = df[inf_cols].fillna(df[inf_cols].median()).fillna(0.0)
+        print(f"[feature_eng] inf temizlendi (scaling oncesi): {inf_cols}")
     robust   = [c for c in outlier_cols if c in num]
     standard = [c for c in num if c not in robust]
     if robust:
