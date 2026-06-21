@@ -353,6 +353,54 @@ def _find_related_target_cols(df: pd.DataFrame, target_name: str) -> list[str]:
     return cols
 
 
+def _resolve_time_col(df: pd.DataFrame, time_col: str) -> str | None:
+    """Kullanıcının UI'dan seçtiği ham time_col adını df'teki gerçek kolona eşle.
+    _normalize_column_names sonrası adlar değişmiş olabilir → exact, sonra
+    case-insensitive/trimmed eşleme dene. Bulunamazsa None."""
+    if not time_col:
+        return None
+    if time_col in df.columns:
+        return time_col
+    lookup = {str(c).lower().strip(): c for c in df.columns}
+    return lookup.get(time_col.lower().strip())
+
+
+def _chronological_order(time_sort_key: pd.Series, index) -> np.ndarray:
+    """time_sort_key'i verilen satır index'ine hizala ve eski→yeni KARARLI pozisyonel
+    sıra döndür (np.argsort mergesort = stabil, deterministik). Parse edilemeyen az
+    sayıda satır (NaT) en eski tarihe atanır → train tarafında kalır, test'i kirletmez."""
+    key = time_sort_key.reindex(index)
+    key = key.fillna(key.min())
+    return np.argsort(key.to_numpy(), kind="mergesort")
+
+
+def _entity_aware_split_positions(
+    time_sort_key: pd.Series, entity_split_key: pd.Series, index, test_size: float
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Her entity'nin KENDI son %test_size'i test. df.index'e hizali calisir, POZISYONEL
+    (df.iloc ile kullanilir) train/test index dizileri dondurur → df ve y ayni permutasyonla
+    hizali kalir (FAZ 1 disiplini). Boylece hicbir entity tamamen bir tarafa dusmez.
+    Donus: (train_pos, test_pos, imbalanced_entity_sayisi)."""
+    ent = entity_split_key.reindex(index).to_numpy()
+    tk = time_sort_key.reindex(index)
+    tk = tk.fillna(tk.min()).to_numpy()
+    helper = pd.DataFrame({"pos": np.arange(len(index)), "ent": ent, "tk": tk})
+    helper = helper.sort_values(["ent", "tk"], kind="mergesort")   # [entity, zaman] stabil
+    train_pos: list[int] = []
+    test_pos: list[int] = []
+    imbalanced = 0
+    for _, g in helper.groupby("ent", sort=False):
+        m = len(g)
+        n_test_g = max(1, int(round(m * test_size)))   # her entity >=1 test
+        gp = g["pos"].to_numpy()
+        cut = m - n_test_g                              # cut<=0 → train bos (cok kucuk entity)
+        if cut <= 0:
+            imbalanced += 1
+        train_pos.extend(gp[:max(cut, 0)].tolist())
+        test_pos.extend(gp[max(cut, 0):].tolist())
+    return np.array(train_pos, dtype=int), np.array(test_pos, dtype=int), imbalanced
+
+
 def _derive_time_based_target(
     df: pd.DataFrame, target: dict, plan: dict
 ) -> tuple[pd.DataFrame, pd.Series, str]:
@@ -417,6 +465,200 @@ def _find_best_target_candidate(df: pd.DataFrame, planned_target: str = "") -> t
         "Olası neden: SQL hedef kolonu seçmedi, kolon adı normalize edilince değişti, "
         "ya da unsupervised bir intent için target aranıyor."
     )
+
+
+# ── Time-series lag features (FAZ A: cekirdek) ───────────────
+_TS_MAX_FEATURE_COLS = 5   # hedef disinda laglenecek en fazla sayisal kolon (feature patlamasi korumasi)
+
+
+def _detect_frequency(parsed: pd.Series, group_key: "pd.Series | None" = None) -> tuple[str, list[int]]:
+    """Ardisik tarih farklarinin medyanindan veri sikligini ve dinamik lag pencerelerini turet.
+
+    ``group_key`` verilirse (multi-entity, FAZ B2) fark GRUP-ICI alinir: panelde tum
+    entity'ler ayni tarihleri paylasinca havuzlanmis GLOBAL diff 0'a coker (ayni gun
+    tekrari) → within-group diff bunu onler. group_key None ise GLOBAL diff (FAZ A/B1).
+    """
+    if group_key is not None:
+        tmp = pd.DataFrame({"t": parsed, "g": group_key}).dropna(subset=["t"])
+        deltas = tmp.sort_values(["g", "t"]).groupby("g")["t"].diff().dropna()
+    else:
+        deltas = parsed.dropna().sort_values().diff().dropna()
+    if len(deltas) == 0:
+        print("[feature_eng] timeseries: frekans icin yeterli tarih farki yok → varsayilan [1]")
+        return "unknown", [1]
+    days = deltas.median() / pd.Timedelta(days=1)
+    if 0.5 <= days <= 1.5:
+        return "daily", [1, 7, 30]
+    if 5 <= days <= 9:
+        return "weekly", [1, 4, 12]
+    if 26 <= days <= 32:
+        return "monthly", [1, 3, 12]
+    print(f"[feature_eng] timeseries: taninmayan frekans (medyan ~{days:.1f} gun) → varsayilan [1] + WARN")
+    return "unknown", [1]
+
+
+def _build_timeseries_features(
+    df: pd.DataFrame, feature_plan: dict, resolved_time_col: str, meta: "ColumnMetadata",
+    entity_col: str = "",
+) -> tuple[pd.DataFrame, dict]:
+    """Zaman anahtarina gore sirala; frekanstan dinamik pencere turet; hedef + secili
+    sayisal feature'larin LAG (FAZ A) ve ROLLING mean/std (FAZ B1) feature'larini uret;
+    tum NaN-lead satirlari (lag+rolling birlikte) TEK seferde at — fillna'dan ONCE.
+    Hem lag hem rolling YALNIZCA gecmise bakar (lag: shift(k>0); rolling: shift(1).rolling(w))
+    → simdiki/gelecek deger sizmaz. y henuz ayrilmadi → tek df maskesi, hizalama derdi yok.
+
+    ``entity_col`` (FAZ B2-a): BOS → GLOBAL yol (FAZ A/B1 birebir). DOLU → multi-entity
+    panel: sort/lag/rolling/frekans GRUP ICINDE hesaplanir (bir entity'nin satiri
+    digerinin penceresine sizmaz). Split bu adimda hala GLOBAL (B2-b duzeltecek)."""
+    parsed = pd.to_datetime(df[resolved_time_col], errors="coerce")
+    freq, windows = _detect_frequency(parsed, group_key=df[entity_col] if entity_col else None)
+
+    if entity_col:
+        print(f"[feature_eng] timeseries: GRUP-ICI mod, entity_col='{entity_col}' "
+              f"({df[entity_col].nunique()} entity) — lag/rolling/frekans entity icinde hesaplanir")
+    else:
+        # GLOBAL mod: identifier varsa panel-leakage WARN (entity_col secilmedi).
+        id_cols = [c for c, info in meta.columns.items()
+                   if info.get("semantic_type") == "identifier" and c in df.columns]
+        if id_cols:
+            ex = id_cols[0]
+            try:
+                n_ent = int(df[ex].nunique())
+            except Exception:
+                n_ent = -1
+            print(f"[feature_eng] WARN timeseries lag: identifier kolon(lar) {id_cols} "
+                  f"(orn. '{ex}' → {n_ent} entity) ama entity_col SECILMEDI → GLOBAL shift; "
+                  f"entity sinirinda sizinti olabilir. entity_col secersen grup-ici hesaplanir.")
+
+    # Kronolojik sirala (kararli/stabil, eski→yeni). NaT'lar en eskiye.
+    # entity_col dolu → COK-ANAHTARLI [entity, zaman]: her entity bitisik VE kendi icinde
+    # sirali olur ki groupby.shift "grup icinde zamanca onceki" anlamina gelsin.
+    if entity_col:
+        df = df.assign(__parsed=parsed.fillna(parsed.min()).values)
+        df = df.sort_values([entity_col, "__parsed"], kind="mergesort").reset_index(drop=True)
+        df = df.drop(columns="__parsed")
+    else:
+        order = np.argsort(parsed.fillna(parsed.min()).to_numpy(), kind="mergesort")
+        df = df.iloc[order].reset_index(drop=True)
+
+    n = len(df)
+    windows = [w for w in windows if w < n]   # veri boyutunu asan pencereyi ele (hepsini dropdan kacin)
+    if not windows:
+        print(f"[feature_eng] timeseries: veri ({n} satir) pencereler icin cok kucuk → lag/rolling atlandi")
+        return df, {"frequency": freq, "windows": [], "roll_windows": [], "lag_columns": [],
+                    "rolling_columns": [], "lag_base_columns": [], "dropped_lead_rows": 0,
+                    "entity_col": entity_col or None, "dropped_entities": 0,
+                    "dropped_rows_from_small_entities": 0}
+
+    target_name = feature_plan.get("target", {}).get("column_name", "")
+    skip = {resolved_time_col}
+    if entity_col:
+        skip.add(entity_col)        # entity id'sini feature olarak laglemeyiz
+    for col, info in meta.columns.items():
+        if info.get("semantic_type") in ("identifier", "timestamp"):
+            skip.add(col)
+
+    numeric_cols = [c for c in df.select_dtypes(include="number").columns
+                    if c not in skip and c != target_name]
+
+    # Kolon SECIMI (cok sayisal kolon varsa feature patlamasini onle): deterministik,
+    # VERIYE DAYALI kriter = min-max normalize edilmis varyans (olcek-bagimsiz yayilim).
+    # Model feature importance bu asamada YOK; IE importance_score'a guvenmiyoruz (cogu
+    # zaman 0.5'e duser → sessizce "ilk 5 kolon" secimi). Yayilimi yuksek kolonlar
+    # (lag'lemeye deger sinyal) once gelir; esitlikte kolon adina gore stabil siralanir.
+    if len(numeric_cols) > _TS_MAX_FEATURE_COLS:
+        def _norm_var(c: str) -> float:
+            s = pd.to_numeric(df[c], errors="coerce")
+            lo, hi = s.min(), s.max()
+            if pd.isna(lo) or pd.isna(hi) or hi == lo:
+                return 0.0
+            return float(((s - lo) / (hi - lo)).var())
+        ranked = sorted(numeric_cols, key=lambda c: (-_norm_var(c), c))
+        lag_base_cols = ranked[:_TS_MAX_FEATURE_COLS]
+        print(f"[feature_eng] timeseries lag: {len(numeric_cols)} sayisal kolondan "
+              f"normalize-varyans (yayilim) ile {_TS_MAX_FEATURE_COLS} secildi: {lag_base_cols}")
+    else:
+        lag_base_cols = list(numeric_cols)
+
+    # Hedef sayisalsa onu da ekle: gecmis target (lag_k_target) mesru feature
+    if target_name in df.columns and pd.api.types.is_numeric_dtype(df[target_name]):
+        lag_base_cols = [target_name] + lag_base_cols
+
+    lag_cols_created: list[str] = []
+    for col in lag_base_cols:
+        for k in windows:
+            new_col = f"lag_{k}_{col}"
+            if new_col in df.columns:
+                continue
+            if entity_col:
+                df[new_col] = df.groupby(entity_col)[col].shift(k)   # grup-ici gecmis
+            else:
+                df[new_col] = df[col].shift(k)   # shift>0 = gecmis; gelecek sizmaz
+            lag_cols_created.append(new_col)
+
+    # ── ROLLING (FAZ B1): trend (mean) + oynaklik (std) ──────────
+    # Pencereler lag pencerelerinden gelir AMA 1-birim ATLANIR (1-birim rolling =
+    # degerin kendisi, anlamsiz). KRITIK: shift(1).rolling(w) → pencere yalnizca
+    # GECMISI (t-1..t-w) gorur, simdiki satiri (t) ASLA icermez → gelecek/simdi sizmaz.
+    # Grup-ici modda transform(lambda s: s.shift(1).rolling(w)...) ZORUNLU: groupby.shift
+    # sonrasi duz .rolling grup sinirini UNUTUR (bir entity'nin ilki oncekinin sonuyla
+    # karisir = leakage); transform kaydirma+pencereyi grup ICINDE tutar.
+    roll_windows = [w for w in windows if w >= 2]
+    rolling_cols_created: list[str] = []
+    for col in lag_base_cols:
+        for w in roll_windows:
+            m, s = f"roll{w}_mean_{col}", f"roll{w}_std_{col}"
+            if m not in df.columns:
+                if entity_col:
+                    df[m] = df.groupby(entity_col)[col].transform(
+                        lambda x, w=w: x.shift(1).rolling(w).mean())
+                else:
+                    df[m] = df[col].shift(1).rolling(w).mean()
+                rolling_cols_created.append(m)
+            if s not in df.columns:
+                if entity_col:
+                    df[s] = df.groupby(entity_col)[col].transform(
+                        lambda x, w=w: x.shift(1).rolling(w).std())
+                else:
+                    df[s] = df[col].shift(1).rolling(w).std()
+                rolling_cols_created.append(s)
+
+    # NaN-lead drop: lag + rolling kolonlarinin NaN urettigi ilk satirlari TEK seferde at
+    # — fillna/to_numeric'ten ONCE (yoksa lead satirlar sahte 0 ile modele girer).
+    # Grup-ici modda bu dropna otomatik entity-aware: her entity'nin ilk max-pencere satiri
+    # NaN olur ve duser. y henuz df icinde → hizalama derdi yok.
+    before = len(df)
+    counts_before = df[entity_col].value_counts() if entity_col else None
+    all_new = lag_cols_created + rolling_cols_created
+    if all_new:
+        df = df.dropna(subset=all_new).reset_index(drop=True)
+    dropped = before - len(df)
+
+    # Kucuk-entity raporu (TUZAK 3): penceresinden kisa entity'nin HER satiri NaN → komple
+    # duser. Yari-doldurma (min_periods) YOK; ama sessiz kalmasin → say + raporla.
+    dropped_entities = 0
+    dropped_rows_small = 0
+    if entity_col and counts_before is not None:
+        gone = set(counts_before.index) - set(df[entity_col].unique())
+        dropped_entities = len(gone)
+        dropped_rows_small = int(counts_before.loc[list(gone)].sum()) if gone else 0
+        if dropped_entities:
+            print(f"[feature_eng] WARN grup-ici: {dropped_entities} entity penceresinden kisa → "
+                  f"KOMPLE dustu ({dropped_rows_small} satir). Kucuk entity'ler atilir (yari-doldurma YOK).")
+
+    info = {
+        "frequency": freq, "windows": windows, "roll_windows": roll_windows,
+        "lag_columns": lag_cols_created, "rolling_columns": rolling_cols_created,
+        "lag_base_columns": lag_base_cols, "dropped_lead_rows": dropped,
+        "entity_col": entity_col or None,
+        "dropped_entities": dropped_entities,
+        "dropped_rows_from_small_entities": dropped_rows_small,
+    }
+    print(f"[feature_eng] timeseries: frekans={freq}, lag pencereleri={windows}, "
+          f"rolling pencereleri={roll_windows}, {len(lag_cols_created)} lag + "
+          f"{len(rolling_cols_created)} rolling kolonu uretildi, {dropped} lead satir atildi"
+          + (f", {dropped_entities} kucuk entity dustu" if entity_col else ""))
+    return df, info
 
 
 # ── Aggregation ──────────────────────────────────────────────
@@ -644,16 +886,23 @@ def _detect_leakage(
     df: pd.DataFrame,
     y: pd.Series,
     meta=None,  # ColumnMetadata, identifier tespiti için
+    protected_high_card=None,  # SADECE kardinalite (KESİN 2) kuralından muaf kolonlar
 ) -> tuple[pd.DataFrame, dict]:
     """
     Leakage tespiti — iki seviyeli:
       KESİN  → otomatik drop (identifier, ~birebir korelasyon)
       ŞÜPHELİ → drop etme, uyarı listesine ekle
 
+    ``protected_high_card``: time-series lag kolonlari gibi deterministik turetilmis,
+    continuous oldugu icin dogal olarak yuksek-kardinaliteli ama ID OLMAYAN kolonlar.
+    Bunlar YALNIZCA KESİN 2 (kardinalite) heuristiginden muaftir; identifier (KESİN 1)
+    ve korelasyon/sizinti kontrolu onlara da AYNEN uygulanir.
+
     Dönüş:
       df              : temizlenmiş dataframe
       leakage_report  : {"dropped": [...], "suspected": [...]}
     """
+    protected_high_card = protected_high_card or set()
     dropped = []      # otomatik atılanlar (kesin)
     suspected = []    # şüpheli, kullanıcıya raporlanacak
     n_rows = len(df)
@@ -679,8 +928,11 @@ def _detect_leakage(
                 continue
 
         # ── KESİN 2: Aşırı yüksek kardinalite (ID-benzeri) ──
+        # Time-series lag kolonlari MUAF: deterministik turetildi, continuous olmalari
+        # dogal (her satir farkli) → ID degiller. SADECE bu kuraldan muaf; korelasyon/
+        # sizinti kontrolu (asagida) onlara da aynen uygulanir.
         nunique = df[col].nunique()
-        if n_rows > 0 and nunique / n_rows > 0.95:
+        if col not in protected_high_card and n_rows > 0 and nunique / n_rows > 0.95:
             df = df.drop(columns=[col], errors="ignore")
             dropped.append({"column": col, "reason": f"asiri kardinalite ({nunique}/{n_rows})"})
             print(f"[leakage] KESIN drop: '{col}' (kardinalite orani {nunique/n_rows:.2f})")
@@ -834,7 +1086,13 @@ def build_features(state: dict) -> dict:
     profiling_report = state.get("profiling_report",{})
     db_intelligence  = state.get("db_intelligence",{})
     feature_plan     = state.get("feature_plan",{})
-    
+
+    # Modality ekseni (domain_pack'ten bağımsız). Boş/"tabular" = mevcut davranış;
+    # "timeseries" → holdout split kronolojik olur (geçmişle eğit, gelecekte test).
+    modality         = (state.get("modality") or "").strip().lower()
+    time_col         = (state.get("time_col") or "").strip()
+    entity_col       = (state.get("entity_col") or "").strip()   # opsiyonel multi-entity (FAZ B2-a)
+
     if not feature_plan:
         return {"error":"Feature plan yok."}
 
@@ -874,12 +1132,40 @@ def build_features(state: dict) -> dict:
     # Temizlik
     df = _clean_data(df)
 
+    # ── Time-series lag katmani (FAZ A) ──────────────────────────
+    # Yalnizca modality==timeseries; tabular yol bu blogu hic gormez.
+    # Konum: _clean_data sonrasi, _resolve_target ONCESI → target hala df'te
+    # (gecmis target = mesru feature), degerler henuz scale/encode edilmemis,
+    # zaman kolonu henuz drop edilmemis. NaN-lead drop fillna'dan (~asagida) ONCE.
+    ts_lag_info = None
+    if modality == "timeseries":
+        resolved_time_col = _resolve_time_col(df, time_col)
+        if resolved_time_col is None:
+            print(f"[feature_eng] WARN timeseries lag: time_col '{time_col}' df'te yok → lag atlandi")
+        elif float(pd.to_datetime(df[resolved_time_col], errors="coerce").notna().mean()) < 0.5:
+            print(f"[feature_eng] WARN timeseries lag: '{resolved_time_col}' parse edilemedi → lag atlandi")
+        else:
+            # entity_col opsiyonel: _resolve_time_col generik ad-normalizasyonu yapar
+            # (entity de _normalize_column_names suffix'inden etkilenebilir). Bos/bulunamaz
+            # → GLOBAL yol (FAZ A/B1 birebir).
+            resolved_entity_col = _resolve_time_col(df, entity_col) if entity_col else None
+            if entity_col and resolved_entity_col is None:
+                print(f"[feature_eng] WARN timeseries: entity_col '{entity_col}' df'te yok → GLOBAL yol")
+            df, ts_lag_info = _build_timeseries_features(
+                df, feature_plan, resolved_time_col, meta,
+                entity_col=resolved_entity_col or "",
+            )
+
     # Hedef değişken
     df, y, target_name = _resolve_target(df, feature_plan, intent)
 
-    # Aggregation
-    entity_resolution = state.get("entity_resolution") or {}
-    df, y = _aggregate_if_needed(df, y, feature_plan, meta, entity_resolution=entity_resolution)
+    # Aggregation — timeseries'te zaman eksenini korumak icin ATLANIR (kapatinca
+    # domain recipe'leri de inert kalir: avg_/std_ kolonlari olusmaz → onlara dokunmuyoruz).
+    if modality == "timeseries":
+        print("[feature_eng] timeseries: aggregation atlandi (zaman ekseni korunuyor)")
+    else:
+        entity_resolution = state.get("entity_resolution") or {}
+        df, y = _aggregate_if_needed(df, y, feature_plan, meta, entity_resolution=entity_resolution)
 
     if df.empty or len(df) < 5:
         return {"error": f"İşlemler sonrası yetersiz veri sayısı ({len(df)} satır). Model kurulamıyor."}
@@ -907,6 +1193,38 @@ def build_features(state: dict) -> dict:
                 df[f"{col}_dayofweek"] = dt.dt.dayofweek
             except Exception:
                 pass
+
+    # Timeseries: kronolojik split anahtarını drop'tan ÖNCE yakala — aşağıdaki blok
+    # timestamp kolonlarını drop ediyor + duckdb USING SAMPLE satır sırasını bozduğu
+    # için satır sırasına GÜVENİLMEZ; gerçek tarih değerine göre sıralanmalı. Anahtar
+    # df.index'e hizalı tutulur (sonraki adımlar yalnızca kolon ekler/atar, satır ve
+    # index'i korur), split anında pozisyonel olarak yeniden hizalanır.
+    time_sort_key = None
+    entity_split_key = None   # B2-b-1: entity-aware split icin — drop'tan ONCE yakala (identifier dusuyor)
+    if modality == "timeseries":
+        resolved_time_col = _resolve_time_col(df, time_col)
+        if resolved_time_col is None:
+            print(f"[feature_eng] WARN timeseries: time_col '{time_col}' df'te bulunamadı → RASTGELE split fallback")
+        else:
+            parsed = pd.to_datetime(df[resolved_time_col], errors="coerce")
+            valid_ratio = float(parsed.notna().mean())
+            if valid_ratio < 0.5:
+                print(f"[feature_eng] WARN timeseries: '{resolved_time_col}' tarih olarak parse edilemedi "
+                      f"(%{valid_ratio*100:.0f} geçerli) → RASTGELE split fallback")
+            else:
+                time_sort_key = parsed
+                print(f"[feature_eng] timeseries: kronolojik anahtar '{resolved_time_col}' yakalandı "
+                      f"({parsed.notna().sum()}/{len(parsed)} geçerli tarih)")
+                # entity anahtari: time_sort_key gibi df.index'e hizali, drop'tan ONCE yakalanir
+                if entity_col:
+                    resolved_entity_col = _resolve_time_col(df, entity_col)
+                    if resolved_entity_col is not None:
+                        entity_split_key = df[resolved_entity_col].copy()
+                        print(f"[feature_eng] timeseries: entity-aware split anahtari "
+                              f"'{resolved_entity_col}' yakalandı ({entity_split_key.nunique()} entity)")
+                    else:
+                        print(f"[feature_eng] WARN timeseries: entity_col '{entity_col}' split için "
+                              f"bulunamadı → GLOBAL split")
 
     # Drop identifier / timestamp / target kolonları
     target_col = feature_plan.get("target",{}).get("column_name","")
@@ -969,8 +1287,13 @@ def build_features(state: dict) -> dict:
     # Final NaN temizliği
     df = df.apply(pd.to_numeric, errors="coerce").fillna(0)
 
-    # Leakage detection
-    df, leakage_report = _detect_leakage(df, y, meta)
+    # Leakage detection — time-series lag + rolling kolonlari SADECE kardinalite kuralindan
+    # muaf (continuous turevler ID degil); korelasyon/sizinti kontrolu onlara da uygulanir.
+    ts_protected_cols: set = set()
+    if ts_lag_info:
+        ts_protected_cols = (set(ts_lag_info.get("lag_columns", []))
+                             | set(ts_lag_info.get("rolling_columns", [])))
+    df, leakage_report = _detect_leakage(df, y, meta, protected_high_card=ts_protected_cols)
 
     df, domain_dropped = _apply_domain_leakage_drops(df, domain_leakage_report)
 
@@ -978,12 +1301,41 @@ def build_features(state: dict) -> dict:
     leakage_report["dropped"].extend(domain_dropped)
 
     # 14. Train/test split
+    split_imbalanced = 0
     if intent in ("clustering","anomaly_detection"):
         X_train = X_test = df.copy()
         y_train = y_test = pd.Series([], dtype=int)
+        split_strategy = "none"
         print(f"[feature_eng] Unsupervised — split atlandi")
+    elif modality == "timeseries" and time_sort_key is not None and entity_split_key is not None:
+        # ENTITY-AWARE holdout: her entity'nin kendi son %TEST_SIZE'i test → hicbir entity
+        # tamamen bir tarafa dusmez (her biri gecmisiyle train, gelecegiyle test). Pozisyonel
+        # (df ve y konum bazli birlikte hizali) → kaydirmali zaman aralikli paneller dogru.
+        train_pos, test_pos, split_imbalanced = _entity_aware_split_positions(
+            time_sort_key, entity_split_key, df.index, TEST_SIZE)
+        X_train, X_test = df.iloc[train_pos], df.iloc[test_pos]
+        y_train, y_test = y.iloc[train_pos], y.iloc[test_pos]
+        split_strategy = "entity_aware"
+        if split_imbalanced:
+            print(f"[feature_eng] WARN entity-aware split: {split_imbalanced} entity train'i bos/yetersiz "
+                  f"(cok kucuk entity) — modele zayif katki, sessiz gecilmiyor")
+        print(f"[feature_eng] ENTITY-AWARE split (timeseries): her entity son %{int(TEST_SIZE*100)} = test "
+              f"({entity_split_key.nunique()} entity, n_train={len(X_train)}, n_test={len(X_test)}), shuffle YOK")
+    elif modality == "timeseries" and time_sort_key is not None:
+        # Kronolojik holdout: geçmişle eğit, gelecekte test. shuffle/stratify YOK.
+        # Pozisyonel sırala (df ve y konum bazlı hizalı) → index etiketlerinden bağımsız.
+        order_pos = _chronological_order(time_sort_key, df.index)
+        df_sorted = df.iloc[order_pos]
+        y_sorted  = y.iloc[order_pos]
+        n_test = max(1, int(round(len(df_sorted) * TEST_SIZE)))
+        X_train, X_test = df_sorted.iloc[:-n_test], df_sorted.iloc[-n_test:]
+        y_train, y_test = y_sorted.iloc[:-n_test], y_sorted.iloc[-n_test:]
+        split_strategy = "global_chronological"
+        print(f"[feature_eng] KRONOLOJIK split (timeseries): son %{int(TEST_SIZE*100)} = test "
+              f"(n_train={len(X_train)}, n_test={len(X_test)}), shuffle/stratify YOK")
     else:
         stratify_arg = y if intent.strip().lower() == "classification" else None
+        split_strategy = "random"
         try:
             X_train, X_test, y_train, y_test = train_test_split(
                 df, y, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED, stratify=stratify_arg
@@ -1018,6 +1370,9 @@ def build_features(state: dict) -> dict:
         "leakage_dropped":          leakage_report["dropped"],
         "leakage_suspected":        leakage_report["suspected"],
         "domain_features":          [c for c in domain_feature_cols if c in X_train.columns],
+        "timeseries_lag":           ts_lag_info,
+        "split_strategy":           split_strategy,
+        "split_imbalanced_entities": split_imbalanced,
     }
 
     return {

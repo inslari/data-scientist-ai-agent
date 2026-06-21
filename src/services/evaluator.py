@@ -366,9 +366,50 @@ def _evaluate_regression(
     if shap_result:
         evaluation["shap_importance"] = shap_result
 
+    # ── Regresyon scatter görselleri (rapor UI'ı için) ───────────────────
+    # Residual-vs-predicted ve predicted-vs-actual saçılımları. Binlerce ham
+    # nokta step_data'yı şişirir; roc_curve gibi stride ile ~200 noktaya
+    # downsample edilir. Mevcut residual_analysis ÖZETİ korunur — bu yalnızca
+    # görselleştirme için örneklenmiş ham noktalar. Domain-pack bloklarından
+    # bağımsız, ayrı bir alan (regression_scatter).
+    evaluation["regression_scatter"] = _build_regression_scatter(y_test, y_pred_test)
+
     evaluation["reliability_score"] = _compute_reliability_score(evaluation)
 
     return evaluation
+
+
+def _build_regression_scatter(
+    y_true: np.ndarray, y_pred: np.ndarray, max_points: int = 200
+) -> dict:
+    """Rapor görselleri için örneklenmiş scatter noktaları üretir.
+
+    roc_curve'deki stride yaklaşımıyla (arr[::step]) en fazla ~max_points
+    noktaya downsample eder; ham binlerce noktayı step_data'ya yazmaz.
+    Döndürülen diziler indeks-eşli: i. eleman aynı örneğe aittir.
+      - predicted : ŷ
+      - actual    : y
+      - residuals : y - ŷ  (y_true - y_pred)
+    """
+    try:
+        yt = np.asarray(y_true, dtype=float).ravel()
+        yp = np.asarray(y_pred, dtype=float).ravel()
+        n_total = int(yt.shape[0])
+        if n_total == 0:
+            return {}
+        step = max(1, n_total // max_points)
+        yt_s = yt[::step]
+        yp_s = yp[::step]
+        res_s = yt_s - yp_s
+        return {
+            "predicted": [round(float(v), 4) for v in yp_s],
+            "actual": [round(float(v), 4) for v in yt_s],
+            "residuals": [round(float(v), 4) for v in res_s],
+            "n_sampled": int(yp_s.shape[0]),
+            "n_total": n_total,
+        }
+    except Exception:
+        return {}
 
 
 def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:

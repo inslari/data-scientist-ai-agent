@@ -58,6 +58,8 @@ Nodes in `src/nodes/` are thin LangGraph adapters: read from `AgentState`, call 
 
 LangGraph checkpoints are stored separately again: Postgres (`AsyncPostgresSaver`) when `API_DATABASE_URL` is Postgres, else `data/checkpoints.sqlite`. The graph's `thread_id` is the `project_id`; `force_restart` deletes checkpoint rows and clears `ProjectStepModel`.
 
+**Tests/migrations must NEVER hit the remote app DB.** `.env`'s `API_DATABASE_URL` usually points at production Postgres. `api/core/database.py` uses `load_dotenv(override=False)`, so a **real env var wins over `.env`** — to run any test/migration against a sandbox, set `API_DATABASE_URL=sqlite:///<abs/path>` before invoking (no wrapper needed). As a hard backstop, destructive/DDL scripts (`scripts/migrate_db.py`, `scripts/reset_app_db.py`) call `assert_local_db()` from `api/core/db_safety.py`, which **aborts before connecting** if the target is remote (non-sqlite, non-localhost) unless you opt in with `ALLOW_REMOTE_DB_OPS=1`. Production migrations are run by hand with that flag set. Never flip `database.py` back to `override=True`, and gate any new schema/data-mutating script with `assert_local_db()`.
+
 ### LLM access
 Always get models through `get_llm(model_name, temperature, provider)` in `src/core/llm.py` — never instantiate `ChatOpenAI` etc. directly. Provider/model defaults come from `src/core/config.py` `settings` (env-driven: `LLM_PROVIDER`, `LLM_MODEL_NAME`, plus a separate `INTELLIGENCE_ENGINE_*` pair for the heavier intelligence engine). Determinism is enabled by default (`RANDOM_SEED=42`, `ENABLE_DETERMINISM`).
 

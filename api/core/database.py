@@ -3,8 +3,12 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# .env dosyasını yükle
-load_dotenv(override=True)
+# .env dosyasını yükle.
+# override=False: GERÇEK ortam değişkenleri .env'i EZMELİDİR. Eskiden override=True idi
+# ve bir testin/subprocess'in açıkça verdiği API_DATABASE_URL'i .env'deki remote URL ile
+# sessizce ezerek "izole" testlerin remote'a kaçmasına yol açıyordu. .env yalnızca env
+# değişkeni HİÇ set edilmemişse fallback olmalı. Ek savunma: api/core/db_safety.py.
+load_dotenv(override=False)
 
 # Veritabanı dizinini belirle (SQLite için fallback)
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data")
