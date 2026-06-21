@@ -1067,6 +1067,42 @@ def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata")
     return added
 
 
+def _target_distribution(y_arr, intent: str) -> "tuple[dict | None, dict | None]":
+    """Hedef dağılımını uygun temsile dönüştürür.
+
+    Dönüş: ``(counts, histogram)`` — ikisinden biri her zaman ``None``, böylece
+    frontend hangisini çizeceğini tek bakışta seçer:
+      - ``counts``    : ``{deger: adet}`` value_counts — sınıflandırma / düşük
+        kardinalite (mevcut donut davranışı AYNEN korunur).
+      - ``histogram`` : ``{"bin_edges":[...], "counts":[...]}`` — regresyon /
+        sürekli hedef; her benzersiz değeri ayrı "sınıf" yapan çorbayı önler.
+
+    Regresyon kararı: ``intent == "regression"`` VEYA (sayısal hedef ve
+    ``nunique > 20``). Anti-fabrication: tüm sayılar gerçek ``y_arr``'dan numpy
+    ile hesaplanır; hiçbir değer uydurulmaz.
+    """
+    s = pd.Series(y_arr)
+    is_numeric = pd.api.types.is_numeric_dtype(s)
+    nunique = int(s.nunique(dropna=True))
+    is_regression = (str(intent).strip().lower() == "regression") or (is_numeric and nunique > 20)
+
+    if is_regression and is_numeric:
+        data = s.dropna().to_numpy()
+        if data.size > 0 and nunique > 1:
+            n_bins = int(min(30, max(20, nunique)))  # ~20-30 bin
+            counts_arr, edges = np.histogram(data, bins=n_bins)
+            histogram = {
+                "bin_edges": [float(e) for e in edges],    # n_bins + 1 kenar
+                "counts":    [int(c) for c in counts_arr],  # n_bins adet
+            }
+            return None, histogram
+        # tek-değerli / boş sürekli hedef: histogram anlamsız → value_counts'a düş
+
+    # sınıflandırma / düşük kardinalite: mevcut value_counts davranışı
+    # (native int/str'e cast → JSON güvenliği; frontend için anlamı değişmez)
+    return {str(k): int(v) for k, v in s.value_counts().items()}, None
+
+
 def build_features(state: dict) -> dict:
     """
     Feature Engineering Service — BigData Edition
@@ -1348,6 +1384,12 @@ def build_features(state: dict) -> dict:
     y_train_arr = np.array(y_train)
     y_test_arr  = np.array(y_test)
 
+    # Hedef dağılımı: sınıflandırmada value_counts (donut), regresyon/sürekli
+    # hedefte histogram bin'leri. İkisinden biri None → frontend hangisini
+    # çizeceğini bilir. Gerçek y_train/y_test'ten hesaplanır (anti-fabrication).
+    dist_train_counts, hist_train = _target_distribution(y_train_arr, intent)
+    dist_test_counts,  hist_test  = _target_distribution(y_test_arr, intent)
+
     print(f"\n[feature_eng] TAMAMLANDI:")
     print(f"  Hedef   : {target_name}")
     print(f"  X_train : {X_train.shape}")
@@ -1362,8 +1404,10 @@ def build_features(state: dict) -> dict:
         "n_features":               len(X_train.columns),
         "n_train":                  len(X_train),
         "n_test":                   len(X_test),
-        "target_distribution_train": pd.Series(y_train_arr).value_counts().to_dict(),  # type: ignore
-        "target_distribution_test": pd.Series(y_test_arr).value_counts().to_dict(),  # type: ignore
+        "target_distribution_train": dist_train_counts,   # sınıflandırma → value_counts, regresyon → None
+        "target_distribution_test":  dist_test_counts,
+        "target_histogram_train":    hist_train,           # regresyon → {bin_edges, counts}, sınıflandırma → None
+        "target_histogram_test":     hist_test,
         "intelligence_metadata":    meta.summary(),
         "data_source":              "parquet" if state.get("data_path") else "sql_results_preview",
         "total_rows_available":     None,  # execution_node profiling'den alınabilir
