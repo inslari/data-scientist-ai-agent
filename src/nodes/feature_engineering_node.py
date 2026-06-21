@@ -1,30 +1,32 @@
+from src.core.nodes import node
 from src.state import AgentState
 from src.services.feature_builder import build_features
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
+@node("feature_engineering_node")
 def feature_engineering_node(state: AgentState) -> AgentState:
     """
     Node 5: Makine Öğrenmesi için Veri Hazırlığı.
     Tüm feature engineering mantığı `src.services.feature_builder` içerisine taşındı.
     """
-    print("\n========================================\n[NODE START] feature_engineering_node başlıyor...\n========================================")
 
-    print(f"[DEBUG FE] data_path = '{state.get('data_path')}'")
-    print(f"[DEBUG FE] sql_results len = {len(state.get('sql_results') or [])}")
+    logger.info(f"[DEBUG FE] data_path = '{state.get('data_path')}'")
+    logger.info(f"[DEBUG FE] sql_results len = {len(state.get('sql_results') or [])}")
 
     result = build_features(state)
     
     if result.get("error"):
         return {
-            **state,
             "error": result["error"],
             "current_step": "feature_engineering_node",
         }
         
     from src.utils.type_utils import clean_np
 
-    print(f"[DEBUG FE OUT] domain_leakage_report var mi: {state.get('domain_leakage_report') is not None}")
+    logger.info(f"[DEBUG FE OUT] domain_leakage_report var mi: {state.get('domain_leakage_report') is not None}")
     return clean_np({
-        **state,
         "X_train": result.get("X_train"),
         "X_test": result.get("X_test"),
         "y_train": result.get("y_train"),

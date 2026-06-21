@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Optional
+import operator
+from typing import Annotated, Any, Optional
 from typing_extensions import TypedDict
 
 
@@ -72,7 +73,9 @@ class AgentState(TypedDict, total=False):
     # Critic & Self-Correction
     retry_count: int                 # Number of retry attempts made
     max_retries: int                 # Maximum allowed retries
-    critic_feedback: list[str]       # Feedback from the critic node
+    # Append-only across retry loops — nodes emit only the new items (deltas);
+    # the reducer concatenates them so feedback/history accumulate automatically.
+    critic_feedback: Annotated[list[str], operator.add]   # Feedback from the critic node
     next_retry_node: str             # Node to route to after critic
     
     # Leakage Detection
@@ -84,14 +87,15 @@ class AgentState(TypedDict, total=False):
     # Quality Gate
     quality_gate: dict
 
-    # Retry History
-    retry_history: list[dict]
+    # Retry History — append-only delta per turn (see critic_feedback note)
+    retry_history: Annotated[list[dict], operator.add]
     # Audit Trail / Tracking
     experiment_logs: list[dict]      # Logs of completed ML experiments
 
     # Graph Control
     current_step: str                # Current active node
     error: Optional[str]             # Errors
+    error_category: str              # classify_error() kategorisi: data/db/llm/timeout/memory/unknown
     messages: list                   # LLM conversation history
     excluded_models: list[str]       # Models excluded due to 
     

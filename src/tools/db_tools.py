@@ -6,6 +6,9 @@ from api.core.database import SessionLocal
 from api.schemas.data_group import get_data_group_schema_logic, run_data_group_query_logic, QueryRequest
 from api.models.data_group import DataGroupModel
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 @tool
 async def get_schema(config: RunnableConfig) -> str:
     """
@@ -16,7 +19,7 @@ async def get_schema(config: RunnableConfig) -> str:
     if not data_group_id:
         return "API Hatası: data_group_id bulunamadı"
 
-    print(f" 📡 [Dahili İşlem]: Şema çekiliyor... (Data Group: {data_group_id})")
+    logger.info(f" 📡 [Dahili İşlem]: Şema çekiliyor... (Data Group: {data_group_id})")
     db = SessionLocal()
     try:
         dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
@@ -40,7 +43,7 @@ async def run_sql_query(query: str, config: RunnableConfig) -> str:
     if not data_group_id:
         return "Sistem Hatası: data_group_id bulunamadı"
 
-    print(f" 📡 [Dahili İşlem - SQL]: {query} (Data Group: {data_group_id})")
+    logger.info(f" 📡 [Dahili İşlem - SQL]: {query} (Data Group: {data_group_id})")
     db = SessionLocal()
     try:
         dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()

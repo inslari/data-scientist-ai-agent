@@ -24,7 +24,11 @@ from api.models.project import ProjectModel, ProjectStepModel
 from api.models.data_group import DataGroupModel
 from src.graph import build_graph
 from src.core.config import settings
+from src.core.logging_config import set_project
 from api.core.database import SQLALCHEMY_DATABASE_URL
+
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
 
 # How long the worker sleeps between polling cycles when there is nothing to do.
 POLL_INTERVAL_SECONDS = 5
@@ -35,16 +39,16 @@ async def job_worker_loop() -> None:
     Continuously polls the background_jobs table and executes pending jobs.
     Designed to be run as a single long-lived asyncio.Task.
     """
-    print("[Worker] Background job worker started.")
+    logger.info("[Worker] Background job worker started.")
     while True:
         try:
             await _process_next_job()
         except asyncio.CancelledError:
-            print("[Worker] Worker task cancelled — shutting down cleanly.")
+            logger.info("[Worker] Worker task cancelled — shutting down cleanly.")
             break
         except Exception as exc:
             # Never let an unexpected error kill the worker loop.
-            print(f"[Worker] Unexpected error in worker loop: {exc}")
+            logger.error(f"[Worker] Unexpected error in worker loop: {exc}")
             traceback.print_exc()
 
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -77,7 +81,7 @@ async def _process_next_job() -> None:
         if job is None:
             return  # Nothing to do; caller will sleep
 
-        print(f"[Worker] Picked up job id={job.id} for project_id={job.project_id}")
+        logger.info(f"[Worker] Picked up job id={job.id} for project_id={job.project_id}")
         job.status = "running"
         job.updated_at = int(time.time())
         db.commit()
@@ -135,7 +139,7 @@ async def _generate_ttd_suggestions_job(job: BackgroundJobModel) -> None:
         finally:
             db.close()
     except Exception as e:
-        print(f"[Worker] TTD öneri üretimi hata (group {data_group_id}): {str(e)[:200]}")
+        logger.error(f"[Worker] TTD öneri üretimi hata (group {data_group_id}): {str(e)[:200]}")
 
     # Sonucu yaz (boş liste de yazılır → 'üretildi ama soru çıkmadı' ile 'henüz üretilmedi/NULL' ayrışır)
     db = SessionLocal()
@@ -144,10 +148,10 @@ async def _generate_ttd_suggestions_job(job: BackgroundJobModel) -> None:
         if dg:
             dg.ttd_suggestions = suggestions
             db.commit()
-            print(f"[Worker] TTD önerileri kaydedildi (group {data_group_id}): {len(suggestions)} adet")
+            logger.info(f"[Worker] TTD önerileri kaydedildi (group {data_group_id}): {len(suggestions)} adet")
     except Exception as e:
         db.rollback()
-        print(f"[Worker] TTD öneri kaydı başarısız (group {data_group_id}): {str(e)[:200]}")
+        logger.info(f"[Worker] TTD öneri kaydı başarısız (group {data_group_id}): {str(e)[:200]}")
     finally:
         db.close()
 
@@ -166,6 +170,9 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     is_resume = bool(job.is_resume)
     force_restart = bool(job.force_restart)
 
+    # Bu işin tüm logları (node decorator'ları dahil) bu project_id ile etiketlenir.
+    set_project(project_id)
+
     # Resolve domain pack: project override → data group → global DOMAIN_PACK
     resolved_domain_pack = settings.DOMAIN_PACK
     domain_doc = ""
@@ -176,7 +183,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     try:
         project: ProjectModel | None = db.query(ProjectModel).filter(ProjectModel.id == project_id).first()
         if not project:
-            print(f"[Worker] Project {project_id} not found; skipping job {job.id}.")
+            logger.warning(f"[Worker] Project {project_id} not found; skipping job {job.id}.")
             _mark_job(job.id, "failed", "Project not found")
             return
 
@@ -190,7 +197,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
         elif dg and dg.domain_pack:
             resolved_domain_pack = dg.domain_pack
         domain_doc = (dg.domain_doc if dg else None) or ""
-        print(f"[Worker] Resolved domain_pack='{resolved_domain_pack}', domain_doc={'yes' if domain_doc else 'no'} for project {project_id}")
+        logger.info(f"[Worker] Resolved domain_pack='{resolved_domain_pack}', domain_doc={'yes' if domain_doc else 'no'} for project {project_id}")
 
         project.status = "running"
         project.error = None
@@ -209,7 +216,12 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                 "configurable": {
                     "data_group_id": data_group_id,
                     "thread_id": str(project_id),
-                }
+                },
+                # Ana hat (~12 node) + critic self-correction döngüsü
+                # (max_retries × feature_plan→…→critic ≈ 5 node/tur) LangGraph'ın
+                # varsayılan 25 super-step limitini aşabilir. Retry bütçesiyle
+                # uyumlu, güvenli bir tavan veriyoruz.
+                "recursion_limit": 50,
             }
 
             # domain_pack resolved above: project override → data group → global default
@@ -240,7 +252,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                     else:
                         is_resume = False
                 except Exception as exc:
-                    print(f"[Worker] Could not fetch state snapshot: {exc}")
+                    logger.error(f"[Worker] Could not fetch state snapshot: {exc}")
                     is_resume = False
 
             if force_restart:
@@ -270,7 +282,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
 
             async for chunk in app.astream(initial_state, config=config):
                 node_name = list(chunk.keys())[0]
-                print(f"\n{'='*40}\n[Worker][NODE END] {node_name}\n{'='*40}")
+                logger.info(f"\n{'='*40}\n[Worker][NODE END] {node_name}\n{'='*40}")
 
                 chunk_data: dict = chunk[node_name]
                 final_state.update(chunk_data)
@@ -340,7 +352,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             raise
         except Exception:
             error_trace = traceback.format_exc()
-            print(f"[Worker] Graph execution failed for project {project_id}:\n{error_trace}")
+            logger.error(f"[Worker] Graph execution failed for project {project_id}:\n{error_trace}")
 
             db_s = SessionLocal()
             try:
@@ -385,7 +397,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     except Exception:
         if not error_trace:
             error_trace = traceback.format_exc()
-            print(f"[Worker] Saver setup/execution failed for project {project_id}:\n{error_trace}")
+            logger.error(f"[Worker] Saver setup/execution failed for project {project_id}:\n{error_trace}")
             
             db_s = SessionLocal()
             try:

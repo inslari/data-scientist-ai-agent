@@ -1,6 +1,9 @@
 import os
 import resend
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 def send_verification_email(to_email: str, token: str, frontend_url: str = "http://localhost:5173") -> bool:
     """
     Sends an email verification link using Resend.
@@ -8,7 +11,7 @@ def send_verification_email(to_email: str, token: str, frontend_url: str = "http
     """
     api_key = os.getenv("RESEND_API_KEY")
     if not api_key:
-        print("Warning: RESEND_API_KEY is not set. Skipping verification email.")
+        logger.warning("Warning: RESEND_API_KEY is not set. Skipping verification email.")
         return False
         
     resend.api_key = api_key
@@ -45,10 +48,10 @@ def send_verification_email(to_email: str, token: str, frontend_url: str = "http
             "subject": "Verify your email address - Inslari AI",
             "html": html_content
         })
-        print(f"Verification email sent to {to_email}. Response: {response}")
+        logger.info(f"Verification email sent to {to_email}. Response: {response}")
         return True
     except Exception as e:
-        print(f"Failed to send verification email: {e}")
+        logger.error(f"Failed to send verification email: {e}")
         return False
 
 def send_reset_password_email(to_email: str, token: str) -> bool:
@@ -56,11 +59,11 @@ def send_reset_password_email(to_email: str, token: str) -> bool:
     Sends a password reset email using Resend.
     """
     api_key = os.getenv("RESEND_API_KEY")
-    print(api_key)
+    logger.debug("RESEND_API_KEY set: %s", bool(api_key))
     if not api_key:
-        print("Warning: RESEND_API_KEY is not set. Skipping reset password email.")
+        logger.warning("Warning: RESEND_API_KEY is not set. Skipping reset password email.")
         return False
-    print(to_email, api_key, token)    
+    logger.info("Sending reset password email to %s", to_email)
     resend.api_key = api_key
 
     client_url = os.getenv("CLIENT_URL", "http://localhost:5173")
@@ -97,8 +100,8 @@ def send_reset_password_email(to_email: str, token: str) -> bool:
             "subject": "Reset your password - Inslari AI",
             "html": html_content
         })
-        print(f"Reset password email sent to {to_email}. Response: {response}")
+        logger.info(f"Reset password email sent to {to_email}. Response: {response}")
         return True
     except Exception as e:
-        print(f"Failed to send reset password email: {e}")
+        logger.error(f"Failed to send reset password email: {e}")
         return False

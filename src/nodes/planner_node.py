@@ -1,3 +1,4 @@
+from src.core.nodes import node
 from ..state import AgentState
 from ..core.llm import get_llm
 from ..core.config import settings
@@ -5,11 +6,11 @@ from ..core.prompt_loader import create_chat_prompt
 from ..schemas.planner_schemas import AnalysisPlan
 
 
+@node("planner_node")
 def planner_node(state: AgentState) -> AgentState:
     """
     Node 3: Takes the database intelligence and user query as input and produces an analysis plan.
     """
-    print("\n========================================\n[NODE START] planner_node başlıyor...\n========================================")
     llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
     structured_llm = llm.with_structured_output(AnalysisPlan)
 
@@ -36,7 +37,6 @@ def planner_node(state: AgentState) -> AgentState:
     )
 
     return {
-        **state,
         "analysis_plan": plan,
         "current_step": "planner_node",
     }

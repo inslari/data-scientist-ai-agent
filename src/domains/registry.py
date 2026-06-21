@@ -18,6 +18,9 @@ from src.core.config import settings
 from .base import DomainPack
 from .null_pack import NullDomainPack
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 # name → factory (lazy so importing the registry doesn't import every pack/LLM)
 _FACTORIES: dict[str, Callable[[], DomainPack]] = {}
 _INSTANCES: dict[str, DomainPack] = {}
@@ -38,6 +41,41 @@ def _default_factories() -> None:
             return FinancialPack()
 
         _FACTORIES["financial"] = _make_financial
+
+    if "ecommerce" not in _FACTORIES:
+        def _make_ecommerce() -> DomainPack:
+            from .ecommerce.pack import EcommercePack
+            return EcommercePack()
+
+        _FACTORIES["ecommerce"] = _make_ecommerce
+
+    if "healthcare" not in _FACTORIES:
+        def _make_healthcare() -> DomainPack:
+            from .healthcare.pack import HealthcarePack
+            return HealthcarePack()
+
+        _FACTORIES["healthcare"] = _make_healthcare
+
+    if "retail" not in _FACTORIES:
+        def _make_retail() -> DomainPack:
+            from .retail.pack import RetailPack
+            return RetailPack()
+
+        _FACTORIES["retail"] = _make_retail
+
+    if "hr" not in _FACTORIES:
+        def _make_hr() -> DomainPack:
+            from .hr.pack import HRPack
+            return HRPack()
+
+        _FACTORIES["hr"] = _make_hr
+
+    if "marketing" not in _FACTORIES:
+        def _make_marketing() -> DomainPack:
+            from .marketing.pack import MarketingPack
+            return MarketingPack()
+
+        _FACTORIES["marketing"] = _make_marketing
 
 
 def _resolve_name(name_or_state: Union[str, dict, None]) -> str:
@@ -67,13 +105,13 @@ def get_active_pack(name_or_state: Union[str, dict, None] = None) -> DomainPack:
 
     factory = _FACTORIES.get(name)
     if factory is None:
-        print(f"[domains] Unknown domain pack '{name}', falling back to NullDomainPack.")
+        logger.info(f"[domains] Unknown domain pack '{name}', falling back to NullDomainPack.")
         return _NULL
 
     try:
         pack = factory()
     except Exception as exc:  # pragma: no cover - defensive
-        print(f"[domains] Failed to construct domain pack '{name}': {exc}. Using NullDomainPack.")
+        logger.error(f"[domains] Failed to construct domain pack '{name}': {exc}. Using NullDomainPack.")
         return _NULL
 
     _INSTANCES[name] = pack

@@ -18,6 +18,9 @@ from sqlalchemy.orm import Session
 from src.core.config import settings
 from src.core.llm import get_llm
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 SUGGESTION_COUNT = 5
 _MAX_SCHEMA_CHARS = 6000  # LLM'e gönderilen şemayı sınırla (uzun şemalarda halüsinasyon/maliyet)
 
@@ -74,11 +77,11 @@ async def generate_ttd_suggestions(group_id: int, db: Session, user_id: int) -> 
         schema_result = await get_data_group_schema_logic(group_id, db, user_id)
         raw_schema = (schema_result or {}).get("schema", "") if isinstance(schema_result, dict) else ""
     except Exception as e:
-        print(f"[ttd_suggest] Şema çekilemedi (group {group_id}): {str(e)[:150]}")
+        logger.info(f"[ttd_suggest] Şema çekilemedi (group {group_id}): {str(e)[:150]}")
         return []
 
     if not raw_schema or not raw_schema.strip():
-        print(f"[ttd_suggest] Boş şema (group {group_id}); öneri üretilmedi.")
+        logger.info(f"[ttd_suggest] Boş şema (group {group_id}); öneri üretilmedi.")
         return []
 
     schema_text = raw_schema[:_MAX_SCHEMA_CHARS]
@@ -95,8 +98,8 @@ async def generate_ttd_suggestions(group_id: int, db: Session, user_id: int) -> 
         ])
         content = resp.content if hasattr(resp, "content") else str(resp)
         suggestions = _parse_suggestions(content if isinstance(content, str) else str(content))
-        print(f"[ttd_suggest] group {group_id}: {len(suggestions)} öneri üretildi.")
+        logger.info(f"[ttd_suggest] group {group_id}: {len(suggestions)} öneri üretildi.")
         return suggestions
     except Exception as e:
-        print(f"[ttd_suggest] LLM üretimi başarısız (group {group_id}): {str(e)[:150]}")
+        logger.info(f"[ttd_suggest] LLM üretimi başarısız (group {group_id}): {str(e)[:150]}")
         return []

@@ -8,6 +8,9 @@ from ..utils import _get_llm, _StructuredJsonParser
 from src.domains import get_active_pack
 from src.domains.base import MerchantContext
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 TTD_INTERPRETER_SYSTEM = """\
 You are a Data Scientist and Analysis Expert. The user has asked a question, and data has been fetched from the database to answer it.
 
@@ -42,7 +45,7 @@ async def ttd_interpreter_node(state: TTDState, config: RunnableConfig) -> TTDSt
     SQL sonuçlarını LLM ile yorumlar → sql_query_summary doldurur.
     Chitchat ve schema_question intent'leri için de çalışır.
     """
-    print("\n[TTD] ttd_interpreter_node başlıyor...")
+    logger.info("\n[TTD] ttd_interpreter_node başlıyor...")
 
     intent    = state.get("intent") or "sql_query"
     rows      = state.get("sql_query_results") or []
@@ -73,7 +76,7 @@ async def ttd_interpreter_node(state: TTDState, config: RunnableConfig) -> TTDSt
                 if lens:
                     system_prompt = TTD_INTERPRETER_SYSTEM + "\n\n" + lens.system_suffix
         except Exception as e:  # pragma: no cover - defensive
-            print(f"[TTD] Domain pack yorum merceği başarısız ({e}); atlanıyor.")
+            logger.warning(f"[TTD] Domain pack yorum merceği başarısız ({e}); atlanıyor.")
 
     try:
         llm = _get_llm(temperature=0.2)
@@ -106,7 +109,7 @@ async def ttd_interpreter_node(state: TTDState, config: RunnableConfig) -> TTDSt
         try:
             response: _InterpreterResult = llm.with_structured_output(_InterpreterResult).invoke(messages)  # type: ignore
         except Exception as e_struct:
-            print(f"[TTD] structured interpreter başarısız ({type(e_struct).__name__}); metin-parser fallback")
+            logger.info(f"[TTD] structured interpreter başarısız ({type(e_struct).__name__}); metin-parser fallback")
             raw_response = llm.invoke(messages)
             response = _StructuredJsonParser(
                 pydantic_object=_InterpreterResult,
@@ -117,7 +120,7 @@ async def ttd_interpreter_node(state: TTDState, config: RunnableConfig) -> TTDSt
         summary        = _strip_memory_echo(response.summary)
         updated_memory = response.updated_long_term_memory
     except Exception as e:
-        print(f"[TTD] interpreter error: {e}")
+        logger.error(f"[TTD] interpreter error: {e}")
         count          = len(rows)
         summary        = f"Query completed, {count} row(s) returned."
         updated_memory = state.get("long_term_memory")

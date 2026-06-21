@@ -5,6 +5,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from ..state import TTDState, _ChartConfig
 from ..utils import _get_llm, _build_chart_payload, _infer_chart_from_text, _StructuredJsonParser
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 TTD_CHART_SYSTEM = """\
 You are a data visualization expert. Look at the SQL results and choose the most meaningful chart type.
 
@@ -29,7 +32,7 @@ async def ttd_chart_node(state: TTDState, config: RunnableConfig) -> TTDState:
     """
     Grafik konfigürasyonunu LLM ile belirler ve ECharts payload üretir.
     """
-    print("\n[TTD] ttd_chart_node başlıyor...")
+    logger.info("\n[TTD] ttd_chart_node başlıyor...")
 
     llm        = _get_llm(temperature=0)
     user_query = state["user_query"]
@@ -51,12 +54,12 @@ async def ttd_chart_node(state: TTDState, config: RunnableConfig) -> TTDState:
         # Strategy 1: tool-call structured output
         chart_cfg = (TTD_CHART_PROMPT | llm.with_structured_output(_ChartConfig)).invoke(chart_invoke_kwargs)  # type: ignore[assignment]
     except Exception as e1:
-        print(f"[TTD] chart structured output failed ({type(e1).__name__}), trying text parser")
+        logger.error(f"[TTD] chart structured output failed ({type(e1).__name__}), trying text parser")
         try:
             # Strategy 2: text-based JSON parser
             chart_cfg = (TTD_CHART_PROMPT | llm | _StructuredJsonParser(pydantic_object=_ChartConfig)).invoke(chart_invoke_kwargs)  # type: ignore[assignment]
         except Exception as e2:
-            print(f"[TTD] chart text parser failed ({type(e2).__name__}), inferring from prose")
+            logger.error(f"[TTD] chart text parser failed ({type(e2).__name__}), inferring from prose")
             try:
                 # Strategy 3: keyword inference from prose response
                 raw_text = llm.invoke(
@@ -64,7 +67,7 @@ async def ttd_chart_node(state: TTDState, config: RunnableConfig) -> TTDState:
                 ).content
                 chart_cfg = _infer_chart_from_text(raw_text, columns, user_query)
             except Exception as e3:
-                print(f"[TTD] chart inference failed ({e3}), defaulting to table")
+                logger.error(f"[TTD] chart inference failed ({e3}), defaulting to table")
                 chart_cfg = _ChartConfig(type="table", x=columns[0] if columns else "", y="", title="Query Results")
 
     chart_payload = _build_chart_payload(chart_cfg.model_dump(), raw_rows, columns)

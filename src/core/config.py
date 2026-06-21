@@ -1,6 +1,9 @@
 import os
 from dotenv import load_dotenv
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 # Load environment variables from .env file
 load_dotenv(override=True)
 
@@ -32,7 +35,7 @@ class Settings:
         DATABASES = {}
 
     if not DATABASES:
-        print(DATABASES)
+        logger.info(DATABASES)
         DATABASES = {
             "default": {
                 "provider": os.getenv("DB_PROVIDER", "sqlite"),

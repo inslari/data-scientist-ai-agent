@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 # ─────────────────────────────────────────────────────────────
 # Severity eşikleri (gerçek hayat etkisine göre)
 #   8-10 : Model kullanılamaz seviyede, mutlaka çözülmeli
@@ -280,12 +283,12 @@ def advise(state: dict) -> dict:
     diagnoses = [d for d in raw if d is not None]
     diagnoses.sort(key=lambda d: d["severity"], reverse=True)
 
-    print(f"\n[critic_advisor] Birincil metrik: {current_score:.4f}")
+    logger.info(f"\n[critic_advisor] Birincil metrik: {current_score:.4f}")
     if diagnoses:
         for d in diagnoses:
-            print(f"[critic_advisor]   teshis: {d['type']} (severity={d['severity']}, deger={d['value']})")
+            logger.info(f"[critic_advisor]   teshis: {d['type']} (severity={d['severity']}, deger={d['value']})")
     else:
-        print(f"[critic_advisor]   teshis yok — model temiz")
+        logger.info(f"[critic_advisor]   teshis yok — model temiz")
 
     # ── 2) Aksiyon gerektiren teşhis var mı? ───────────────
     actionable = [d for d in diagnoses if d["severity"] >= MIN_ACTION_SEVERITY]

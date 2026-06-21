@@ -47,6 +47,7 @@ dependencies = [
     "langgraph-checkpoint-postgres>=3.1.0",
     "psycopg-binary>=3.3.4",
     "boto3>=1.43.29",
+    "catboost>=1.2.10",
 ]
 
 [tool.pyrefly]

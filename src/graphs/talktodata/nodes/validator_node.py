@@ -5,6 +5,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from ..state import TTDState, _ValidationResult
 from ..utils import _get_llm, _StructuredJsonParser
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 TTD_VALIDATOR_SYSTEM = """\
 You are a SQL result validator for a data analytics assistant.
 
@@ -38,7 +41,7 @@ async def ttd_result_validator_node(state: TTDState, config: RunnableConfig) -> 
     SQL sonuçlarının kullanıcının sorusunu gerçekten cevapladığını doğrular.
     Geçersiz sonuçlarda fix hint üretir ve sql_node'a geri döner.
     """
-    print("\n[TTD] ttd_result_validator_node başlıyor...")
+    logger.info("\n[TTD] ttd_result_validator_node başlıyor...")
 
     user_query = state["user_query"]
     sql        = state.get("sql_query_raw") or ""
@@ -69,17 +72,17 @@ async def ttd_result_validator_node(state: TTDState, config: RunnableConfig) -> 
                 TTD_VALIDATOR_PROMPT | llm.with_structured_output(_ValidationResult)
             ).invoke(invoke_kwargs)  # type: ignore[assignment]
         except Exception as e1:
-            print(f"[TTD] validator structured output failed ({type(e1).__name__}), trying text parser")
+            logger.error(f"[TTD] validator structured output failed ({type(e1).__name__}), trying text parser")
             raw_text = llm.invoke(
                 TTD_VALIDATOR_PROMPT.format_messages(**invoke_kwargs)
             ).content
             val_result = _StructuredJsonParser(pydantic_object=_ValidationResult).parse(raw_text)  # type: ignore[assignment]
     except Exception as e:
-        print(f"[TTD] validator failed ({e}), assuming valid")
+        logger.error(f"[TTD] validator failed ({e}), assuming valid")
         val_result = _ValidationResult(is_valid=True)
 
     retry_count = state.get("sql_retry_count") or 0
-    print(f"[TTD] validation: is_valid={val_result.is_valid} | issue={val_result.issue} | retry_count={retry_count}")
+    logger.info(f"[TTD] validation: is_valid={val_result.is_valid} | issue={val_result.issue} | retry_count={retry_count}")
 
     return {
         **state,

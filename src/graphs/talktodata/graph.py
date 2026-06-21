@@ -8,6 +8,9 @@ from .nodes.validator_node import ttd_result_validator_node
 from .nodes.chart_node import ttd_chart_node
 from .nodes.interpreter_node import ttd_interpreter_node
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 def _route_after_intent(state: TTDState) -> str:
     """
     Intent sınıflandırmasına göre routing:
@@ -40,10 +43,10 @@ def _route_after_validator(state: TTDState) -> str:
     retry_count = state.get("sql_retry_count") or 0
     issue = state.get("validation_issue")
     if not state.get("validation_passed") and issue != "empty_result" and retry_count < 3:
-        print(f"[TTD] validator rejected results (issue={issue}), retrying SQL (attempt {retry_count}/{3})")
+        logger.info(f"[TTD] validator rejected results (issue={issue}), retrying SQL (attempt {retry_count}/{3})")
         return "ttd_sql_node"
     if issue == "empty_result":
-        print(f"[TTD] empty result — veri yok, retry atlanıyor, interpreter'a gidiliyor")
+        logger.warning(f"[TTD] empty result — veri yok, retry atlanıyor, interpreter'a gidiliyor")
     return "ttd_chart_node"
 
 

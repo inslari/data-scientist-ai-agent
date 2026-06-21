@@ -1,3 +1,4 @@
+from src.core.nodes import node
 import os
 from dotenv import load_dotenv
 
@@ -9,10 +10,14 @@ from ..domains import get_active_pack
 from ..domains.base import MerchantContext, trim_doc
 from ..domains.schemas import MerchantAnalysis
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 load_dotenv(override=True)
 
 FEATURE_PLAN_PROMPT = create_chat_prompt("feature_plan_system.md", "feature_plan_human.md")
 
+@node("feature_plan_node")
 def feature_plan_node(state: AgentState) -> AgentState:
     """
     Node 4.5: Kullanıcı sorgusundan feature engineering planı üretir.
@@ -28,7 +33,6 @@ def feature_plan_node(state: AgentState) -> AgentState:
     State çıktıları:
         feature_plan   : FeaturePlan dict olarak
     """
-    print("\n========================================\n[NODE START] feature_plan_node başlıyor...\n========================================")
     user_query      = state.get("user_query", "")
     intent          = state.get("intent", "classification")
     db_intelligence = state.get("db_intelligence", {})
@@ -37,12 +41,11 @@ def feature_plan_node(state: AgentState) -> AgentState:
 
     target_def_initial = state.get("target_definition") or {}
     if target_def_initial.get("column_name"):
-        print(f"[feature_plan] target_discovery_node önerisi: '{target_def_initial['column_name']}' "
+        logger.info(f"[feature_plan] target_discovery_node önerisi: '{target_def_initial['column_name']}' "
               f"(confidence={target_def_initial.get('confidence', 0):.2f})")
     
     if not db_intelligence:
         return {
-            **state,
             "error": "db_intelligence bulunamadı.",
             "current_step": "feature_plan_node",
         }
@@ -98,9 +101,9 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
             if hint and hint.strip():
                 domain_hint = "\n" + hint
                 src = "agentic bulgular" if analysis else "statik ipuçları"
-                print(f"[feature_plan] Domain pack '{pack.name}' feature ipuçları eklendi ({src}).")
+                logger.info(f"[feature_plan] Domain pack '{pack.name}' feature ipuçları eklendi ({src}).")
     except Exception as e:  # pragma: no cover - defensive
-        print(f"[feature_plan] Domain pack feature ipucu başarısız ({e}); atlanıyor.")
+        logger.warning(f"[feature_plan] Domain pack feature ipucu başarısız ({e}); atlanıyor.")
 
     # Per-data-group domain document (dataset context) — pack'ten bağımsız enjekte edilir
     domain_doc = ""
@@ -112,7 +115,7 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
             "Use this to choose meaningful, domain-aware features and the right target; "
             "only reference columns that exist in the schema above."
         )
-        print("[feature_plan] Dataset domain_doc feature plan'a eklendi.")
+        logger.info("[feature_plan] Dataset domain_doc feature plan'a eklendi.")
 
     chain = FEATURE_PLAN_PROMPT | structured_llm
 
@@ -132,25 +135,24 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
     # hem de db_intelligence semantic_type etiketlerine göre validate eder.
     plan_dict = plan.model_dump()
     target_def_initial = state.get("target_definition", {}) or {}
-    print(f"[DEBUG FP] target_def_initial = {target_def_initial}")
+    logger.info(f"[DEBUG FP] target_def_initial = {target_def_initial}")
     _validate_target_selection(plan_dict, user_query, db_intelligence, target_def_initial)
     plan = FeaturePlan(**plan_dict)
     # ──────────────────────────────────────────────────────────────────────────
 
-    print(f"\n[feature_plan] Analiz özeti  : {plan.analysis_summary}")
-    print(f"[feature_plan] Hedef değişken: {plan.target.column_name} "
+    logger.info(f"\n[feature_plan] Analiz özeti  : {plan.analysis_summary}")
+    logger.info(f"[feature_plan] Hedef değişken: {plan.target.column_name} "
           f"({'türetilecek' if plan.target.is_derived else 'mevcut'})")
-    print(f"[feature_plan] Tanım         : {plan.target.positive_class_description}")
-    print(f"[feature_plan] Aggregation   : {plan.aggregation.level} "
+    logger.info(f"[feature_plan] Tanım         : {plan.target.positive_class_description}")
+    logger.info(f"[feature_plan] Aggregation   : {plan.aggregation.level} "
           f"(group_by: {plan.aggregation.group_by_column})")
-    print(f"[feature_plan] Feature grupları: {plan.feature_groups}")
+    logger.info(f"[feature_plan] Feature grupları: {plan.feature_groups}")
     if plan.math_interactions:
-        print(f"[feature_plan] Math etkileşimler: {plan.math_interactions}")
-    print(f"[feature_plan] Data split    : {plan.use_data_split_for_label}")
-    print(f"[feature_plan] Neden         : {plan.reasoning}")
+        logger.info(f"[feature_plan] Math etkileşimler: {plan.math_interactions}")
+    logger.info(f"[feature_plan] Data split    : {plan.use_data_split_for_label}")
+    logger.info(f"[feature_plan] Neden         : {plan.reasoning}")
 
     return {
-        **state,
         "feature_plan": plan.model_dump(),
         "current_step": "feature_plan_node",
     }
@@ -230,14 +232,14 @@ def _validate_target_selection(
     discovery_target = target_def.get("column_name", "")
     confidence       = target_def.get("confidence", 0.0)
 
-    print(f"[DEBUG VALIDATE] target_definition param = {target_definition}")
-    print(f"[DEBUG VALIDATE] discovery_target = '{discovery_target}', confidence = {confidence}")
+    logger.info(f"[DEBUG VALIDATE] target_definition param = {target_definition}")
+    logger.info(f"[DEBUG VALIDATE] discovery_target = '{discovery_target}', confidence = {confidence}")
 
     # ── GUARD: türetilmiş hedef tanım gereği MEVCUT KOLON DEĞİLDİR ──
     # (ör. churn: veride churn kolonu yok, date + cust_id'den türetilecek). Bunu
     # 'halüsinasyon' sanıp override etme/silme — LLM bilinçli olarak türetmeyi seçti.
     if target_block.get("is_derived", False):
-        print(f"[feature_plan] Hedef '{current_target}' türetilmiş "
+        logger.warning(f"[feature_plan] Hedef '{current_target}' türetilmiş "
               f"(derivation_type={target_block.get('derivation_type', '?')}) — "
               f"kolon-varlık doğrulaması atlanıyor.")
         return
@@ -247,10 +249,10 @@ def _validate_target_selection(
         col_names = [c.get("column_name", "") for c in all_cols]
         if discovery_target in col_names:
             plan_dict["target"]["column_name"] = discovery_target
-            print(f"[feature_plan] target_discovery karari korunuyor: '{discovery_target}' (confidence={confidence:.2f})")
+            logger.info(f"[feature_plan] target_discovery karari korunuyor: '{discovery_target}' (confidence={confidence:.2f})")
             return
         else:
-            print(f"[feature_plan] target_discovery onerisi '{discovery_target}' db'de bulunamadi, validation devam ediyor...")
+            logger.warning(f"[feature_plan] target_discovery onerisi '{discovery_target}' db'de bulunamadi, validation devam ediyor...")
 
 
 
@@ -258,28 +260,28 @@ def _validate_target_selection(
     # LLM uydurma kolon mu seçti?
     all_col_names = {col["column_name"] for col in all_cols}
     if current_target and current_target not in all_col_names:
-        print(f"[feature_plan] ⚠️  LLM'in seçtiği '{current_target}' veritabanında YOK (halüsinasyon)!")
+        logger.warning(f"[feature_plan] ⚠️  LLM'in seçtiği '{current_target}' veritabanında YOK (halüsinasyon)!")
         if discovery_target and discovery_target in all_col_names:
-            print(f"[feature_plan] ✓  target_discovery_node'un geçerli '{discovery_target}' kolonu kullanılacak.")
+            logger.info(f"[feature_plan] ✓  target_discovery_node'un geçerli '{discovery_target}' kolonu kullanılacak.")
             plan_dict["target"]["column_name"]     = discovery_target
             plan_dict["target"]["is_derived"]      = False
             plan_dict["target"]["derivation_type"] = "none"
             current_target = discovery_target
         else:
-            print("[feature_plan] 🚨 Geçerli bir target bulunamadı!")
+            logger.warning("[feature_plan] 🚨 Geçerli bir target bulunamadı!")
             return
 
     # ── 2. TARGET DISCOVERY OVERRIDE (yüksek confidence) ─────
     if discovery_target and confidence >= 0.5:
         if current_target != discovery_target:
-            print(f"[feature_plan] ⚠️  LLM='{current_target}' ama target_discovery_node "
+            logger.warning(f"[feature_plan] ⚠️  LLM='{current_target}' ama target_discovery_node "
                   f"='{discovery_target}' (confidence={confidence:.2f}). Override.")
             plan_dict["target"]["column_name"]     = discovery_target
             plan_dict["target"]["is_derived"]      = False
             plan_dict["target"]["derivation_type"] = "none"
             current_target = discovery_target
         else:
-            print(f"[feature_plan] ✓  LLM ve target_discovery_node uyumlu: '{current_target}' "
+            logger.info(f"[feature_plan] ✓  LLM ve target_discovery_node uyumlu: '{current_target}' "
                   f"(confidence={confidence:.2f})")
 
     # ── 3. SEMANTIC TYPE KONTROLÜ ────────────────────────────
@@ -289,18 +291,18 @@ def _validate_target_selection(
     ]
 
     if not target_candidates:
-        print(f"[feature_plan] ℹ️  IE'de target-etiketli kolon yok. Mevcut seçim korunuyor: '{current_target}'")
+        logger.info(f"[feature_plan] ℹ️  IE'de target-etiketli kolon yok. Mevcut seçim korunuyor: '{current_target}'")
         return
 
     target_col_names = {col["column_name"] for col in target_candidates}
     if current_target in target_col_names:
-        print(f"[feature_plan] ✓  Target geçerli: '{current_target}' (semantic_type=target)")
+        logger.info(f"[feature_plan] ✓  Target geçerli: '{current_target}' (semantic_type=target)")
         return
 
     # ── 4. WORD OVERLAP FALLBACK ─────────────────────────────
-    print(f"[feature_plan] ⚠️  '{current_target}' kolonu semantic_type=target değil. Düzeltiliyor...")
+    logger.warning(f"[feature_plan] ⚠️  '{current_target}' kolonu semantic_type=target değil. Düzeltiliyor...")
     best = _score_target_by_query_overlap(target_candidates, user_query)
-    print(f"[feature_plan] ✓  Target override: '{current_target}' → '{best['column_name']}' "
+    logger.info(f"[feature_plan] ✓  Target override: '{current_target}' → '{best['column_name']}' "
           f"(skor: {best['_score']:.3f})")
 
     plan_dict["target"]["column_name"]     = best["column_name"]

@@ -24,6 +24,9 @@ from api.schemas.mcp import (
 from api.core.deps import get_current_user
 from api.models.user import UserModel
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 router = APIRouter(prefix="/mcp", tags=["MCP Configuration"])
 
 # ---------------------------------------------------------------------------
@@ -41,7 +44,7 @@ async def _get_or_create_session(url: str) -> ClientSession:
         if entry is not None:
             session, _ = entry
             return session
-        print(f"[MCP] opening persistent session → {url}")
+        logger.info(f"[MCP] opening persistent session → {url}")
         stack = contextlib.AsyncExitStack()
         try:
             transport = await asyncio.wait_for(
@@ -51,7 +54,7 @@ async def _get_or_create_session(url: str) -> ClientSession:
             session = await stack.enter_async_context(ClientSession(read, write))
             await asyncio.wait_for(session.initialize(), timeout=10.0)
             _session_pool[url] = (session, stack)
-            print(f"[MCP] persistent session ready → {url}")
+            logger.info(f"[MCP] persistent session ready → {url}")
             return session
         except Exception as exc:
             await stack.aclose()
@@ -67,7 +70,7 @@ async def _invalidate_session(url: str) -> None:
                 await stack.aclose()
             except Exception:
                 pass
-            print(f"[MCP] session invalidated → {url}")
+            logger.error(f"[MCP] session invalidated → {url}")
 
 @router.post("/config", response_model=MCPConfigResponse)
 def create_mcp_config(config: MCPConfigCreate, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
@@ -227,7 +230,7 @@ async def test_mcp_connection(req: ConnectionTestRequest, db: Session = Depends(
                     "inputSchema": t.inputSchema
                 })
                 
-            print(tool_names)   
+            logger.info(tool_names)   
             # Sistemin çalışması için zorunlu olan araçların kontrolü
             required_tools = {"get_schema", "get_column_stats", "run_sql_query"}
             missing_tools = required_tools - tool_names
@@ -254,23 +257,23 @@ async def _run_mcp_session(transport_cm_factory, tool_name: str, tool_args: dict
     transport_cm_factory is a callable (no args) returning a fresh context manager.
     """
     query_preview = str(tool_args.get("query", ""))[:120] if tool_args else ""
-    print(f"[MCP] >> tool={tool_name} | args={query_preview!r}")
+    logger.info(f"[MCP] >> tool={tool_name} | args={query_preview!r}")
     try:
         async with contextlib.AsyncExitStack() as stack:
             result = await asyncio.wait_for(
                 stack.enter_async_context(transport_cm_factory()), timeout=15.0
             )
             read, write = result[0], result[1]
-            print(f"[MCP] connected, initializing session...")
+            logger.info(f"[MCP] connected, initializing session...")
             session = await stack.enter_async_context(ClientSession(read, write))
             await asyncio.wait_for(session.initialize(), timeout=10.0)
-            print(f"[MCP] session ready, calling tool...")
+            logger.info(f"[MCP] session ready, calling tool...")
             tool_result = await asyncio.wait_for(
                 session.call_tool(tool_name, tool_args), timeout=120.0
             )
-            print(f"[MCP] << tool={tool_name} OK, content_items={len(tool_result.content or [])}")
+            logger.info(f"[MCP] << tool={tool_name} OK, content_items={len(tool_result.content or [])}")
     except Exception as exc:
-        print(f"[MCP] !! tool={tool_name} FAILED: {type(exc).__name__}: {exc}")
+        logger.error(f"[MCP] !! tool={tool_name} FAILED: {type(exc).__name__}: {exc}")
         raise
     if tool_result.content:
         parts = []
@@ -309,7 +312,7 @@ async def _call_mcp_tool(db_config, tool_name: str, tool_args: dict = None) -> s
             raise ValueError("URL is required for sse type")
         url = db_config.url
         query_preview = str(tool_args.get("query", ""))[:80] if tool_args else ""
-        print(f"[MCP] >> tool={tool_name} | {query_preview!r}")
+        logger.info(f"[MCP] >> tool={tool_name} | {query_preview!r}")
         return await _run_mcp_session(
             lambda: streamable_http_client(url), tool_name, tool_args
         )

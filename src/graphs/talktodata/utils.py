@@ -7,6 +7,9 @@ from langchain_core.output_parsers import BaseOutputParser
 from src.core.llm import get_llm
 from src.core.config import settings
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 def _get_llm(temperature: float = 0):
     """Returns a configured LLM instance."""
     return get_llm(
@@ -51,7 +54,7 @@ def _build_chart_payload(chart_cfg: dict, rows: list, columns: list) -> dict | N
             }
         return option
     except Exception as e:
-        print(f"[ttd chart] build error: {e}")
+        logger.error(f"[ttd chart] build error: {e}")
         return None
 
 def _build_column_profiles(db_intelligence: dict) -> str:
@@ -148,7 +151,7 @@ def _parse_with_fallback(llm, prompt_value, pydantic_cls, fallback_field: Option
     try:
         return (prompt_value | llm.with_structured_output(pydantic_cls)).invoke({})
     except Exception as e1:
-        print(f"[TTD] with_structured_output failed ({type(e1).__name__}), trying text parser")
+        logger.error(f"[TTD] with_structured_output failed ({type(e1).__name__}), trying text parser")
         raw_text = llm.invoke(prompt_value).content
         return _StructuredJsonParser(
             pydantic_object=pydantic_cls,

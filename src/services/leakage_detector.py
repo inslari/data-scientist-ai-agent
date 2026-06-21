@@ -9,6 +9,9 @@ from langchain_core.messages import SystemMessage, HumanMessage
 import numpy as np
 import pandas as pd
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 
 
 def detect_target_lock(X: pd.DataFrame, y: np.ndarray,
@@ -160,7 +163,7 @@ def _build_human_message(state: dict) -> str:
     columns_info = db_intel.get("columns", [])
     for c in columns_info:
         if c.get("table_name") == target_table:
-            print(f"[DEBUG] {c.get('column_name')}: semantic_type={c.get('semantic_type')}")
+            logger.info(f"[DEBUG] {c.get('column_name')}: semantic_type={c.get('semantic_type')}")
     # Sadece target'in tablosundaki kolonları al (büyük olasılıkla feature'lar buradan)
     relevant_cols = [
         c for c in columns_info
@@ -202,13 +205,13 @@ def detect_leakage(state: dict) -> dict:
             "overall_assessment": "...",
         }
     """
-    print(f"\n{'='*60}")
-    print(f"[leakage_detector] BASLIYOR — Domain-based leakage detection")
-    print(f"{'='*60}")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"[leakage_detector] BASLIYOR — Domain-based leakage detection")
+    logger.info(f"{'='*60}")
 
     target_def = state.get("target_definition") or {}
     if not target_def.get("column_name"):
-        print(f"[leakage_detector] Target yok, atlaniyor")
+        logger.warning(f"[leakage_detector] Target yok, atlaniyor")
         return {"domain_leakage_report": {"concerns": [], "overall_assessment": "Target belirlenmemis, kontrol atlandi"}}
 
     try:
@@ -228,17 +231,17 @@ def detect_leakage(state: dict) -> dict:
         report_dict = result.model_dump()
         n_concerns = len(report_dict.get("concerns", []))
 
-        print(f"[leakage_detector] {n_concerns} suphe tespit edildi")
+        logger.info(f"[leakage_detector] {n_concerns} suphe tespit edildi")
         for c in report_dict.get("concerns", []):
-            print(f"  - {c['column_name']} ({c['relationship_type']}, {c['confidence']}): {c['reasoning'][:80]}")
-        print(f"[leakage_detector] Genel: {report_dict.get('overall_assessment', '')}")
+            logger.info(f"  - {c['column_name']} ({c['relationship_type']}, {c['confidence']}): {c['reasoning'][:80]}")
+        logger.info(f"[leakage_detector] Genel: {report_dict.get('overall_assessment', '')}")
 
         return {"domain_leakage_report": report_dict}
 
     except Exception as e:
         import traceback
-        print(f"[leakage_detector] HATA: {e}")
-        print(traceback.format_exc())
+        logger.error(f"[leakage_detector] HATA: {e}")
+        logger.info(traceback.format_exc())
         return {
             "domain_leakage_report": {
                 "concerns": [],
