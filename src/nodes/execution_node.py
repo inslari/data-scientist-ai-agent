@@ -25,7 +25,7 @@ def _maybe_override_intent(state: AgentState, data_path: str | None) -> str | No
     target_col = state.get("target_col")
     intent = state.get("intent", "")
 
-    if not target_col or intent not in _TASK_OVERRIDE_INTENTS:
+    if not target_col:
         return None
     if not data_path:
         return None

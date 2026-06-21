@@ -12,10 +12,16 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
-load_dotenv(override=True)
+# override=False: açıkça verilen API_DATABASE_URL .env'i ezsin (izole çalıştırma için).
+load_dotenv(override=False)
 
 from api.core.database import engine
+from api.core.db_safety import assert_local_db
 from sqlalchemy import text
+
+# GÜVENLİK: bu script DELETE çalıştırır — remote (production) verisini yanlışlıkla
+# silmeyi engelle. Bilinçli remote için ALLOW_REMOTE_DB_OPS=1.
+assert_local_db(engine.url, context="reset_app_db.py")
 
 TABLES = [
     "data_group_queries",
