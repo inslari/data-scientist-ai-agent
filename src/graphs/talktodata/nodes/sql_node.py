@@ -14,6 +14,9 @@ from ..utils import _get_llm, _build_column_profiles, _StructuredJsonParser
 from src.domains import get_active_pack
 from src.domains.base import MerchantContext
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 TTD_SQL_SYSTEM = """\
 You are a SQL database expert. Available databases: {db_providers}.
 Your job is to understand the user's question and generate an appropriate SELECT query along with the target database name (db_name) to run it on.
@@ -97,7 +100,7 @@ async def ttd_sql_node(state: TTDState, config: RunnableConfig) -> TTDState:
     """
     LLM → SQL üretir → MCP'de çalıştırır → LIMIT/ORDER BY uygular.
     """
-    print("\n[TTD] ttd_sql_node başlıyor...")
+    logger.info("\n[TTD] ttd_sql_node başlıyor...")
 
     cfg = config.get("configurable", {})
     data_group_id = cfg.get("data_group_id") or state.get("data_group_id")
@@ -137,7 +140,7 @@ async def ttd_sql_node(state: TTDState, config: RunnableConfig) -> TTDState:
         if pack.name != "none" and mc is not None:
             domain_hint = pack.query_hints(mc, db_intelligence) or ""
     except Exception as e:  # pragma: no cover - defensive
-        print(f"[TTD] Domain pack query ipucu başarısız ({e}); atlanıyor.")
+        logger.warning(f"[TTD] Domain pack query ipucu başarısız ({e}); atlanıyor.")
 
     # Validator'dan gelen düzeltme ipucunu ekle
     validation_fix_hint = ""
@@ -172,7 +175,7 @@ async def ttd_sql_node(state: TTDState, config: RunnableConfig) -> TTDState:
             sql_chain_structured = TTD_SQL_PROMPT | llm.with_structured_output(_SQLGenerationResult)
             sql_result = sql_chain_structured.invoke(invoke_kwargs)  # type: ignore[assignment]
         except Exception as e1:
-            print(f"[TTD] with_structured_output failed ({e1}), falling back to text parser")
+            logger.error(f"[TTD] with_structured_output failed ({e1}), falling back to text parser")
             # Strategy 2: text-based parser — handles plain text / markdown JSON responses
             sql_chain_text = TTD_SQL_PROMPT | llm | _StructuredJsonParser(pydantic_object=_SQLGenerationResult)
             sql_result = sql_chain_text.invoke(invoke_kwargs)  # type: ignore[assignment]
@@ -182,7 +185,7 @@ async def ttd_sql_node(state: TTDState, config: RunnableConfig) -> TTDState:
         approx_warning = sql_result.approximation_warning or ""
     except Exception as e:
         retry_count = state.get("sql_retry_count") or 0
-        print(f"[TTD] SQL generation failed (retry {retry_count}): {e}")
+        logger.error(f"[TTD] SQL generation failed (retry {retry_count}): {e}")
         return {
             **state,
             "sql_error": f"SQL generation error: {e}",
@@ -239,7 +242,7 @@ async def ttd_sql_node(state: TTDState, config: RunnableConfig) -> TTDState:
             db.close()
     except Exception as e:
         retry_count = state.get("sql_retry_count") or 0
-        print(f"[TTD] SQL execution failed (retry {retry_count}): {e}")
+        logger.error(f"[TTD] SQL execution failed (retry {retry_count}): {e}")
         return {
             **state,
             "sql_error": str(e),

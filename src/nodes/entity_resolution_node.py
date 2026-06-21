@@ -1,3 +1,4 @@
+from src.core.nodes import node
 """
 Entity Resolution Node
 =======================
@@ -15,7 +16,11 @@ Akış:
 from src.state import AgentState
 from src.services.entity_resolver import resolve_entities
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
 
+
+@node("entity_resolution_node")
 def entity_resolution_node(state: AgentState) -> AgentState:
     """
     Entity-level veri kalıplarını tespit eder ve gerekirse aggregate eder.
@@ -29,14 +34,10 @@ def entity_resolution_node(state: AgentState) -> AgentState:
         entity_resolution — EntityResolution raporu (dict)
         data_path         — güncellenmiş parquet path (aggregate ise yeni)
     """
-    print("\n========================================\n"
-          "[NODE START] entity_resolution_node başlıyor...\n"
-          "========================================")
 
     result = resolve_entities(state)
 
     new_state = {
-        **state,
         "entity_resolution": result.get("entity_resolution", {}),
         "data_path": result.get("data_path", state.get("data_path", "")),
         "current_step": "entity_resolution_node",
@@ -44,8 +45,8 @@ def entity_resolution_node(state: AgentState) -> AgentState:
 
     # DEBUG
     resolution = result.get("entity_resolution", {})
-    print(f"[DEBUG ENTITY_RES NODE] action = {resolution.get('action', 'N/A')}")
-    print(f"[DEBUG ENTITY_RES NODE] message = {resolution.get('message', 'N/A')}")
-    print(f"[DEBUG ENTITY_RES NODE] new data_path = {new_state.get('data_path', 'N/A')}")
+    logger.info(f"[DEBUG ENTITY_RES NODE] action = {resolution.get('action', 'N/A')}")
+    logger.info(f"[DEBUG ENTITY_RES NODE] message = {resolution.get('message', 'N/A')}")
+    logger.info(f"[DEBUG ENTITY_RES NODE] new data_path = {new_state.get('data_path', 'N/A')}")
 
     return new_state

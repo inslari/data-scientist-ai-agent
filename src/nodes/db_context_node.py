@@ -1,4 +1,5 @@
 from __future__ import annotations
+from src.core.nodes import node
 
 import hashlib
 
@@ -13,19 +14,22 @@ from api.schemas.data_group import get_data_group_schema_logic, run_data_group_q
 from api.models.data_group import DataGroupModel
 from api.models.db_intelligence_cache import DbIntelligenceCacheModel
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
+@node("db_context_node")
 async def db_context_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """Async node — LangGraph ainvoke ile uyumlu."""
-    print("\n========================================\n[NODE START] db_context_node başlıyor...\n========================================")
     
-    print(">>> db_context_node basladi!")
+    logger.info(">>> db_context_node basladi!")
     data_group_id = config.get("configurable", {}).get("data_group_id")
     if not data_group_id:
         raise ValueError("data_group_id is missing in config")
 
     # Fetch schema + sample data
-    print(">>> DataGroup'dan sema ve ornek veri cekiliyor...")
+    logger.info(">>> DataGroup'dan sema ve ornek veri cekiliyor...")
     raw_schema, sample_data = await _fetch_schema_and_samples(data_group_id)
-    print(">>> Sema basariyla cekildi. Uzunluk:", len(raw_schema))
+    logger.info(">>> Sema basariyla cekildi. Uzunluk: %s", len(raw_schema))
 
     # Project bazlı cache: aynı şema için pahalı analyze_schema LLM çağrısını atla.
     # thread_id == project_id (api/core/worker.py).
@@ -39,37 +43,36 @@ async def db_context_node(state: AgentState, config: RunnableConfig) -> AgentSta
         if cached is not None:
             try:
                 db_model = DatabaseIntelligenceModel.model_validate(cached)
-                print(f">>> db_intelligence cache HIT (project {project_id}) — LLM analizi atlandi.")
+                logger.warning(f">>> db_intelligence cache HIT (project {project_id}) — LLM analizi atlandi.")
             except Exception as e:  # bozuk/uyumsuz payload → yeniden hesapla
-                print(f">>> Cache payload gecersiz, yeniden hesaplaniyor: {str(e)[:150]}")
+                logger.info(f">>> Cache payload gecersiz, yeniden hesaplaniyor: {str(e)[:150]}")
                 db_model = None
 
     if db_model is None:
         engine = DatabaseIntelligenceEngine()
-        print(">>> DatabaseIntelligenceEngine baslatildi. Sema analizi icin LLM'e istek atiliyor (Bu islem uzun surebilir)...")
+        logger.info(">>> DatabaseIntelligenceEngine baslatildi. Sema analizi icin LLM'e istek atiliyor (Bu islem uzun surebilir)...")
         try:
             db_model = engine.analyze_schema(
                 schema_text=raw_schema,
                 sample_data=sample_data,
             )
         except Exception as e:
-            print(f">>> LLM analizi basarisiz oldu: {str(e)[:200]}")
-            print(">>> Fallback moduna geciliyor (ornek veri olmadan tekrar deneniyor)...")
+            logger.info(f">>> LLM analizi basarisiz oldu: {str(e)[:200]}")
+            logger.info(">>> Fallback moduna geciliyor (ornek veri olmadan tekrar deneniyor)...")
             db_model = engine.analyze_schema(
                 schema_text=raw_schema,
                 sample_data="Örnek veri çok uzun olduğu için LLM halüsinasyonuna yol açtı, çıkarıldı.",
             )
-        print(">>> LLM analizi basariyla tamamlandi!")
+        logger.info(">>> LLM analizi basariyla tamamlandi!")
         if cache_enabled:
             _save_cached_intelligence(project_id, cache_key, db_model.model_dump())
-            print(f">>> db_intelligence cache yazildi (project {project_id}).")
+            logger.info(f">>> db_intelligence cache yazildi (project {project_id}).")
 
 
     intent          = state.get("intent", "eda")
     relevant_tables = _filter_tables_by_intent(db_model, intent)
 
     return {
-        **state,
         "raw_schema":      raw_schema,
         "db_intelligence": db_model.model_dump(),
         "relevant_tables": relevant_tables,
@@ -145,7 +148,7 @@ def _load_cached_intelligence(project_id: int, cache_key: str) -> dict | None:
             return row.payload
         return None
     except Exception as e:  # cache okuması asla pipeline'ı düşürmemeli
-        print(f">>> db_intelligence cache okunamadi: {str(e)[:150]}")
+        logger.info(f">>> db_intelligence cache okunamadi: {str(e)[:150]}")
         return None
     finally:
         db.close()
@@ -167,7 +170,7 @@ def _save_cached_intelligence(project_id: int, cache_key: str, payload: dict) ->
         db.commit()
     except Exception as e:  # cache yazımı asla pipeline'ı düşürmemeli
         db.rollback()
-        print(f">>> db_intelligence cache yazilamadi: {str(e)[:150]}")
+        logger.info(f">>> db_intelligence cache yazilamadi: {str(e)[:150]}")
     finally:
         db.close()
 

@@ -10,6 +10,12 @@ from api.models.user import UserModel
 from api.models.job import BackgroundJobModel  # Must be imported so the table is created
 from api.models.data_group_query import DataGroupQueryModel  # Must be imported so the table is created
 from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # Must be imported so the table is created
+from api.models.log_entry import LogEntryModel  # Must be imported so the app_logs table is created
+
+# Yapısal logging — süreç başında bir kez. API'de DB logging varsayılan kapalı
+# (LOG_DB_ENABLED=true ile açılabilir); tablo yine create_all ile oluşur.
+from src.core.logging_config import setup_logging
+setup_logging(process="api")
 
 # Create all DB tables
 Base.metadata.create_all(bind=engine)

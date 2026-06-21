@@ -1,10 +1,14 @@
 from __future__ import annotations
+from src.core.nodes import node
 
 import time as _time
 from langchain_core.runnables import RunnableConfig
 
 from src.state import AgentState
 from src.domains import get_active_pack
+
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
 
 
 def _save_discovered_queries(analysis, data_group_id: int) -> None:
@@ -33,13 +37,14 @@ def _save_discovered_queries(analysis, data_group_id: int) -> None:
                     created_at=int(_time.time()),
                 ))
             db.commit()
-            print(f"[merchant_node] {len(all_queries)} keşfedilen sorgu data_group {data_group_id} için kaydedildi.")
+            logger.info(f"[merchant_node] {len(all_queries)} keşfedilen sorgu data_group {data_group_id} için kaydedildi.")
         finally:
             db.close()
     except Exception as e:  # pragma: no cover - defensive
-        print(f"[merchant_node] Sorgular kaydedilemedi: {e}")
+        logger.info(f"[merchant_node] Sorgular kaydedilemedi: {e}")
 
 
+@node("merchant_intelligence_node")
 async def merchant_intelligence_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """Run the active pack's tool-using expert agents over the real dataset.
 
@@ -48,11 +53,10 @@ async def merchant_intelligence_node(state: AgentState, config: RunnableConfig) 
     fails, the node passes through and the hooks fall back to static guidance —
     the pipeline never breaks.
     """
-    print("\n========================================\n[NODE START] merchant_intelligence_node başlıyor...\n========================================")
 
     pack = get_active_pack(state.get("domain_pack"))
     if pack.name == "none":
-        return {**state, "current_step": "merchant_intelligence_node"}
+        return {"current_step": "merchant_intelligence_node"}
 
     data_group_id = config.get("configurable", {}).get("data_group_id")
 
@@ -72,7 +76,7 @@ async def merchant_intelligence_node(state: AgentState, config: RunnableConfig) 
             finally:
                 db.close()
 
-        print(f"[merchant_node] pack='{pack.name}' data_group={data_group_id} source={source_type} → expert ajanları çalışıyor...")
+        logger.info(f"[merchant_node] pack='{pack.name}' data_group={data_group_id} source={source_type} → expert ajanları çalışıyor...")
         analysis = await pack.analyze(
             user_query=state.get("user_query", ""),
             db_intelligence=state.get("db_intelligence"),
@@ -82,16 +86,15 @@ async def merchant_intelligence_node(state: AgentState, config: RunnableConfig) 
             source_type=source_type,
         )
         if analysis is not None:
-            print(f"[merchant_node] analiz tamam → expert(ler)={analysis.council}, bulgu={len(analysis.findings)}")
+            logger.info(f"[merchant_node] analiz tamam → expert(ler)={analysis.council}, bulgu={len(analysis.findings)}")
             if data_group_id:
                 _save_discovered_queries(analysis, data_group_id)
             return {
-                **state,
                 "merchant_analysis": analysis.to_dict(),
                 "current_step": "merchant_intelligence_node",
             }
-        print("[merchant_node] analiz None döndü; statik ipuçlarına düşülecek.")
+        logger.info("[merchant_node] analiz None döndü; statik ipuçlarına düşülecek.")
     except Exception as e:  # pragma: no cover - defensive
-        print(f"[merchant_node] analiz başarısız ({e}); statik ipuçlarına düşülüyor.")
+        logger.info(f"[merchant_node] analiz başarısız ({e}); statik ipuçlarına düşülüyor.")
 
-    return {**state, "current_step": "merchant_intelligence_node"}
+    return {"current_step": "merchant_intelligence_node"}

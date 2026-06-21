@@ -5,6 +5,9 @@ from ..state import TTDState, _IntentResult
 from ..utils import _get_llm, _StructuredJsonParser
 from src.domains import get_active_pack
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 TTD_INTENT_SYSTEM = """\
 You are an intent classifier for a data analytics assistant.
 
@@ -50,7 +53,7 @@ async def ttd_intent_classifier_node(state: TTDState, config: RunnableConfig) ->
     - sql_query       → sql node'a git
     - analytical      → sql node'a git (karmaşık query)
     """
-    print("\n[TTD] ttd_intent_classifier_node başlıyor...")
+    logger.info("\n[TTD] ttd_intent_classifier_node başlıyor...")
 
     llm        = _get_llm(temperature=0)
     user_query = state["user_query"]
@@ -72,10 +75,10 @@ async def ttd_intent_classifier_node(state: TTDState, config: RunnableConfig) ->
             ctx = pack.select_experts(user_query, state.get("db_intelligence"), domain_doc)
             merchant_context = ctx.to_dict()
             domain_context = pack.enrich_intent_prompt(ctx, domain_doc)
-            print(f"[TTD] Domain pack '{pack.name}' aktif → expert(ler): "
+            logger.info(f"[TTD] Domain pack '{pack.name}' aktif → expert(ler): "
                   f"{ctx.council if ctx.is_council else [ctx.primary_expert]}")
     except Exception as e:  # pragma: no cover - defensive
-        print(f"[TTD] Domain pack seçimi başarısız ({e}); atlanıyor.")
+        logger.warning(f"[TTD] Domain pack seçimi başarısız ({e}); atlanıyor.")
 
     invoke_kwargs = {
         "user_query":     user_query,
@@ -90,17 +93,17 @@ async def ttd_intent_classifier_node(state: TTDState, config: RunnableConfig) ->
             TTD_INTENT_PROMPT | llm.with_structured_output(_IntentResult)
         ).invoke(invoke_kwargs)  # type: ignore[assignment]
     except Exception as e1:
-        print(f"[TTD] intent structured output failed ({type(e1).__name__}), trying text parser")
+        logger.error(f"[TTD] intent structured output failed ({type(e1).__name__}), trying text parser")
         try:
             raw_text = llm.invoke(
                 TTD_INTENT_PROMPT.format_messages(**invoke_kwargs)
             ).content
             intent_result = _StructuredJsonParser(pydantic_object=_IntentResult).parse(raw_text)  # type: ignore[assignment]
         except Exception as e2:
-            print(f"[TTD] intent classifier failed ({e2}), defaulting to sql_query")
+            logger.error(f"[TTD] intent classifier failed ({e2}), defaulting to sql_query")
             intent_result = _IntentResult(intent="sql_query")  # type: ignore[assignment]
 
-    print(f"[TTD] intent: {intent_result.intent} | multi={intent_result.needs_multiple_queries} | clarify={intent_result.clarification_needed}")
+    logger.info(f"[TTD] intent: {intent_result.intent} | multi={intent_result.needs_multiple_queries} | clarify={intent_result.clarification_needed}")
 
     # Eğer clarification gerekiyorsa, doğrudan cevap ver
     if intent_result.clarification_needed and intent_result.clarification_question:

@@ -38,6 +38,9 @@ from pathlib import Path
 
 import numpy as np
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 # Config
 N_ACCOUNTS     =    500_000
 N_MERCHANTS    =     50_000
@@ -271,51 +274,51 @@ def gen_transactions_batch(
 
 # Main
 def main():
-    print(f"{'='*60}")
-    print(f"  Financial Dataset Generator")
-    print(f"  Accounts    : {N_ACCOUNTS:,}")
-    print(f"  Merchants   : {N_MERCHANTS:,}")
-    print(f"  Transactions: {N_TRANSACTIONS:,}")
-    print(f"  Fraud rate  : %{FRAUD_RATE*100:.1f}")
-    print(f"  Output      : {OUTPUT_PATH}")
-    print(f"{'='*60}\n")
+    logger.info(f"{'='*60}")
+    logger.info(f"  Financial Dataset Generator")
+    logger.info(f"  Accounts    : {N_ACCOUNTS:,}")
+    logger.info(f"  Merchants   : {N_MERCHANTS:,}")
+    logger.info(f"  Transactions: {N_TRANSACTIONS:,}")
+    logger.info(f"  Fraud rate  : %{FRAUD_RATE*100:.1f}")
+    logger.info(f"  Output      : {OUTPUT_PATH}")
+    logger.info(f"{'='*60}\n")
 
     if OUTPUT_PATH.exists():
         OUTPUT_PATH.unlink()
-        print(f"Eski veritabanı silindi.")
+        logger.info(f"Eski veritabanı silindi.")
 
     conn = sqlite3.connect(OUTPUT_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-64000")   # 64MB cache
     conn.executescript(SCHEMA)
-    print("Schema oluşturuldu.")
+    logger.info("Schema oluşturuldu.")
 
     # Accounts
     t0 = time.time()
-    print(f"\n[1/3] Accounts üretiliyor ({N_ACCOUNTS:,})...")
+    logger.info(f"\n[1/3] Accounts üretiliyor ({N_ACCOUNTS:,})...")
     accounts = gen_accounts(N_ACCOUNTS)
     conn.executemany(
         "INSERT INTO accounts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         accounts
     )
     conn.commit()
-    print(f"  ✓ {N_ACCOUNTS:,} hesap eklendi ({time.time()-t0:.1f}s)")
+    logger.info(f"  ✓ {N_ACCOUNTS:,} hesap eklendi ({time.time()-t0:.1f}s)")
 
     # Merchants
     t0 = time.time()
-    print(f"\n[2/3] Merchants üretiliyor ({N_MERCHANTS:,})...")
+    logger.info(f"\n[2/3] Merchants üretiliyor ({N_MERCHANTS:,})...")
     merchants = gen_merchants(N_MERCHANTS)
     conn.executemany(
         "INSERT INTO merchants VALUES (?,?,?,?,?,?,?)",
         merchants
     )
     conn.commit()
-    print(f"  ✓ {N_MERCHANTS:,} satıcı eklendi ({time.time()-t0:.1f}s)")
+    logger.info(f"  ✓ {N_MERCHANTS:,} satıcı eklendi ({time.time()-t0:.1f}s)")
 
     # Transactions (batched)
     t0 = time.time()
-    print(f"\n[3/3] Transactions üretiliyor ({N_TRANSACTIONS:,})...")
+    logger.info(f"\n[3/3] Transactions üretiliyor ({N_TRANSACTIONS:,})...")
     total_inserted = 0
 
     for batch_start in range(0, N_TRANSACTIONS, BATCH_SIZE):
@@ -333,32 +336,34 @@ def main():
         elapsed = time.time() - t0
         rate    = total_inserted / elapsed
         eta     = (N_TRANSACTIONS - total_inserted) / rate if rate > 0 else 0
-        print(f"  {total_inserted:>10,}/{N_TRANSACTIONS:,} "
+        logger.info(f"  {total_inserted:>10,}/{N_TRANSACTIONS:,} "
               f"({total_inserted/N_TRANSACTIONS*100:.1f}%) "
               f"| {rate:,.0f} row/s | ETA: {eta:.0f}s")
 
-    print(f"\n  ✓ {total_inserted:,} işlem eklendi ({time.time()-t0:.1f}s)")
+    logger.info(f"\n  ✓ {total_inserted:,} işlem eklendi ({time.time()-t0:.1f}s)")
 
     # Stats
-    print(f"\n{'='*60}")
-    print(f"  Final istatistikler:")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"  Final istatistikler:")
     for table in ["accounts","merchants","transactions"]:
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        print(f"  {table:15s}: {count:>12,} satır")
+        logger.info(f"  {table:15s}: {count:>12,} satır")
 
     fraud_count = conn.execute(
         "SELECT COUNT(*) FROM transactions WHERE is_fraud=1"
     ).fetchone()[0]
-    print(f"  fraud işlem  : {fraud_count:>12,} (%{fraud_count/N_TRANSACTIONS*100:.2f})")
+    logger.info(f"  fraud işlem  : {fraud_count:>12,} (%{fraud_count/N_TRANSACTIONS*100:.2f})")
 
     size_mb = OUTPUT_PATH.stat().st_size / 1024 / 1024
-    print(f"\n  Dosya boyutu : {size_mb:.1f} MB")
-    print(f"  Konum        : {OUTPUT_PATH}")
-    print(f"{'='*60}")
+    logger.info(f"\n  Dosya boyutu : {size_mb:.1f} MB")
+    logger.info(f"  Konum        : {OUTPUT_PATH}")
+    logger.info(f"{'='*60}")
 
     conn.close()
-    print("\nTamamlandı!")
+    logger.info("\nTamamlandı!")
 
 
 if __name__ == "__main__":
+    from src.core.logging_config import setup_logging
+    setup_logging(process="script")
     main()

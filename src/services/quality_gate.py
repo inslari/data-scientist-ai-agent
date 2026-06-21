@@ -1,6 +1,9 @@
 from __future__ import annotations
 from typing import Any
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 
 def evaluate_quality_gate(state: dict) -> dict:
     """
@@ -234,14 +237,14 @@ def evaluate_quality_gate(state: dict) -> dict:
             "doğrulama ve sürekli izleme önerilir."
         )
 
-    print(f"\n[quality_gate] STATUS: {status.upper()}")
-    print(f"[quality_gate] {summary}")
+    logger.info(f"\n[quality_gate] STATUS: {status.upper()}")
+    logger.info(f"[quality_gate] {summary}")
     if failures:
         for f in failures:
-            print(f"  [FAIL] {f['message']}")
+            logger.error(f"  [FAIL] {f['message']}")
     if warnings:
         for w in warnings:
-            print(f"  [WARN] {w['message']}")
+            logger.info(f"  [WARN] {w['message']}")
 
     return {
         "status": status,

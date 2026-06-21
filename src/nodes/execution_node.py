@@ -1,7 +1,11 @@
+from src.core.nodes import node
 from langchain_core.runnables import RunnableConfig
 from src.state import AgentState
 from src.services.data_executor import execute_data_operations
 from src.services.target_discovery import infer_task_type
+
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
 
 # Görev tipi override'ının çalışabileceği model-eğitme intent'leri.
 # deep_analysis / eda / report / sql_query / clustering / anomaly_detection
@@ -30,30 +34,29 @@ def _maybe_override_intent(state: AgentState, data_path: str | None) -> str | No
         import pandas as pd
         series = pd.read_parquet(data_path, columns=[target_col])[target_col]
     except Exception as e:
-        print(f"[execution] Gorev tipi cikarimi atlandi (hedef '{target_col}' okunamadi): {e}")
+        logger.warning(f"[execution] Gorev tipi cikarimi atlandi (hedef '{target_col}' okunamadi): {e}")
         return None
 
     inferred = infer_task_type(series)
     if inferred != intent:
-        print(f"[execution] Gorev tipi override: hedef '{target_col}' -> "
+        logger.info(f"[execution] Gorev tipi override: hedef '{target_col}' -> "
               f"intent '{intent}' yerine '{inferred}' (manuel hedef verisinden cikarildi)")
         return inferred
 
-    print(f"[execution] Gorev tipi dogrulandi: hedef '{target_col}' -> '{intent}'")
+    logger.info(f"[execution] Gorev tipi dogrulandi: hedef '{target_col}' -> '{intent}'")
     return None
 
 
+@node("execution_node")
 async def execution_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """
     Node 3: Planı (SQL sorguları dahil) yürütür ve veriyi Pandas DataFrame'e çeker.
     Tüm yürütme mantığı `src.services.data_executor` içerisine taşındı.
     """
-    print("\n========================================\n[NODE START] execution_node başlıyor...\n========================================")
     result = await execute_data_operations(state, config)
 
     if result.get("error"):
         return {
-            **state,
             "error": result["error"],
             "current_step": "execution_node",
         }
@@ -61,7 +64,6 @@ async def execution_node(state: AgentState, config: RunnableConfig) -> AgentStat
     data_path = result.get("data_path")
 
     new_state = {
-        **state,
         "data_path": data_path,
         "sql_results": result.get("sql_results"),
         "dataframe": result.get("dataframe"),

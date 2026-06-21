@@ -759,8 +759,40 @@ def compute_ecdf(
 #  ANALİZ MODÜL KAYIT DEFTERİ (Registry)
 # ═══════════════════════════════════════════════════════════
 
-# Analiz modülleri. "general" her veride çalışır.
-# "fintech" ileride doldurulacak (WoE/IV, target-rate vb.) — şimdilik boş yuva.
+# E-ticaret sektör modülleri (analysis_type="ecommerce" ile eklenir).
+from src.services.analysis_ecommerce import compute_rfm, compute_basket_affinity
+
+# Sağlık sektör modülleri (analysis_type="healthcare" ile eklenir).
+from src.services.analysis_healthcare import (
+    compute_survival_summary,
+    compute_readmission_rate,
+)
+
+# Perakende sektör modülleri (analysis_type="retail" ile eklenir).
+from src.services.analysis_retail import (
+    compute_demand_trend,
+    compute_price_elasticity,
+)
+
+# İK sektör modülleri (analysis_type="hr" ile eklenir).
+from src.services.analysis_hr import (
+    compute_attrition_overview,
+    compute_compensation_gaps,
+)
+
+# Pazarlama sektör modülleri (analysis_type="marketing" ile eklenir).
+from src.services.analysis_marketing import (
+    compute_channel_performance,
+    compute_campaign_roi,
+)
+
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
+# Analiz modülleri. "general" her veride çalışır; sektör grupları "general"in
+# ÜSTÜNE eklenir (bkz. run_deep_analysis). Yeni sektör eklemek için: compute_*
+# fonksiyonlarını yaz + buraya yeni bir grup anahtarı ekle, pack.analysis_type
+# ile eşleştir.
 ANALYSIS_MODULES: dict[str, list] = {
     "general": [
         compute_correlation,
@@ -774,6 +806,26 @@ ANALYSIS_MODULES: dict[str, list] = {
         compute_ecdf,
     ],
     "fintech": [],
+    "ecommerce": [
+        compute_rfm,
+        compute_basket_affinity,
+    ],
+    "healthcare": [
+        compute_survival_summary,
+        compute_readmission_rate,
+    ],
+    "retail": [
+        compute_demand_trend,
+        compute_price_elasticity,
+    ],
+    "hr": [
+        compute_attrition_overview,
+        compute_compensation_gaps,
+    ],
+    "marketing": [
+        compute_channel_performance,
+        compute_campaign_roi,
+    ],
 }
 
 
@@ -801,21 +853,30 @@ def run_deep_analysis(
         df: ham veri (parquet'ten okunmuş)
         profile: DuckDBEngine.profile_table() çıktısı
         target_col: hedef sütun (opsiyonel)
-        analysis_type: registry'den hangi modül grubunu çalıştır ("general", "fintech")
+        analysis_type: hangi sektör modül grubu eklensin ("general", "fintech",
+            "ecommerce", …). "general" her zaman çalışır; sektör grubu onun
+            ÜSTÜNE eklenir (domain pack'in analysis_type'ından gelir).
 
     Returns:
         profile + correlation_matrix + histograms + target_relations + clustering
+        + (varsa) sektöre özel anahtarlar (örn. rfm, basket_affinity)
     """
     # Mevcut profile'ı koru, üstüne ekle
     analysis = dict(profile)
 
-    for fn in ANALYSIS_MODULES.get(analysis_type, []):
-        try:
-            result = fn(df, profile, target_col)
-            if result and isinstance(result, dict):
-                analysis.update(result)
-        except Exception as e:
-            print(f"[analysis_engine] {fn.__name__} hatası: {e}")
-            continue
+    # Önce "general" (her veride), sonra varsa sektör grubu — tekrar çalıştırma.
+    groups = ["general"]
+    if analysis_type and analysis_type not in ("general", "none"):
+        groups.append(analysis_type)
+
+    for group in groups:
+        for fn in ANALYSIS_MODULES.get(group, []):
+            try:
+                result = fn(df, profile, target_col)
+                if result and isinstance(result, dict):
+                    analysis.update(result)
+            except Exception as e:
+                logger.error(f"[analysis_engine] {fn.__name__} hatası: {e}")
+                continue
 
     return analysis

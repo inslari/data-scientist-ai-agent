@@ -37,6 +37,9 @@ from langchain_core.runnables import RunnableConfig
 from mcp.client.session import ClientSession
 
 from src.core.config import settings
+from src.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 # ── Sabitler ────────────────────────────────────────────────
 CHUNK_SIZE        = 5_000   # MCP'den kaç satır çekileceği (per chunk) — küçük chunk = hızlı sorgu, daha az iptal/spin riski
@@ -235,13 +238,13 @@ def _select_anchor_table(
             "score":    outgoing * 3 - incoming,
             "rows":     len(dfs[table]),
         }
-        print(f"[execution] '{table}': outgoing_FK={outgoing}, incoming_FK={incoming}, "
+        logger.info(f"[execution] '{table}': outgoing_FK={outgoing}, incoming_FK={incoming}, "
               f"score={scores[table]['score']}, rows={len(dfs[table]):,}")
 
     # En yüksek skor → fact table → anchor
     # Tie varsa daha fazla satıra sahip olan
     anchor = max(scores, key=lambda t: (scores[t]["score"], scores[t]["rows"]))
-    print(f"[execution] Anchor (fact table): '{anchor}'")
+    logger.info(f"[execution] Anchor (fact table): '{anchor}'")
     return anchor
 
 
@@ -343,7 +346,7 @@ async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> 
             except Exception:
                 total_rows = 0
 
-            print(f"[execution] '{table}': {total_rows:,} satır tespit edildi")
+            logger.info(f"[execution] '{table}': {total_rows:,} satır tespit edildi")
 
             # TEK SORGU — chunk yok. MAX_FETCH_ROWS kadar LIMIT'le.
             fetch_limit = min(total_rows, MAX_FETCH_ROWS) if total_rows else MAX_FETCH_ROWS
@@ -352,7 +355,7 @@ async def _fetch_all_tables(table_to_db: dict[str, str], data_group_id: int) -> 
             result = await run_data_group_query_logic(data_group_id, req, db, user_id)
 
             if result.get("status") == "success":
-                print(f"[execution] '{table}': {fetch_limit:,} satır tek sorguda çekildi")
+                logger.info(f"[execution] '{table}': {fetch_limit:,} satır tek sorguda çekildi")
                 return table, str(result.get("result", ""))
             return table, ""
         finally:
@@ -407,7 +410,7 @@ class DuckDBEngine:
         safe_name = _make_safe(name)
         self.conn.register(safe_name, df)
         self._tables.add(safe_name)
-        print(f"[duckdb] '{safe_name}' yüklendi: {len(df):,} satır × {len(df.columns)} kolon")
+        logger.info(f"[duckdb] '{safe_name}' yüklendi: {len(df):,} satır × {len(df.columns)} kolon")
 
     def query(self, sql: str) -> pd.DataFrame:
         """SQL sorgusu çalıştır, DataFrame döndür."""
@@ -552,7 +555,7 @@ class DuckDBEngine:
         total = total_row[0] if total_row else 0
 
         if total <= n:
-            print(f"[duckdb] '{safe}' zaten küçük ({total:,} satır), tüm veri kullanılıyor.")
+            logger.info(f"[duckdb] '{safe}' zaten küçük ({total:,} satır), tüm veri kullanılıyor.")
             return self.conn.execute(f"SELECT * FROM {safe}").df()
 
         if target_col and target_col in self._get_columns(safe):
@@ -572,21 +575,21 @@ class DuckDBEngine:
                 ).df()
                 frames.append(df_cls)
             result = pd.concat(frames, ignore_index=True)
-            print(f"[duckdb] Stratified sample: {len(result):,}/{total:,} satır")
+            logger.info(f"[duckdb] Stratified sample: {len(result):,}/{total:,} satır")
             return result
         else:
             # Random sample
             result = self.conn.execute(
                 f"SELECT * FROM {safe} USING SAMPLE {n}"
             ).df()
-            print(f"[duckdb] Random sample: {len(result):,}/{total:,} satır")
+            logger.info(f"[duckdb] Random sample: {len(result):,}/{total:,} satır")
             return result
 
     def to_parquet(self, name: str, path: Path) -> None:
         """DuckDB tablosunu parquet'e yaz."""
         safe = _make_safe(name)
         self.conn.execute(f"COPY {safe} TO '{path}' (FORMAT PARQUET)")
-        print(f"[duckdb] '{safe}' → {path} ({path.stat().st_size//1024:,} KB)")
+        logger.info(f"[duckdb] '{safe}' → {path} ({path.stat().st_size//1024:,} KB)")
 
     def _get_columns(self, safe_name: str) -> list[str]:
         try:
@@ -624,7 +627,7 @@ def _merge_dataframes(
             rdf = rdf.rename(columns={c: f"{c}_{rt}" for c in overlap})
         before = len(result)
         result = result.merge(rdf, left_on=op["left_on"], right_on=op["right_on"], how="left")
-        print(f"[merge] {op['left']}.{op['left_on']} → {rt}.{op['right_on']} | {before}→{len(result)}")
+        logger.info(f"[merge] {op['left']}.{op['left_on']} → {rt}.{op['right_on']} | {before}→{len(result)}")
     return result
 
 
@@ -714,7 +717,7 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
     5. ML için stratified sample
     """
     analysis_plan  = state.get("analysis_plan", [])
-    print(f"[DEBUG EXEC] analysis_plan = {analysis_plan}")
+    logger.debug(f"[DEBUG EXEC] analysis_plan = {analysis_plan}")
     db_intelligence= state.get("db_intelligence", {})
 
     if not analysis_plan:
@@ -757,8 +760,8 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                             break
                     table_to_db[t] = db_name
 
-                print(f"[execution] Planner: {selected}")
-                print(f"[execution] Graph traverse: {all_tables}")
+                logger.info(f"[execution] Planner: {selected}")
+                logger.info(f"[execution] Graph traverse: {all_tables}")
 
                 # Parallel chunked fetch
                 raw_results = await _fetch_all_tables(table_to_db, data_group_id)
@@ -769,7 +772,7 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                     df = _parse_mcp_to_df(raw, table)
                     dfs[table] = df
                     duck.load(table, df)
-                    print(f"[execution] '{table}': {len(df):,} satır")
+                    logger.info(f"[execution] '{table}': {len(df):,} satır")
 
                 # Multi-table merge (DuckDB SQL JOIN - fast)
                 # Multi-table: tek SQL JOIN ile MCP'den çek
@@ -780,7 +783,7 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                     if merge_ops:
                         # JOIN SQL'ini dinamik olarak oluştur (LIMIT/OFFSET hariç base SQL)
                         base_join_sql = _build_joined_sql(anchor, merge_ops, dfs, MAX_FETCH_ROWS)
-                        print(f"[execution] DB-side JOIN Base SQL:\n  {base_join_sql[:200]}...")
+                        logger.info(f"[execution] DB-side JOIN Base SQL:\n  {base_join_sql[:200]}...")
 
                         tables_info = db_intelligence.get("tables", [])
                         anchor_db = "default"
@@ -824,13 +827,13 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                                         break
                                     chunks_text.append("\n".join(data_lines))
                                     
-                                print(f"[execution] JOIN chunk: {offset+limit:,}/{MAX_FETCH_ROWS:,} satır çekildi")
+                                logger.info(f"[execution] JOIN chunk: {offset+limit:,}/{MAX_FETCH_ROWS:,} satır çekildi")
                         finally:
                             db_conn.close()
 
                         raw_joined = "\n".join(chunks_text)
                         merged_df = _parse_mcp_to_df(raw_joined, "joined")
-                        print(f"[execution] DB-side JOIN sonucu: {len(merged_df):,} satır × {len(merged_df.columns)} kolon")
+                        logger.info(f"[execution] DB-side JOIN sonucu: {len(merged_df):,} satır × {len(merged_df.columns)} kolon")
                     else:
                         # merge_ops boş → tablolar arasında bilinen ilişki yok, anchor kullan
                         merged_df = dfs[anchor]
@@ -843,13 +846,13 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                     single_name = list(dfs.keys())[0]
                     merged_table = _make_safe(single_name)
 
-                print(f"[execution] Merged table: '{merged_table}'")
+                logger.info(f"[execution] Merged table: '{merged_table}'")
 
                 # Parquet'e yaz
                 parquet_path = PARQUET_DIR / f"{merged_table}.parquet"
                 duck.to_parquet(merged_table, parquet_path)
                 data_path = str(parquet_path)
-                print(f"[execution] Parquet yazıldı: {data_path}")
+                logger.info(f"[execution] Parquet yazıldı: {data_path}")
                 # Preview (1K satır)
                 preview = duck.query(f"SELECT * FROM {merged_table} LIMIT 1000")
                 sql_results = preview.where(pd.notnull(preview), None).to_dict(orient="records")  # type: ignore[arg-type]
@@ -860,7 +863,7 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                     raise ValueError("Profiling için tablo yok.")
                 profiling_report = duck.profile_table(merged_table)
                 shape = profiling_report["shape"]
-                print(f"[execution] Profiling: {shape['rows']:,}×{shape['columns']} | "
+                logger.info(f"[execution] Profiling: {shape['rows']:,}×{shape['columns']} | "
                       f"{len(profiling_report.get('recommendations',[]))} öneri")
 
             else:
@@ -868,8 +871,8 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
 
     except Exception as e:
         import traceback
-        print(f"\n[execution] HATA: {e}")
-        print(traceback.format_exc())
+        logger.error(f"\n[execution] HATA: {e}")
+        logger.info(traceback.format_exc())
         duck.close()
         return {"error": f"Execution hatası: {str(e)}", "current_step": "execution_node"}
 
@@ -878,7 +881,7 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
 
     if not data_path and not sql_results:
         step_names = [s.get("step", "") for s in analysis_plan]
-        print(f"[execution] HATA: data_path boş, sql_results boş. Plan adımları: {step_names}")
+        logger.error(f"[execution] HATA: data_path boş, sql_results boş. Plan adımları: {step_names}")
         return {
             "error": (
                 "Veri çekme adımı çalışmadı. Analiz planı bir 'sql_query' adımı içermiyor "
@@ -934,8 +937,8 @@ def _merge_with_duckdb(
     sql = f"SELECT {', '.join(select_parts)} FROM {safe_anchor} {' '.join(join_parts)}"
     try:
         result = duck.query(sql)
-        print(f"[duckdb] DuckDB JOIN: {len(result):,} satır")
+        logger.info(f"[duckdb] DuckDB JOIN: {len(result):,} satır")
         return result
     except Exception as e:
-        print(f"[duckdb] JOIN hatası, pandas merge'e fallback: {e}")
+        logger.error(f"[duckdb] JOIN hatası, pandas merge'e fallback: {e}")
         return _merge_dataframes(dfs, merge_ops, anchor)

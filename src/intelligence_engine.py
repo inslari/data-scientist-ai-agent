@@ -11,6 +11,9 @@ from src.core.llm import get_llm
 from src.core.config import settings
 from langchain_core.output_parsers import PydanticOutputParser
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 load_dotenv(override=True)
 
 
@@ -115,7 +118,7 @@ def _augment_shared_key_relationships(model: "DatabaseIntelligenceModel") -> "Da
             added.append((anchor_t, t, key))
 
     if added:
-        print(f"[intelligence] Shared-key ilişkileri eklendi (artifact hariç): {added}")
+        logger.info(f"[intelligence] Shared-key ilişkileri eklendi (artifact hariç): {added}")
     return model
 
 class DatabaseIntelligenceModel(BaseModel):
@@ -371,6 +374,6 @@ For each column, assign semantic_type using this strict decision tree:
         try:
             response = _augment_shared_key_relationships(response)
         except Exception as e:  # pragma: no cover - defensive
-            print(f"[intelligence] Shared-key augmentation atlandı: {e}")
+            logger.warning(f"[intelligence] Shared-key augmentation atlandı: {e}")
 
         return response

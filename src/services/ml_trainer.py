@@ -54,6 +54,9 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import roc_curve, precision_recall_curve
 from src.state import AgentState
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 warnings.filterwarnings("ignore")
 RANDOM_STATE = 42
 
@@ -84,6 +87,13 @@ def _get_classification_models() -> dict:
         )
     except ImportError:
         pass
+    try:
+        from catboost import CatBoostClassifier
+        models["catboost"] = CatBoostClassifier(
+            iterations=300, random_state=RANDOM_STATE, verbose=0, allow_writing_files=False,
+        )
+    except ImportError:
+        pass
     return models
 
 
@@ -109,29 +119,70 @@ def _get_regression_models() -> dict:
         )
     except ImportError:
         pass
+    try:
+        from catboost import CatBoostRegressor
+        models["catboost"] = CatBoostRegressor(
+            iterations=300, random_state=RANDOM_STATE, verbose=0, allow_writing_files=False,
+        )
+    except ImportError:
+        pass
     return models
 
 
 # Feature importance
+def _unwrap_to_estimator(model: Any) -> Any:
+    """Sarmalayıcıları (CalibratedClassifierCV, SMOTE/sklearn Pipeline) soyup
+    içteki gerçek tahmin edici modele iner. Stacking, çağıran tarafça ayrıca
+    ele alınır (estimators_ ortalaması)."""
+    # CalibratedClassifierCV → kalibre edilmiş ilk alt-modelin estimator'ı
+    cc_list = getattr(model, "calibrated_classifiers_", None)
+    if cc_list:
+        inner = getattr(cc_list[0], "estimator", None) or getattr(cc_list[0], "base_estimator", None)
+        if inner is not None:
+            return _unwrap_to_estimator(inner)
+    # imblearn/sklearn Pipeline → "clf" veya son adım
+    if hasattr(model, "named_steps"):
+        steps = model.named_steps
+        nxt = steps["clf"] if "clf" in steps else list(steps.values())[-1]
+        return _unwrap_to_estimator(nxt)
+    return model
+
+
+def _importances_from(est: Any, feature_names: list[str]):
+    """Tek bir tahmin ediciden feature_importances_ veya |coef_| dizisi (ya da None)."""
+    arr = None
+    if hasattr(est, "feature_importances_"):
+        arr = np.asarray(est.feature_importances_, dtype=float)
+    elif hasattr(est, "coef_"):
+        coef = np.asarray(est.coef_, dtype=float)
+        if coef.ndim > 1:
+            coef = np.abs(coef).mean(axis=0)
+        arr = np.abs(coef)
+    if arr is not None and arr.shape[0] == len(feature_names):
+        return arr
+    return None
+
+
 def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
     try:
-        est = model
-        # imblearn Pipeline desteği: ("smote", ...), ("clf", actual_model)
-        if hasattr(model, "named_steps") and "clf" in model.named_steps:
-            est = model.named_steps["clf"]
-        elif hasattr(model, "named_steps"):
-            est = list(model.named_steps.values())[-1]
-        # sklearn Pipeline içindeyse son adımı al
-        if hasattr(est, "named_steps"):
-            est = list(est.named_steps.values())[-1]
-        if hasattr(est, "feature_importances_"):
-            imp = dict(zip(feature_names, est.feature_importances_.tolist()))
-            return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
-        elif hasattr(est, "coef_"):
-            coef = est.coef_
-            if coef.ndim > 1:
-                coef = np.abs(coef).mean(axis=0)
-            imp = dict(zip(feature_names, np.abs(coef).tolist()))
+        base = _unwrap_to_estimator(model)
+        # StackingClassifier/Regressor: fitted base'lerin importance'larını ortala.
+        # (RandomForest gibi 'estimators_'ı olan ama final_estimator_ olmayan
+        #  modellerle karışmasın diye iki niteliği birlikte kontrol ederiz.)
+        if hasattr(base, "estimators_") and hasattr(base, "final_estimator_"):
+            arrs = []
+            for sub in base.estimators_:
+                a = _importances_from(_unwrap_to_estimator(sub), feature_names)
+                if a is not None:
+                    arrs.append(a)
+            if arrs:
+                avg = np.mean(arrs, axis=0)
+                imp = dict(zip(feature_names, avg.tolist()))
+                return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
+            return {}
+        arr = _importances_from(base, feature_names)
+        if arr is not None:
+            imp = dict(zip(feature_names, arr.tolist()))
             return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
     except Exception:
         pass
@@ -155,7 +206,7 @@ def _prep_data(X_train_raw, X_test_raw, y_train_raw, y_test_raw):
 def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, is_binary: bool, strong_regularization: bool = False, is_imbalanced: bool = False) -> Any:
     """Tunes the selected model using Optuna. If strong_regularization is True, shrinks the search space to prevent overfitting."""
     reg_msg = " (STRONG REGULARIZATION)" if strong_regularization else ""
-    print(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor{reg_msg} (15 sn limiti)...")
+    logger.info(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor{reg_msg} (15 sn limiti)...")
     
     cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
     scoring = "roc_auc" if is_binary else "roc_auc_ovr_weighted"
@@ -216,7 +267,7 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
     try:
         study.optimize(objective, n_trials=20, timeout=15)
         best_params = study.best_params
-        print(f"[automl] Optuna tamamlandı. En iyi parametreler: {best_params}")
+        logger.info(f"[automl] Optuna tamamlandı. En iyi parametreler: {best_params}")
         
         # Best model Instantiate
         if model_name == "random_forest":
@@ -232,14 +283,14 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
             from lightgbm import LGBMClassifier
             return LGBMClassifier(**best_params, random_state=settings.RANDOM_SEED, verbose=-1, n_jobs=-1)
     except Exception as e:
-        print(f"[automl] Optuna tuning başarısız oldu, default modele dönülüyor: {e}")
+        logger.info(f"[automl] Optuna tuning başarısız oldu, default modele dönülüyor: {e}")
         
     return None
 
 def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, strong_regularization: bool = False) -> Any:
     """Tunes the selected regression model using Optuna."""
     reg_msg = " (STRONG REGULARIZATION)" if strong_regularization else ""
-    print(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor{reg_msg} (15 sn limiti)...")
+    logger.info(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor{reg_msg} (15 sn limiti)...")
     
     cv = KFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
 
@@ -292,7 +343,7 @@ def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.n
     try:
         study.optimize(objective, n_trials=20, timeout=15)
         best_params = study.best_params
-        print(f"[automl] Optuna tamamlandı. En iyi parametreler: {best_params}")
+        logger.info(f"[automl] Optuna tamamlandı. En iyi parametreler: {best_params}")
         
         if model_name == "random_forest":
             return RandomForestRegressor(**best_params, random_state=settings.RANDOM_SEED, n_jobs=-1)
@@ -307,7 +358,7 @@ def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.n
             from lightgbm import LGBMRegressor
             return LGBMRegressor(**best_params, random_state=settings.RANDOM_SEED, verbose=-1, n_jobs=-1)
     except Exception as e:
-        print(f"[automl] Optuna tuning başarısız oldu, default modele dönülüyor: {e}")
+        logger.info(f"[automl] Optuna tuning başarısız oldu, default modele dönülüyor: {e}")
         
     return None
 
@@ -393,10 +444,95 @@ def _get_classification_models_balanced(class_weights: dict) -> dict:
         )
     except ImportError:
         pass
- 
+
+    try:
+        from catboost import CatBoostClassifier
+        models["catboost"] = CatBoostClassifier(
+            iterations=300, random_state=RANDOM_STATE, verbose=0,
+            allow_writing_files=False, auto_class_weights="Balanced",
+        )
+    except ImportError:
+        pass
+
     return models
  
  
+def _build_stacking_candidate(models, results, X_train, y_train, scoring, is_imbalanced):
+    """En iyi 2-3 modeli StackingClassifier ile birleştirip CV skorunu döndürür.
+
+    Dönüş: (unfitted_stack | None, cv_score | None). Maliyeti sınırlamak için
+    değerlendirme 3-fold yapılır. Imbalanced'da her base SMOTE pipeline'ına
+    sarılır (leakage-free); GradientBoosting SMOTE pipeline desteklemediği için
+    o durumda stack base'lerinden çıkarılır.
+    """
+    from sklearn.base import clone
+    from sklearn.ensemble import StackingClassifier
+
+    ranked = sorted(results, key=lambda k: results[k]["score"], reverse=True)
+    base_names = []
+    for n in ranked:
+        if is_imbalanced and n == "gradient_boosting":
+            continue
+        base_names.append(n)
+        if len(base_names) >= 3:
+            break
+    if len(base_names) < 2:
+        return None, None
+
+    estimators = []
+    for n in base_names:
+        m = clone(models[n])
+        if is_imbalanced:
+            m = _wrap_with_smote(m, y_train)
+        estimators.append((n, m))
+
+    stack = StackingClassifier(
+        estimators=estimators,
+        final_estimator=LogisticRegression(max_iter=1000, random_state=RANDOM_STATE),
+        stack_method="predict_proba",
+        cv=3,
+        n_jobs=-1,
+    )
+    eval_cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+    try:
+        scores = cross_val_score(stack, X_train, y_train, cv=eval_cv, scoring=scoring, n_jobs=-1)
+        logger.info(f"[automl] {'stacking_ensemble':25s} ROC-AUC: {scores.mean():.4f} "
+              f"(base: {', '.join(base_names)})")
+        return stack, float(scores.mean())
+    except Exception as e:
+        logger.info(f"[automl] Stacking ensemble değerlendirilemedi: {e}")
+        return None, None
+
+
+def _calibrated_fit(model, X_train, y_train, sample_weight, n_samples):
+    """Modeli CalibratedClassifierCV ile sarıp fit eder (olasılık kalibrasyonu).
+
+    method: yeterli veri varsa 'isotonic', az veride 'sigmoid'. Estimator klonlanır
+    (unfitted olmalı). Herhangi bir hatada kalibrasyonsuz fit'e güvenle düşer.
+    Dönüş: (fitted_model, calibration_applied: bool).
+    """
+    from sklearn.base import clone
+    from sklearn.calibration import CalibratedClassifierCV
+
+    method = "isotonic" if n_samples >= 1000 else "sigmoid"
+    try:
+        cal = CalibratedClassifierCV(clone(model), method=method, cv=3)
+        if sample_weight is not None:
+            cal.fit(X_train, y_train, sample_weight=sample_weight)
+        else:
+            cal.fit(X_train, y_train)
+        logger.info(f"[automl] Olasılık kalibrasyonu uygulandı (method={method}, cv=3)")
+        return cal, True
+    except Exception as e:
+        logger.info(f"[automl] Kalibrasyon başarısız ({e}); kalibrasyonsuz fit'e dönülüyor")
+        m = clone(model)
+        if sample_weight is not None:
+            m.fit(X_train, y_train, sample_weight=sample_weight)
+        else:
+            m.fit(X_train, y_train)
+        return m, False
+
+
 def _run_classification(
     X_train: pd.DataFrame, y_train: np.ndarray,
     X_test: pd.DataFrame, y_test: np.ndarray,
@@ -418,8 +554,8 @@ def _run_classification(
     is_imbalanced   = minority_ratio < 0.3
  
     if is_imbalanced:
-        print(f"[automl] Dengesiz sınıf tespit edildi: {dict(zip(classes.tolist(), counts.tolist()))}")
-        print(f"[automl] Minority ratio: {minority_ratio:.3f} → SMOTE pipeline (fold-içi, leakage-free)")
+        logger.info(f"[automl] Dengesiz sınıf tespit edildi: {dict(zip(classes.tolist(), counts.tolist()))}")
+        logger.info(f"[automl] Minority ratio: {minority_ratio:.3f} → SMOTE pipeline (fold-içi, leakage-free)")
 
     # Class weights hesapla
     class_weights = _get_class_weights(y_train)
@@ -431,11 +567,11 @@ def _run_classification(
         models = _get_classification_models()
         
     if top_models:
-        print(f"[automl] Sadece Top Modeller denenecek: {top_models}")
+        logger.info(f"[automl] Sadece Top Modeller denenecek: {top_models}")
         models = {k: v for k, v in models.items() if k in top_models}
         
         if not models:
-            print("[automl] Top modeller bulunamadı! Liste fail-safe olarak sıfırlanıyor.")
+            logger.error("[automl] Top modeller bulunamadı! Liste fail-safe olarak sıfırlanıyor.")
             models = _get_classification_models_balanced(class_weights) if is_imbalanced else _get_classification_models()
  
     cv      = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
@@ -473,31 +609,60 @@ def _run_classification(
 
             elapsed = time.time() - start
             results[name] = {"score": scores_mean, "std": scores_std, "time": elapsed}
-            print(f"[automl] {name:25s} ROC-AUC: {scores_mean:.4f} ± {scores_std:.4f} ({elapsed:.1f}s)")
+            logger.info(f"[automl] {name:25s} ROC-AUC: {scores_mean:.4f} ± {scores_std:.4f} ({elapsed:.1f}s)")
 
         except Exception as e:
-            print(f"[automl] {name:25s} HATA: {e}")
+            logger.error(f"[automl] {name:25s} HATA: {e}")
  
     if not results:
         raise ValueError("Hiçbir model çalışmadı.")
  
+    best_name_single = max(results, key=lambda k: results[k]["score"])
+    logger.info(f"\n[automl] Baseline en iyi (tek model): {best_name_single} "
+          f"(ROC-AUC: {results[best_name_single]['score']:.4f})")
+
+    # ── Stacking ensemble adayı (top 2-3 model) ──
+    ensemble_model, ensemble_score = _build_stacking_candidate(
+        models, results, X_train, y_train, scoring, is_imbalanced
+    )
+    if ensemble_score is not None:
+        results["stacking_ensemble"] = {"score": ensemble_score, "std": 0.0, "time": 0.0}
+
+    # ── Seçim: ensemble tek modeli geçti mi? ──
     best_name = max(results, key=lambda k: results[k]["score"])
-    print(f"\n[automl] Baseline en iyi: {best_name} (ROC-AUC: {results[best_name]['score']:.4f})")
- 
-    # Optuna tuning — temiz X_train/y_train alır, SMOTE pipeline içinde otomatik uygulanır
-    tuned_model = _tune_model_classification(best_name, X_train, y_train, is_binary, strong_regularization, is_imbalanced)
-    best_model  = tuned_model if tuned_model is not None else models[best_name]
+    use_ensemble = best_name == "stacking_ensemble" and ensemble_model is not None
 
-    # Tuned modelı da SMOTE pipeline ile sar: final fit de leakage-free
-    if is_imbalanced and best_name != "gradient_boosting":
-        best_model = _wrap_with_smote(best_model, y_train)
-
-    # Final training
-    if best_name == "gradient_boosting" and is_imbalanced:
-        sw_final = compute_sample_weight("balanced", y_train)
-        best_model.fit(X_train, y_train, sample_weight=sw_final)
+    if use_ensemble:
+        logger.info(f"[automl] Ensemble seçildi (ROC-AUC: {ensemble_score:.4f} > "
+              f"tek model {results[best_name_single]['score']:.4f})")
+        selected_model = ensemble_model          # unfitted; SMOTE base'lerin içinde
+        gb_imbalanced_path = False
     else:
-        best_model.fit(X_train, y_train)
+        best_name = best_name_single
+        # Optuna tuning — temiz X_train/y_train alır, SMOTE pipeline içinde otomatik uygulanır
+        tuned_model = _tune_model_classification(best_name, X_train, y_train, is_binary, strong_regularization, is_imbalanced)
+        selected_model = tuned_model if tuned_model is not None else models[best_name]
+        # Tuned modelı da SMOTE pipeline ile sar: final fit de leakage-free
+        if is_imbalanced and best_name != "gradient_boosting":
+            selected_model = _wrap_with_smote(selected_model, y_train)
+        gb_imbalanced_path = best_name == "gradient_boosting" and is_imbalanced
+
+    # ── Final training (+ opsiyonel olasılık kalibrasyonu) ──
+    # GradientBoosting+imbalanced sample_weight ile eğitilir; diğerlerinde SMOTE
+    # pipeline veya class_weight zaten dengeyi sağlar.
+    sample_weight = compute_sample_weight("balanced", y_train) if gb_imbalanced_path else None
+    # cv=3 kalibrasyon için her sınıfta yeterli örnek olmalı.
+    can_calibrate = is_binary and int(counts.min()) >= 6
+    if can_calibrate:
+        best_model, calibration_applied = _calibrated_fit(
+            selected_model, X_train, y_train, sample_weight, n_samples=len(y_train)
+        )
+    else:
+        if sample_weight is not None:
+            selected_model.fit(X_train, y_train, sample_weight=sample_weight)
+        else:
+            selected_model.fit(X_train, y_train)
+        best_model, calibration_applied = selected_model, False
     
     y_prob = None
     try:
@@ -517,9 +682,9 @@ def _run_classification(
             optimal_threshold = float(pr_thresholds[best_f1_idx]) if best_f1_idx < len(pr_thresholds) else 0.5
 
             y_pred = (y_prob[:, 1] >= optimal_threshold).astype(int)
-            print(f"[automl] Optimal threshold (F1-max): {optimal_threshold:.4f}")
+            logger.info(f"[automl] Optimal threshold (F1-max): {optimal_threshold:.4f}")
     except Exception as e:
-        print(f"[automl] Threshold hesaplama hatası: {e}")
+        logger.error(f"[automl] Threshold hesaplama hatası: {e}")
 
     # Metrics
     metrics: dict[str, Any] = {
@@ -535,6 +700,8 @@ def _run_classification(
         "minority_ratio":      round(float(minority_ratio), 4),
         "smote_applied":       is_imbalanced,
         "optimal_threshold":   round(optimal_threshold, 4),
+        "calibration_applied": calibration_applied,
+        "ensemble_used":       use_ensemble,
     }
  
     if y_prob is not None:
@@ -569,10 +736,10 @@ def _handle_skewed_target(y: np.ndarray) -> tuple[np.ndarray, bool]:
         sk   = float(np.mean(((y - mean) / (std + 1e-9)) ** 3)) if std > 0 else 0.0
  
     if abs(sk) > 1.0 and np.all(y >= 0):
-        print(f"[automl] Regression hedef skewed (skewness={sk:.2f}) → log1p transform uygulanıyor")
+        logger.info(f"[automl] Regression hedef skewed (skewness={sk:.2f}) → log1p transform uygulanıyor")
         return np.log1p(y), True
  
-    print(f"[automl] Regression hedef skewness={sk:.2f} — transform gerekmez")
+    logger.info(f"[automl] Regression hedef skewness={sk:.2f} — transform gerekmez")
     return y, False
  
  
@@ -595,10 +762,10 @@ def _run_regression(
     models  = _get_regression_models()
     
     if top_models:
-        print(f"[automl] Sadece Top Modeller denenecek: {top_models}")
+        logger.info(f"[automl] Sadece Top Modeller denenecek: {top_models}")
         models = {k: v for k, v in models.items() if k in top_models}
         if not models:
-            print("[automl] Top modeller bulunamadı! Liste fail-safe olarak sıfırlanıyor.")
+            logger.error("[automl] Top modeller bulunamadı! Liste fail-safe olarak sıfırlanıyor.")
             models = _get_regression_models()
             
     cv      = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
@@ -613,15 +780,15 @@ def _run_regression(
             )
             elapsed = time.time() - start
             results[name] = {"score": scores.mean(), "std": scores.std(), "time": elapsed}
-            print(f"[automl] {name:25s} R²: {scores.mean():.4f} ± {scores.std():.4f} ({elapsed:.1f}s)")
+            logger.info(f"[automl] {name:25s} R²: {scores.mean():.4f} ± {scores.std():.4f} ({elapsed:.1f}s)")
         except Exception as e:
-            print(f"[automl] {name:25s} HATA: {e}")
+            logger.error(f"[automl] {name:25s} HATA: {e}")
  
     if not results:
         raise ValueError("Hiçbir regression modeli çalışmadı.")
  
     best_name = max(results, key=lambda k: results[k]["score"])
-    print(f"\n[automl] Baseline en iyi: {best_name} (R²: {results[best_name]['score']:.4f})")
+    logger.info(f"\n[automl] Baseline en iyi: {best_name} (R²: {results[best_name]['score']:.4f})")
  
     # Optuna tuning
     tuned_model = _tune_model_regression(best_name, X_train, y_train_transformed, strong_regularization)
@@ -636,7 +803,7 @@ def _run_regression(
     if log_applied:
         y_pred = np.expm1(y_pred_transformed)   
         y_test_orig = y_test                     
-        print(f"[automl] log1p inverse transform uygulandı (expm1)")
+        logger.info(f"[automl] log1p inverse transform uygulandı (expm1)")
     else:
         y_pred      = y_pred_transformed
         y_test_orig = y_test
@@ -678,7 +845,7 @@ def _run_clustering(
     results: dict[str, dict[str, Any]] = {}
 
     # KMeans — k=2..8
-    print("[automl] KMeans deniyor (k=2..8)...")
+    logger.info("[automl] KMeans deniyor (k=2..8)...")
     best_k = 2
     best_kmeans_score = -1
 
@@ -692,7 +859,7 @@ def _run_clustering(
             if sil > best_kmeans_score:
                 best_kmeans_score = sil
                 best_k = k
-            print(f"[automl]   k={k}: silhouette={sil:.4f}")
+            logger.info(f"[automl]   k={k}: silhouette={sil:.4f}")
         except Exception:
             continue
 
@@ -705,10 +872,10 @@ def _run_clustering(
         "n_clusters": best_k,
         "params": f"k={best_k}",
     }
-    print(f"[automl] KMeans best: k={best_k}, silhouette={best_kmeans_score:.4f}")
+    logger.info(f"[automl] KMeans best: k={best_k}, silhouette={best_kmeans_score:.4f}")
 
     # DBSCAN
-    print("[automl] DBSCAN deniyor...")
+    logger.info("[automl] DBSCAN deniyor...")
     try:
         db = DBSCAN(eps=0.5, min_samples=5, n_jobs=-1)
         db_labels = db.fit_predict(X_all)
@@ -728,9 +895,9 @@ def _run_clustering(
             "n_clusters": n_clusters_db,
             "params": f"eps=0.5, min_samples=5, noise={noise_pct}%",
         }
-        print(f"[automl] DBSCAN: clusters={n_clusters_db}, silhouette={db_sil:.4f}, noise={noise_pct}%")
+        logger.info(f"[automl] DBSCAN: clusters={n_clusters_db}, silhouette={db_sil:.4f}, noise={noise_pct}%")
     except Exception as e:
-        print(f"[automl] DBSCAN HATA: {e}")
+        logger.error(f"[automl] DBSCAN HATA: {e}")
 
     # Choose the best algorithm
     best_algo = max(results, key=lambda k: results[k]["silhouette"])
@@ -738,7 +905,7 @@ def _run_clustering(
     best_model = best["model"]
     best_labels = best["labels"]
 
-    print(f"\n[automl] En iyi clustering: {best_algo} (silhouette={best['silhouette']:.4f})")
+    logger.info(f"\n[automl] En iyi clustering: {best_algo} (silhouette={best['silhouette']:.4f})")
 
     # Cluster statistics
     cluster_stats: dict[str, dict[str, Any]] = {}
@@ -806,7 +973,7 @@ def _run_anomaly_detection(
     best_score = -np.inf
     results: dict[float, dict[str, Any]] = {}
 
-    print("[automl] IsolationForest — contamination taraması...")
+    logger.info("[automl] IsolationForest — contamination taraması...")
     for cont in contaminations:
         try:
             iso = IsolationForest(
@@ -835,19 +1002,19 @@ def _run_anomaly_detection(
                 "anomaly_pct": round(float(n_anomalies / len(labels) * 100), 2),
                 "silhouette": sil,
             }
-            print(f"[automl]   contamination={cont}: anomalies={n_anomalies} (%{results[cont]['anomaly_pct']})")
+            logger.info(f"[automl]   contamination={cont}: anomalies={n_anomalies} (%{results[cont]['anomaly_pct']})")
 
             if sil > best_score:
                 best_score = sil
                 best_contamination = cont
         except Exception as e:
-            print(f"[automl]   contamination={cont}: HATA {e}")
+            logger.error(f"[automl]   contamination={cont}: HATA {e}")
 
     best = results.get(best_contamination, list(results.values())[0])
     best_model = best["model"]
     best_labels = best["labels"]
 
-    print(f"\n[automl] En iyi contamination: {best_contamination} "
+    logger.info(f"\n[automl] En iyi contamination: {best_contamination} "
           f"({best['n_anomalies']} anomalies, %{best['anomaly_pct']})")
 
     # Anomaly scores (decision function)
@@ -927,7 +1094,7 @@ def train_model(state: AgentState) -> dict:
         try:
             y_train.astype(float)
         except ValueError:
-            print("[automl] Uyarı: y değişkeni string içeriyor, intent 'classification' olarak değiştirildi.")
+            logger.warning("[automl] Uyarı: y değişkeni string içeriyor, intent 'classification' olarak değiştirildi.")
             intent_norm = "classification"
 
     if intent_norm == "classification" or (intent_norm not in ("regression", "clustering", "anomaly_detection")):
@@ -936,10 +1103,10 @@ def train_model(state: AgentState) -> dict:
         known_classes = set(le.classes_)
         y_test = np.array([le.transform([val])[0] if val in known_classes else -1 for val in y_test])  # type: ignore
 
-    print(f"\n[automl] Başlıyor:")
-    print(f"  X_train : {X_train.shape}")
-    print(f"  X_test  : {X_test.shape}")
-    print(f"  Intent  : {intent_norm}")
+    logger.info(f"\n[automl] Başlıyor:")
+    logger.info(f"  X_train : {X_train.shape}")
+    logger.info(f"  X_test  : {X_test.shape}")
+    logger.info(f"  Intent  : {intent_norm}")
 
     # Task routing   
     top_models = state.get("top_models", [])
@@ -947,7 +1114,7 @@ def train_model(state: AgentState) -> dict:
     strong_regularization = any("Strong Regularization" in f or "Overfitting" in f for f in critic_feedback)
     
     if strong_regularization:
-        print("[automl] Critic Node'dan Strong Regularization (Finetuning) sinyali alındı!")
+        logger.info("[automl] Critic Node'dan Strong Regularization (Finetuning) sinyali alındı!")
 
     if intent_norm == "classification":
         model_name, model, metrics = _run_classification(
@@ -974,18 +1141,18 @@ def train_model(state: AgentState) -> dict:
         model_name, model, metrics = _run_classification(X_train, y_train, X_test, y_test, feature_names)  # type: ignore
 
     # Print results   
-    print(f"\n[automl] Sonuçlar ({model_name}):")
+    logger.info(f"\n[automl] Sonuçlar ({model_name}):")
     for k, v in metrics.items():
         if k not in ("feature_importance", "all_model_scores", "all_algorithm_scores",
                      "cluster_distribution", "contamination_scan", "train_labels", "test_labels",
                      "per_class_report"):
-            print(f"  {k}: {v}")
+            logger.info(f"  {k}: {v}")
 
     fi = metrics.get("feature_importance", {})
     if fi:
-        print(f"\n[automl] Top 5 feature:")
+        logger.info(f"\n[automl] Top 5 feature:")
         for feat, imp in list(fi.items())[:5]:
-            print(f"  {feat}: {imp:.4f}")
+            logger.info(f"  {feat}: {imp:.4f}")
 
     # Update top_models if first run
     if intent in ("classification", "regression") and not top_models:
@@ -994,7 +1161,7 @@ def train_model(state: AgentState) -> dict:
             # Sort models by score descending and take top 2
             sorted_models = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
             top_models = [m[0] for m in sorted_models[:2]]
-            print(f"[automl] Top 2 model seçildi ve kaydedildi: {top_models}")
+            logger.info(f"[automl] Top 2 model seçildi ve kaydedildi: {top_models}")
 
     # Save model to disk to avoid LangGraph serialization errors
     import joblib
@@ -1005,7 +1172,7 @@ def train_model(state: AgentState) -> dict:
     try:
         joblib.dump(model, model_path)
     except Exception as e:
-        print(f"[automl] UYARI: Model diske kaydedilemedi: {e}")
+        logger.warning(f"[automl] UYARI: Model diske kaydedilemedi: {e}")
         model_path = None
 
     return {

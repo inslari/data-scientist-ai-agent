@@ -50,6 +50,9 @@ from sklearn.calibration import calibration_curve
 from src.services.leakage_detector import detect_target_lock
 from ..state import AgentState
 from ..history_tracker import log_experiment
+from src.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 warnings.filterwarnings("ignore")
 
@@ -249,13 +252,13 @@ def _evaluate_classification(
         target_lock_concerns = detect_target_lock(X_test, y_test, feature_importance=fi)
         if target_lock_concerns:
             evaluation["target_lock_leakage"] = target_lock_concerns
-            print(f"[evaluation] Target-lock leakage suphesi: "
+            logger.info(f"[evaluation] Target-lock leakage suphesi: "
                   f"{len(target_lock_concerns)} feature")
             for c in target_lock_concerns:
-                print(f"  - {c['feature']} (imp={c['importance']}): {c['reason']}")
+                logger.info(f"  - {c['feature']} (imp={c['importance']}): {c['reason']}")
 
     # Bootstrap confidence intervals
-    print("Bootstrap CI hesaplanıyor...")
+    logger.info("Bootstrap CI hesaplanıyor...")
     evaluation["confidence_intervals"] = _bootstrap_ci_classification(
         model, X_test, y_test, is_binary, n_iterations=300
     )
@@ -267,7 +270,7 @@ def _evaluate_classification(
     )
 
     # SHAP values
-    print("SHAP değerleri hesaplanıyor...")
+    logger.info("SHAP değerleri hesaplanıyor...")
     shap_result = _compute_shap_values(model, X_test, feature_names)
     if shap_result:
         evaluation["shap_importance"] = shap_result
@@ -349,19 +352,19 @@ def _evaluate_regression(
         )
         if target_lock_concerns:
             evaluation["target_lock_leakage"] = target_lock_concerns
-            print(f"[evaluation] Target-lock leakage suphesi: "
+            logger.info(f"[evaluation] Target-lock leakage suphesi: "
                   f"{len(target_lock_concerns)} feature")
             for c in target_lock_concerns:
-                print(f"  - {c['feature']} (imp={c['importance']}): {c['reason']}")
+                logger.info(f"  - {c['feature']} (imp={c['importance']}): {c['reason']}")
 
     # Bootstrap confidence intervals
-    print("Bootstrap CI hesaplanıyor...")
+    logger.info("Bootstrap CI hesaplanıyor...")
     evaluation["confidence_intervals"] = _bootstrap_ci_regression(
         model, X_test, y_test, n_iterations=300
     )
 
     # SHAP values
-    print("SHAP değerleri hesaplanıyor...")
+    logger.info("SHAP değerleri hesaplanıyor...")
     shap_result = _compute_shap_values(model, X_test, feature_names)
     if shap_result:
         evaluation["shap_importance"] = shap_result
@@ -560,9 +563,9 @@ def _summarize_feature_importance(fi: dict) -> dict:
             })
 
     if leakage_suspects:
-        print(f"\n[evaluation] LEAKAGE SUPHESI (importance-based):")
+        logger.info(f"\n[evaluation] LEAKAGE SUPHESI (importance-based):")
         for s in leakage_suspects:
-            print(f"  - {s['column']}: {s['reason']}")
+            logger.info(f"  - {s['column']}: {s['reason']}")
 
     return {
         "top5_features": top5,
@@ -1055,7 +1058,7 @@ def evaluate_model(state: AgentState) -> dict:
             try:
                 model = joblib.load(model_artifact)
             except Exception as e:
-                print(f"[evaluator] Model diskten yuklenemedi: {e}")
+                logger.info(f"[evaluator] Model diskten yuklenemedi: {e}")
     else:
         model = model_artifact
     X_train_raw = state.get("X_train", [])
@@ -1089,10 +1092,10 @@ def evaluate_model(state: AgentState) -> dict:
     y_test = np.array(y_test_raw)
     feature_names = X_train.columns.tolist()
 
-    print(f"\n[evaluation] Başlıyor...")
-    print(f"  Model    : {state.get('model_name', 'unknown')}")
-    print(f"  X_test   : {X_test.shape}")
-    print(f"  Intent   : {intent}")
+    logger.info(f"\n[evaluation] Başlıyor...")
+    logger.info(f"  Model    : {state.get('model_name', 'unknown')}")
+    logger.info(f"  X_test   : {X_test.shape}")
+    logger.info(f"  Intent   : {intent}")
 
     # Evaluation regarding task type
     if intent == "regression":
@@ -1262,73 +1265,73 @@ def evaluate_model(state: AgentState) -> dict:
     overfitting = evaluation_report.get("overfitting", {})
     test_m = evaluation_report.get("test_metrics", {})
 
-    print(f"\n[evaluation] Test Metrikleri:")
+    logger.info(f"\n[evaluation] Test Metrikleri:")
     for k, v in test_m.items():
-        print(f"  {k}: {v}")
+        logger.info(f"  {k}: {v}")
 
     ci = evaluation_report.get("confidence_intervals", {})
     if ci:
-        print(f"\n[evaluation] Bootstrap CI (%95):")
+        logger.info(f"\n[evaluation] Bootstrap CI (%95):")
         for metric, vals in ci.items():
-            print(f"  {metric}: {vals['mean']} [{vals['lower']} — {vals['upper']}] (std: {vals['std']})")
+            logger.info(f"  {metric}: {vals['mean']} [{vals['lower']} — {vals['upper']}] (std: {vals['std']})")
 
-    print(f"\n[evaluation] Overfitting Analizi:")
-    print(f"  Train: {overfitting.get('train_score')} | Test: {overfitting.get('test_score')}")
-    print(f"  Fark : {overfitting.get('gap')} | Durum: {overfitting.get('status')}")
-    print(f"  {overfitting.get('description')}")
+    logger.info(f"\n[evaluation] Overfitting Analizi:")
+    logger.info(f"  Train: {overfitting.get('train_score')} | Test: {overfitting.get('test_score')}")
+    logger.info(f"  Fark : {overfitting.get('gap')} | Durum: {overfitting.get('status')}")
+    logger.info(f"  {overfitting.get('description')}")
 
     calibration = evaluation_report.get("calibration", {})
     if calibration:
-        print(f"\n[evaluation] Kalibrasyon:")
-        print(f"  Brier Score: {calibration.get('brier_score')}")
-        print(f"  İyi kalibre: {calibration.get('is_well_calibrated')}")
+        logger.info(f"\n[evaluation] Kalibrasyon:")
+        logger.info(f"  Brier Score: {calibration.get('brier_score')}")
+        logger.info(f"  İyi kalibre: {calibration.get('is_well_calibrated')}")
 
     err_analysis = evaluation_report.get("error_analysis", {})
     if err_analysis:
-        print(f"\n[evaluation] Error Analysis:")
-        print(f"  Hatalı tahmin: {err_analysis.get('n_errors')}/{err_analysis.get('n_total')} ({err_analysis.get('error_rate')*100:.2f}%)")
+        logger.info(f"\n[evaluation] Error Analysis:")
+        logger.error(f"  Hatalı tahmin: {err_analysis.get('n_errors')}/{err_analysis.get('n_total')} ({err_analysis.get('error_rate')*100:.2f}%)")
         conf = err_analysis.get("confidence_analysis", {})
         if conf:
-            print(f"  Yüksek güven hatası: {conf.get('high_confidence_errors')} adet ({conf.get('high_confidence_errors_pct')}%)")
-            print(f"  Hata güveni ort.: {conf.get('mean_error_confidence')} | Doğru güveni ort.: {conf.get('mean_correct_confidence')}")
+            logger.error(f"  Yüksek güven hatası: {conf.get('high_confidence_errors')} adet ({conf.get('high_confidence_errors_pct')}%)")
+            logger.error(f"  Hata güveni ort.: {conf.get('mean_error_confidence')} | Doğru güveni ort.: {conf.get('mean_correct_confidence')}")
         feat_diff = err_analysis.get("feature_distribution_diff", {})
         if feat_diff:
-            print(f"  En farklı feature'lar (Cohen's d effect size):")
+            logger.info(f"  En farklı feature'lar (Cohen's d effect size):")
             for feat, info in list(feat_diff.items())[:5]:
-                print(f"    {feat}: d={info['cohens_d']} ({info['effect_magnitude']}) | hata={info['mean_in_errors']} | doğru={info['mean_in_correct']}")
+                logger.error(f"    {feat}: d={info['cohens_d']} ({info['effect_magnitude']}) | hata={info['mean_in_errors']} | doğru={info['mean_in_correct']}")
 
     shap_info = evaluation_report.get("shap_importance", {})
     if shap_info:
-        print(f"\n[evaluation] SHAP Top 5:")
+        logger.info(f"\n[evaluation] SHAP Top 5:")
         for feat, pct in shap_info.get("top5_shap_features", {}).items():
-            print(f"  {feat}: %{pct}")
+            logger.info(f"  {feat}: %{pct}")
     else:
-        print(f"\n[evaluation] SHAP: shap paketi bulunamadı, atlandı.")
+        logger.info(f"\n[evaluation] SHAP: shap paketi bulunamadı, atlandı.")
 
     opt_thresh = evaluation_report.get("optimal_threshold")
     if opt_thresh is not None:
-        print(f"\n[evaluation] Optimal Threshold (Youden's J): {opt_thresh}")
+        logger.info(f"\n[evaluation] Optimal Threshold (Youden's J): {opt_thresh}")
 
     fi_summary = evaluation_report.get("feature_importance_summary", {})
     if fi_summary:
-        print(f"\n[evaluation] Feature Importance Özeti:")
-        print(f"  Top 5 toplam katkı: %{fi_summary.get('top5_total_contribution_pct')}")
+        logger.info(f"\n[evaluation] Feature Importance Özeti:")
+        logger.info(f"  Top 5 toplam katkı: %{fi_summary.get('top5_total_contribution_pct')}")
         for feat, pct in fi_summary.get("top5_features", {}).items():
-            print(f"    {feat}: %{pct}")
+            logger.info(f"    {feat}: %{pct}")
         insig_count = fi_summary.get("insignificant_features_count", 0)
         if insig_count > 0:
-            print(f"  Önemsiz feature sayısı (<%%1): {insig_count}")
+            logger.info(f"  Önemsiz feature sayısı (<%%1): {insig_count}")
 
-    print(f"\n[evaluation] Güvenilirlik Skoru: {reliability.get('score')}/100 (Grade: {reliability.get('grade')})")
+    logger.info(f"\n[evaluation] Güvenilirlik Skoru: {reliability.get('score')}/100 (Grade: {reliability.get('grade')})")
     for factor in reliability.get("factors", []):
-        print(f"  ✓ {factor}")
+        logger.info(f"  ✓ {factor}")
         
     bias = evaluation_report.get("bias_analysis", {})
     if bias:
-        print("\n[evaluation] Bias Tespiti (Demografik):")
+        logger.info("\n[evaluation] Bias Tespiti (Demografik):")
         for base_col, cols in bias.items():
             for c, info in cols.items():
-                print(f"  {c}: Diff={info.get('accuracy_diff', info.get('rmse_diff'))} | Disparate Impact={info.get('disparate_impact', 'N/A')}")
+                logger.info(f"  {c}: Diff={info.get('accuracy_diff', info.get('rmse_diff'))} | Disparate Impact={info.get('disparate_impact', 'N/A')}")
 
     # Log to Experiment Tracker
     try:
@@ -1342,9 +1345,9 @@ def evaluate_model(state: AgentState) -> dict:
             target_name=feature_report.get("target_name", "unknown"),
             dataset_shape=f"Train: {X_train.shape}, Test: {X_test.shape}"
         )
-        print("[evaluation] Deney başarıyla veritabanına loglandı.")
+        logger.info("[evaluation] Deney başarıyla veritabanına loglandı.")
     except Exception as e:
-        print(f"[evaluation] Deney loglanırken hata: {e}")
+        logger.error(f"[evaluation] Deney loglanırken hata: {e}")
 
     return {
         **state,
