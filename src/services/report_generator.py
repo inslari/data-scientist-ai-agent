@@ -36,6 +36,9 @@ from src.core.prompt_loader import load_prompt
 from src.domains import get_active_pack
 from src.domains.base import MerchantContext
 from src.domains.schemas import MerchantAnalysis
+from src.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 # LLM Setup
@@ -537,12 +540,12 @@ def generate_report(state: AgentState) -> dict:
         report       : Markdown formatında final rapor
         current_step : "report_node"
     """
-    print("\n[report] Başlıyor...")
+    logger.info("\n[report] Başlıyor...")
 
     # Check for pipeline errors first
     if state.get("error"):
         error_msg = state.get("error")
-        print(f"[report] UYARI: Pipeline hatası algılandı: {error_msg}")
+        logger.warning(f"[report] UYARI: Pipeline hatası algılandı: {error_msg}")
         return {
             **state,
             "report": f"# ❌ Analiz Tamamlanamadı\n\nVeri işleme sürecinde kritik bir hata meydana geldi ve analiz durduruldu:\n\n**Hata Nedeni:** {error_msg}\n\n*Lütfen daha büyük veya daha tutarlı bir veri seti ile tekrar deneyin.*",
@@ -553,7 +556,7 @@ def generate_report(state: AgentState) -> dict:
     ev = state.get("evaluation_report", {})
     if not ev:
         error_msg = "Evaluation raporu bulunamadı, report_node atlanıyor."
-        print(f"[report] UYARI: {error_msg}")
+        logger.warning(f"[report] UYARI: {error_msg}")
         return {
             **state,
             "report": f"# ❌ Rapor Üretilemedi\n\n{error_msg}\n\nBu durum genellikle modelin kurulamamasından kaynaklanır.",
@@ -562,7 +565,7 @@ def generate_report(state: AgentState) -> dict:
 
     # build context
     context = _build_context(state)
-    print(f"[report] Context hazırlandı ({len(context)} karakter)")
+    logger.info(f"[report] Context hazırlandı ({len(context)} karakter)")
 
     # select system prompt based on intent
     intent = state.get("intent", "classification")
@@ -585,9 +588,9 @@ def generate_report(state: AgentState) -> dict:
             if lens:
                 system_prompt = system_prompt + "\n\n" + lens.system_suffix
                 src = "agentic" if analysis else "statik"
-                print(f"[report] Domain pack '{pack.name}' yorum merceği eklendi ({src}).")
+                logger.info(f"[report] Domain pack '{pack.name}' yorum merceği eklendi ({src}).")
     except Exception as e:  # pragma: no cover - defensive
-        print(f"[report] Domain pack yorum merceği başarısız ({e}); atlanıyor.")
+        logger.info(f"[report] Domain pack yorum merceği başarısız ({e}); atlanıyor.")
 
     # llm
     llm = _get_llm()
@@ -601,7 +604,7 @@ def generate_report(state: AgentState) -> dict:
         f"{context}"
     )
 
-    print("[report] LLM'den rapor üretiliyor...")
+    logger.info("[report] LLM'den rapor üretiliyor...")
     try:
         response = llm.invoke([
             SystemMessage(content=system_prompt),
@@ -622,11 +625,11 @@ def generate_report(state: AgentState) -> dict:
         )
 
     except Exception as e:
-        print(f"[report] LLM hatası: {e}")
+        logger.error(f"[report] LLM hatası: {e}")
         # create fallback report if llm fails 
         report_text = _generate_fallback_report(state)
 
-    print(f"[report] Rapor tamamlandı ({len(report_text)} karakter)")
+    logger.info(f"[report] Rapor tamamlandı ({len(report_text)} karakter)")
 
     return {
         **state,
