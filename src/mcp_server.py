@@ -14,6 +14,9 @@ from mcp.server.fastmcp import FastMCP
 from sqlalchemy import text
 
 from src.core.db_provider import db_manager  # type: ignore[import-not-found]
+from src.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv(override=True)
 
@@ -172,13 +175,15 @@ def run_sql_query(query: str, db_name: str = "default") -> str:
 
 def start_mcp_server(transport: Literal["sse", "stdio", "streamable-http"] = "streamable-http", **kwargs) -> None:
     """Start the MCP server with the given transport."""
-    print(f"Starting MCP Server on http://{MCP_SERVER_HOST}:{MCP_SERVER_PORT}{MCP_SERVER_PATH}", flush=True)
+    logger.info(f"Starting MCP Server on http://{MCP_SERVER_HOST}:{MCP_SERVER_PORT}{MCP_SERVER_PATH}")
     db_names = list(db_manager.get_all_providers().keys())
-    print(f"Transport: {transport} | Databases: {', '.join(db_names)}", flush=True)
-    print("Press Ctrl+C to stop...", flush=True)
+    logger.info(f"Transport: {transport} | Databases: {', '.join(db_names)}")
+    logger.info("Press Ctrl+C to stop...")
     mcp.run(transport=transport, **kwargs)
 
 
 
 if __name__ == "__main__":
+    from src.core.logging_config import setup_logging
+    setup_logging(process="mcp")
     start_mcp_server(transport="streamable-http")

@@ -47,6 +47,9 @@ from fastapi.concurrency import run_in_threadpool
 from api.models.data_group import DataGroupModel
 from api.routes.mcp import _call_mcp_tool
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 async def get_data_group_schema_logic(group_id: int, db: Session, user_id: int):
     db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == user_id).first()
     if not db_group:
@@ -56,9 +59,9 @@ async def get_data_group_schema_logic(group_id: int, db: Session, user_id: int):
         if not db_group.mcp_config:
             raise HTTPException(status_code=400, detail="MCP config is missing for this data group")
         if db_group.mcp_config.schema_cache:
-            print("[MCP] schema_cache hit, skipping MCP call")
+            logger.warning("[MCP] schema_cache hit, skipping MCP call")
             return {"status": "success", "schema": db_group.mcp_config.schema_cache}
-        print(f"[MCP] schema_cache miss, calling MCP server for get_schema | type={db_group.mcp_config.type} url={getattr(db_group.mcp_config, 'url', None)}")
+        logger.info(f"[MCP] schema_cache miss, calling MCP server for get_schema | type={db_group.mcp_config.type} url={getattr(db_group.mcp_config, 'url', None)}")
         schema_text = await _call_mcp_tool(db_group.mcp_config, "get_schema")
         return {"status": "success", "schema": schema_text}
         

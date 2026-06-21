@@ -55,7 +55,8 @@ def route_after_execution(state: AgentState) -> str:
 def route_after_critic(state: AgentState) -> str:
     """
     split for critic node after
-      retry varsa -> next_retry_node (feature_plan_node veya automl_node)
+      retry varsa -> next_retry_node (critic_advisor yalnızca
+                     feature_plan_node veya automl_node döndürür)
       yoksa -> report_node
     """
     return state.get("next_retry_node", "report_node")
@@ -80,7 +81,7 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
                                                  ├─ [classification/regression/clustering]
                                                  │    → entity_resolution_node → leakage_detector_node → feature_plan_node
                                                  │         → feature_engineering_node → automl_node → evaluation_node → critic_node
-                                                 │              ├─ [retry] → leakage_detector_node / feature_plan_node / automl_node
+                                                 │              ├─ [retry] → feature_plan_node / automl_node
                                                  │              └─ [pass]  → report_node → END
                                                  └─ [eda/anomaly_detection/report]
                                                       → automl_node → evaluation_node → critic_node → report_node → END
@@ -113,15 +114,14 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
     graph.add_edge("db_context_node", "merchant_intelligence_node")
 
     # merchant_intelligence_node → sql_node or target_discovery_node
+    # Liste formu: route fonksiyonu doğrudan hedef node adını döndürür, böylece
+    # routing fonksiyonu ile kenar haritası arasında drift imkânsız (tek kaynak).
+    # manuel hedef → discovery bypass (planner_node)
     graph.add_conditional_edges(
         "merchant_intelligence_node",
         route_after_db_context,
-        {
-            "sql_node":              "sql_node",
-            "target_discovery_node": "target_discovery_node",
-            "planner_node":          "planner_node",            # manuel hedef → discovery bypass
-        },
-)
+        ["sql_node", "target_discovery_node", "planner_node"],
+    )
 
 
     # sql_node → END
@@ -133,12 +133,7 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
     graph.add_conditional_edges(
         "execution_node",
         route_after_execution,
-        {
-            "entity_resolution_node": "entity_resolution_node",
-            "analysis_node": "analysis_node",
-            "automl_node":       "automl_node",
-            "report_node":       "report_node",
-        },
+        ["entity_resolution_node", "analysis_node", "automl_node", "report_node"],
     )
     graph.add_edge("analysis_node", END)
 
@@ -153,11 +148,7 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
     graph.add_conditional_edges(
         "critic_node",
         route_after_critic,
-        {
-            "feature_plan_node": "feature_plan_node",
-            "automl_node": "automl_node",
-            "report_node": "report_node",
-        }
+        ["feature_plan_node", "automl_node", "report_node"],
     )
     
     graph.add_edge("target_discovery_node", "planner_node")

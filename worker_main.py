@@ -14,6 +14,7 @@ from api.models.data_group import DataGroupModel
 from api.models.user import UserModel
 from api.models.mcp import MCPConfigModel
 from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # table auto-created via create_all
+from api.models.log_entry import LogEntryModel  # app_logs table — DB logging hedefi
 from api.core.worker import job_worker_loop
 
 def recover_interrupted_jobs():
@@ -52,10 +53,14 @@ def recover_interrupted_jobs():
         db.close()
 
 def main():
+    from src.core.logging_config import setup_logging
+    # Worker'da console + DB logging açık (process="worker" etiketiyle app_logs'a yazar).
+    setup_logging(process="worker", db_logging=True)
+
     print("==============================================")
     print("   Data Scientist AI Agent - Worker Process   ")
     print("==============================================")
-    
+
     # Ensure tables exist
     Base.metadata.create_all(bind=engine)
     

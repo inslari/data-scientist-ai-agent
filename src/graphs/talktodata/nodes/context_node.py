@@ -10,15 +10,18 @@ from api.schemas.data_group import (
 
 from ..state import TTDState
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 async def ttd_db_context_node(state: TTDState, config: RunnableConfig) -> TTDState:
     """
     Schema + db_intelligence üretir.
     State'te zaten db_intelligence varsa (cache hit) atlar.
     """
-    print("\n[TTD] ttd_db_context_node başlıyor...")
+    logger.info("\n[TTD] ttd_db_context_node başlıyor...")
 
     if state.get("db_intelligence") and state.get("raw_schema"):
-        print("[TTD] db_context: cache hit, skipping LLM analysis")
+        logger.warning("[TTD] db_context: cache hit, skipping LLM analysis")
         return {**state, "current_step": "ttd_db_context_node"}  # type: ignore[return-value]
 
     cfg = config.get("configurable", {})
@@ -64,7 +67,7 @@ async def ttd_db_context_node(state: TTDState, config: RunnableConfig) -> TTDSta
     except Exception:
         db_model = engine.analyze_schema(schema_text=raw_schema, sample_data="Sample data omitted.")
 
-    print("[TTD] db_context: LLM analysis complete")
+    logger.info("[TTD] db_context: LLM analysis complete")
     return {
         **state,
         "raw_schema":      raw_schema,

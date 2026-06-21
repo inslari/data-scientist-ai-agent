@@ -8,6 +8,9 @@ from sqlalchemy.orm import Session
 
 from api.models.job import BackgroundJobModel
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 
 def enqueue_ttd_suggestions(db: Session, data_group_id: int) -> None:
     """
@@ -23,4 +26,4 @@ def enqueue_ttd_suggestions(db: Session, data_group_id: int) -> None:
         db.commit()
     except Exception as e:
         db.rollback()
-        print(f"[jobs] enqueue_ttd_suggestions başarısız (group {data_group_id}): {str(e)[:150]}")
+        logger.info(f"[jobs] enqueue_ttd_suggestions başarısız (group {data_group_id}): {str(e)[:150]}")

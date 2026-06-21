@@ -19,6 +19,9 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler, StandardScaler, TargetEncoder
+from src.core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 warnings.filterwarnings("ignore")
 
@@ -95,7 +98,7 @@ def _load_data(state: dict) -> pd.DataFrame:
     # No Parquet path fallback
     if not data_path or not Path(data_path).exists():
         if sql_results:
-            print(f"[feature_eng] UYARI: data_path yok, sql_results preview ({len(sql_results)} satır)")
+            logger.warning(f"[feature_eng] UYARI: data_path yok, sql_results preview ({len(sql_results)} satır)")
             return pd.DataFrame(sql_results)
         raise ValueError("Veri yok: data_path ve sql_results ikisi de boş.")
 
@@ -104,7 +107,7 @@ def _load_data(state: dict) -> pd.DataFrame:
     pq   = f"read_parquet('{data_path}')"
     res  = conn.execute(f"SELECT COUNT(*) FROM {pq}").fetchone()
     total = res[0] if res is not None else 0
-    print(f"[feature_eng] Parquet: {total:,} satir → '{data_path}'")
+    logger.info(f"[feature_eng] Parquet: {total:,} satir → '{data_path}'")
 
     # Target kolon suffix'li olabilir (multi-table join sonrası)
     cols_df       = conn.execute(f"SELECT * FROM {pq} LIMIT 0").df()
@@ -118,13 +121,13 @@ def _load_data(state: dict) -> pd.DataFrame:
             for col in actual_cols:
                 if col.startswith(target_col + "_") or col == target_col:
                     actual_target = col
-                    print(f"[feature_eng] Target kolon suffix'li bulundu: '{target_col}' → '{actual_target}'")
+                    logger.info(f"[feature_eng] Target kolon suffix'li bulundu: '{target_col}' → '{actual_target}'")
                     break
 
     # Small data: take all
     if total <= ML_SAMPLE_ROWS:
         df = conn.execute(f"SELECT * FROM {pq}").df()
-        print(f"[feature_eng] Tum veri yuklendi: {len(df):,} satır")
+        logger.info(f"[feature_eng] Tum veri yuklendi: {len(df):,} satır")
         conn.close()
         df = df.convert_dtypes(convert_integer=False)
         return df
@@ -145,7 +148,7 @@ def _load_data(state: dict) -> pd.DataFrame:
                 majority_count = dist[-1][1]
                 ratio = minority_count / max(majority_count, 1)
 
-                print(f"[feature_eng] Target dagilimi: "
+                logger.info(f"[feature_eng] Target dagilimi: "
                       f"minority({minority_class})={minority_count:,}, "
                       f"majority({majority_class})={majority_count:,}, "
                       f"ratio={ratio:.4f}")
@@ -167,7 +170,7 @@ def _load_data(state: dict) -> pd.DataFrame:
                     df = pd.concat([df_min, df_maj], ignore_index=True)
                     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
-                    print(f"[feature_eng] Imbalance-aware sampling: "
+                    logger.info(f"[feature_eng] Imbalance-aware sampling: "
                           f"minority={len(df_min):,} + majority={len(df_maj):,} = {len(df):,}")
                     conn.close()
                     df = df.convert_dtypes(convert_integer=False)
@@ -183,17 +186,17 @@ def _load_data(state: dict) -> pd.DataFrame:
                         ).df()
                         frames.append(df_cls)
                     df = pd.concat(frames, ignore_index=True)
-                    print(f"[feature_eng] Stratified sample: {len(df):,}/{total:,} satır")
+                    logger.info(f"[feature_eng] Stratified sample: {len(df):,}/{total:,} satır")
                     conn.close()
                     df = df.convert_dtypes(convert_integer=False)
                     return df
 
         except Exception as e:
-            print(f"[feature_eng] Akilli sampling hatasi: {e} → random fallback")
+            logger.error(f"[feature_eng] Akilli sampling hatasi: {e} → random fallback")
 
     # Fallback: random sample
     df = conn.execute(f"SELECT * FROM {pq} USING SAMPLE {ML_SAMPLE_ROWS}").df()
-    print(f"[feature_eng] Random sample: {len(df):,}/{total:,} satır "
+    logger.info(f"[feature_eng] Random sample: {len(df):,}/{total:,} satır "
           f"(target {'confirmed' if confirmed else 'unconfirmed'})")
     conn.close()
     df = df.convert_dtypes(convert_integer=False)
@@ -246,11 +249,11 @@ def _normalize_column_names(
 
     if drop_cols:
         df = df.drop(columns=drop_cols)
-        print(f"[feature_eng] Duplicate suffix kolonlar silindi: "
+        logger.info(f"[feature_eng] Duplicate suffix kolonlar silindi: "
               f"{drop_cols[:5]}{'...' if len(drop_cols) > 5 else ''}")
     if rename_map:
         df = df.rename(columns=rename_map)
-        print(f"[feature_eng] {len(rename_map)} kolon suffix temizlendi "
+        logger.info(f"[feature_eng] {len(rename_map)} kolon suffix temizlendi "
               f"(örnek: {list(rename_map.items())[:3]})")
 
     return df
@@ -261,7 +264,7 @@ def _clean_data(df: pd.DataFrame) -> pd.DataFrame:
     before = len(df)
     df = df.drop_duplicates()
     if before - len(df) > 0:
-        print(f"[feature_eng] {before-len(df)} duplicate temizlendi")
+        logger.info(f"[feature_eng] {before-len(df)} duplicate temizlendi")
 
     # String olarak gelen fiyat/sayı kolonlarını temizle (örn: '9.99$')
     for col in df.select_dtypes(include="object").columns:
@@ -274,7 +277,7 @@ def _clean_data(df: pd.DataFrame) -> pd.DataFrame:
             # Eğer sadece nokta kalmışsa NaN yap
             df[col] = df[col].replace('.', np.nan)
             df[col] = pd.to_numeric(df[col], errors='coerce')
-            print(f"[feature_eng] '{col}' kolonu metin bazli currency algilandi, numerik formata cevrildi.")
+            logger.info(f"[feature_eng] '{col}' kolonu metin bazli currency algilandi, numerik formata cevrildi.")
 
     for col in df.select_dtypes(include="number").columns:
         if df[col].isnull().any():
@@ -289,7 +292,7 @@ def _clean_data(df: pd.DataFrame) -> pd.DataFrame:
             if not mode.empty:
                 df[col] = df[col].fillna(mode[0])
 
-    print(f"[feature_eng] Temizlik sonrasi: {len(df):,} satır | null: {df.isnull().sum().sum()}")
+    logger.info(f"[feature_eng] Temizlik sonrasi: {len(df):,} satır | null: {df.isnull().sum().sum()}")
     return df
 
 
@@ -320,17 +323,17 @@ def _resolve_target(
                 numeric_y = pd.to_numeric(cleaned, errors='coerce')
                 if numeric_y.notna().mean() > 0.8:
                     y = numeric_y
-                    print(f"[feature_eng] Hedef '{target_name}' string→numeric cevrildi (para/sayi)")
+                    logger.info(f"[feature_eng] Hedef '{target_name}' string→numeric cevrildi (para/sayi)")
                 else:
                     y = pd.Categorical(y).codes
-                    print(f"[feature_eng] Hedef '{target_name}' kategorik → codes")
+                    logger.info(f"[feature_eng] Hedef '{target_name}' kategorik → codes")
             else:
                 y = pd.Categorical(y).codes
-                print(f"[feature_eng] Hedef '{target_name}' kategorik (unique < 20) → codes")
+                logger.info(f"[feature_eng] Hedef '{target_name}' kategorik (unique < 20) → codes")
 
         cols_drop = _find_related_target_cols(df, target_name)
         df = df.drop(columns=cols_drop, errors="ignore")
-        print(f"[feature_eng] Hedef: '{target_name}' | dtype: {y.dtype}")
+        logger.info(f"[feature_eng] Hedef: '{target_name}' | dtype: {y.dtype}")
         return df, pd.Series(y, name=target_name), target_name
 
     if is_derived and derivation_type == "time_based":
@@ -339,7 +342,7 @@ def _resolve_target(
     if is_derived and derivation_type == "threshold_based":
         return _derive_threshold_target(df, target)
 
-    print(f"[feature_eng] UYARI: '{target_name}' bulunamadi, aday araniyor...")
+    logger.warning(f"[feature_eng] UYARI: '{target_name}' bulunamadi, aday araniyor...")
     return _find_best_target_candidate(df, planned_target=target_name)
 
 
@@ -410,7 +413,7 @@ def _derive_time_based_target(
     group_by      = plan.get("aggregation",{}).get("group_by_column","")
 
     if date_col not in df.columns:
-        print(f"[feature_eng] UYARI: time_based date_column '{date_col}' yok, aday araniyor...")
+        logger.warning(f"[feature_eng] UYARI: time_based date_column '{date_col}' yok, aday araniyor...")
         return _find_best_target_candidate(df, planned_target=target_name)
 
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
@@ -428,7 +431,7 @@ def _derive_time_based_target(
 
     y = df[target_name].copy()
     df = df.drop(columns=[target_name, date_col], errors="ignore")
-    print(f"[feature_eng] Hedef: '{target_name}' (time_based) | {y.value_counts().to_dict()}")
+    logger.info(f"[feature_eng] Hedef: '{target_name}' (time_based) | {y.value_counts().to_dict()}")
     return df, y, target_name
 
 
@@ -439,11 +442,11 @@ def _derive_threshold_target(
     threshold_value = target.get("threshold_value",0.0)
     source_col      = target_name.replace("_binary","").replace("_label","")
     if source_col not in df.columns:
-        print(f"[feature_eng] UYARI: threshold source kolonu '{source_col}' yok, aday araniyor...")
+        logger.warning(f"[feature_eng] UYARI: threshold source kolonu '{source_col}' yok, aday araniyor...")
         return _find_best_target_candidate(df, planned_target=target_name)
     y = (df[source_col] > threshold_value).astype(int)
     df = df.drop(columns=[source_col], errors="ignore")
-    print(f"[feature_eng] Hedef: '{target_name}' (threshold={threshold_value}) | {y.value_counts().to_dict()}")
+    logger.info(f"[feature_eng] Hedef: '{target_name}' (threshold={threshold_value}) | {y.value_counts().to_dict()}")
     return df, pd.Series(y, name=target_name), target_name
 
 
@@ -452,7 +455,7 @@ def _find_best_target_candidate(df: pd.DataFrame, planned_target: str = "") -> t
         if df[col].nunique() == 2 and df[col].dtype in [np.int64, np.float64, int, float]:
             y = df[col].copy()
             df = df.drop(columns=[col])
-            print(f"[feature_eng] Fallback hedef: '{col}'")
+            logger.info(f"[feature_eng] Fallback hedef: '{col}'")
             return df, y, col
     # Tanılayıcı: planlanan hedef ile gerçekte yüklenen kolonları göster ki
     # uyumsuzluğun nedeni (SQL hedefi seçmedi / ad normalize oldu / vb.) anlaşılsın.
@@ -484,7 +487,7 @@ def _detect_frequency(parsed: pd.Series, group_key: "pd.Series | None" = None) -
     else:
         deltas = parsed.dropna().sort_values().diff().dropna()
     if len(deltas) == 0:
-        print("[feature_eng] timeseries: frekans icin yeterli tarih farki yok → varsayilan [1]")
+        logger.info("[feature_eng] timeseries: frekans icin yeterli tarih farki yok → varsayilan [1]")
         return "unknown", [1]
     days = deltas.median() / pd.Timedelta(days=1)
     if 0.5 <= days <= 1.5:
@@ -493,7 +496,7 @@ def _detect_frequency(parsed: pd.Series, group_key: "pd.Series | None" = None) -
         return "weekly", [1, 4, 12]
     if 26 <= days <= 32:
         return "monthly", [1, 3, 12]
-    print(f"[feature_eng] timeseries: taninmayan frekans (medyan ~{days:.1f} gun) → varsayilan [1] + WARN")
+    logger.info(f"[feature_eng] timeseries: taninmayan frekans (medyan ~{days:.1f} gun) → varsayilan [1] + WARN")
     return "unknown", [1]
 
 
@@ -514,7 +517,7 @@ def _build_timeseries_features(
     freq, windows = _detect_frequency(parsed, group_key=df[entity_col] if entity_col else None)
 
     if entity_col:
-        print(f"[feature_eng] timeseries: GRUP-ICI mod, entity_col='{entity_col}' "
+        logger.info(f"[feature_eng] timeseries: GRUP-ICI mod, entity_col='{entity_col}' "
               f"({df[entity_col].nunique()} entity) — lag/rolling/frekans entity icinde hesaplanir")
     else:
         # GLOBAL mod: identifier varsa panel-leakage WARN (entity_col secilmedi).
@@ -526,7 +529,7 @@ def _build_timeseries_features(
                 n_ent = int(df[ex].nunique())
             except Exception:
                 n_ent = -1
-            print(f"[feature_eng] WARN timeseries lag: identifier kolon(lar) {id_cols} "
+            logger.info(f"[feature_eng] WARN timeseries lag: identifier kolon(lar) {id_cols} "
                   f"(orn. '{ex}' → {n_ent} entity) ama entity_col SECILMEDI → GLOBAL shift; "
                   f"entity sinirinda sizinti olabilir. entity_col secersen grup-ici hesaplanir.")
 
@@ -544,7 +547,7 @@ def _build_timeseries_features(
     n = len(df)
     windows = [w for w in windows if w < n]   # veri boyutunu asan pencereyi ele (hepsini dropdan kacin)
     if not windows:
-        print(f"[feature_eng] timeseries: veri ({n} satir) pencereler icin cok kucuk → lag/rolling atlandi")
+        logger.info(f"[feature_eng] timeseries: veri ({n} satir) pencereler icin cok kucuk → lag/rolling atlandi")
         return df, {"frequency": freq, "windows": [], "roll_windows": [], "lag_columns": [],
                     "rolling_columns": [], "lag_base_columns": [], "dropped_lead_rows": 0,
                     "entity_col": entity_col or None, "dropped_entities": 0,
@@ -575,7 +578,7 @@ def _build_timeseries_features(
             return float(((s - lo) / (hi - lo)).var())
         ranked = sorted(numeric_cols, key=lambda c: (-_norm_var(c), c))
         lag_base_cols = ranked[:_TS_MAX_FEATURE_COLS]
-        print(f"[feature_eng] timeseries lag: {len(numeric_cols)} sayisal kolondan "
+        logger.info(f"[feature_eng] timeseries lag: {len(numeric_cols)} sayisal kolondan "
               f"normalize-varyans (yayilim) ile {_TS_MAX_FEATURE_COLS} secildi: {lag_base_cols}")
     else:
         lag_base_cols = list(numeric_cols)
@@ -643,7 +646,7 @@ def _build_timeseries_features(
         dropped_entities = len(gone)
         dropped_rows_small = int(counts_before.loc[list(gone)].sum()) if gone else 0
         if dropped_entities:
-            print(f"[feature_eng] WARN grup-ici: {dropped_entities} entity penceresinden kisa → "
+            logger.info(f"[feature_eng] WARN grup-ici: {dropped_entities} entity penceresinden kisa → "
                   f"KOMPLE dustu ({dropped_rows_small} satir). Kucuk entity'ler atilir (yari-doldurma YOK).")
 
     info = {
@@ -654,7 +657,7 @@ def _build_timeseries_features(
         "dropped_entities": dropped_entities,
         "dropped_rows_from_small_entities": dropped_rows_small,
     }
-    print(f"[feature_eng] timeseries: frekans={freq}, lag pencereleri={windows}, "
+    logger.info(f"[feature_eng] timeseries: frekans={freq}, lag pencereleri={windows}, "
           f"rolling pencereleri={roll_windows}, {len(lag_cols_created)} lag + "
           f"{len(rolling_cols_created)} rolling kolonu uretildi, {dropped} lead satir atildi"
           + (f", {dropped_entities} kucuk entity dustu" if entity_col else ""))
@@ -668,7 +671,7 @@ def _aggregate_if_needed(
 ) -> tuple[pd.DataFrame, pd.Series]:
     # Entity resolution zaten aggregate ettiyse, tekrar aggregate ETME
     if entity_resolution and entity_resolution.get("action") == "aggregate":
-        print("[feature_eng] Entity resolution zaten aggregate etti → "
+        logger.info("[feature_eng] Entity resolution zaten aggregate etti → "
               "feature_builder aggregation atlanıyor (çift aggregation önlendi)")
         return df, y
 
@@ -678,7 +681,7 @@ def _aggregate_if_needed(
 
     group_col = agg_config.get("group_by_column","")
     if not group_col or group_col not in df.columns:
-        print(f"[feature_eng] group_by '{group_col}' bulunamadi, aggregation atlandi")
+        logger.info(f"[feature_eng] group_by '{group_col}' bulunamadi, aggregation atlandi")
         return df, y
 
     level          = agg_config.get("level","none")
@@ -732,7 +735,7 @@ def _aggregate_if_needed(
     y_out = customer_df["__y"].copy()
     customer_df = customer_df.drop(columns=["__y",group_col], errors="ignore").fillna(0)
 
-    print(f"[feature_eng] Aggregation: {len(customer_df):,} satır × {len(customer_df.columns)} kolon")
+    logger.info(f"[feature_eng] Aggregation: {len(customer_df):,} satır × {len(customer_df.columns)} kolon")
     return customer_df, y_out
 
 
@@ -744,14 +747,14 @@ def _encode_categorical(df: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
     high = [c for c in cat_cols if df[c].nunique() >  10]
     if low:
         df = pd.get_dummies(df, columns=low, drop_first=True, dtype=int)
-        print(f"[feature_eng] One-hot ({len(low)}): {low}")
+        logger.info(f"[feature_eng] One-hot ({len(low)}): {low}")
     if high:
         try:
             # sklearn 1.3+ TargetEncoder expects 2D array for X and 1D for y
             df[high] = TargetEncoder(random_state=RANDOM_STATE).fit_transform(df[high], y)
-            print(f"[feature_eng] Target encoding ({len(high)}): {high}")
+            logger.info(f"[feature_eng] Target encoding ({len(high)}): {high}")
         except Exception as e:
-            print(f"[feature_eng] Target encoding hatasi → kolonlar drop ediliyor: {e}")
+            logger.error(f"[feature_eng] Target encoding hatasi → kolonlar drop ediliyor: {e}")
             df = df.drop(columns=high, errors="ignore")
     return df
 
@@ -771,15 +774,15 @@ def _scale_features(df: pd.DataFrame, outlier_cols: list[str]) -> pd.DataFrame:
     if inf_cols:
         df[inf_cols] = df[inf_cols].replace([np.inf, -np.inf], np.nan)
         df[inf_cols] = df[inf_cols].fillna(df[inf_cols].median()).fillna(0.0)
-        print(f"[feature_eng] inf temizlendi (scaling oncesi): {inf_cols}")
+        logger.info(f"[feature_eng] inf temizlendi (scaling oncesi): {inf_cols}")
     robust   = [c for c in outlier_cols if c in num]
     standard = [c for c in num if c not in robust]
     if robust:
         df[robust]   = RobustScaler().fit_transform(df[robust])
-        print(f"[feature_eng] RobustScaler: {len(robust)} kolon")
+        logger.info(f"[feature_eng] RobustScaler: {len(robust)} kolon")
     if standard:
         df[standard] = StandardScaler().fit_transform(df[standard])
-        print(f"[feature_eng] StandardScaler: {len(standard)} kolon")
+        logger.info(f"[feature_eng] StandardScaler: {len(standard)} kolon")
     return df
 
 
@@ -791,7 +794,7 @@ def _select_features(df: pd.DataFrame) -> pd.DataFrame:
     if low_var:
         df = df.drop(columns=low_var)
         num = [c for c in num if c not in low_var]
-        print(f"[feature_eng] Low variance drop: {low_var}")
+        logger.info(f"[feature_eng] Low variance drop: {low_var}")
     if len(num) > 1:
         corr  = df[num].corr().abs()
         mask  = np.triu(np.ones(corr.shape, dtype=bool), k=1)
@@ -799,7 +802,7 @@ def _select_features(df: pd.DataFrame) -> pd.DataFrame:
         hc    = [c for c in upper.columns if any(upper[c] > CORRELATION_THRESHOLD)]
         if hc:
             df = df.drop(columns=hc)
-            print(f"[feature_eng] High corr drop: {hc}")
+            logger.info(f"[feature_eng] High corr drop: {hc}")
     return df
 
 
@@ -853,7 +856,7 @@ def _apply_domain_leakage_drops(
     # Güvenlik: drop sonrası en az 2 feature kalmalı
     remaining_after_drop = len(df.columns) - len(all_cols_to_drop)
     if remaining_after_drop < 2:
-        print(f"[leakage] Domain drop iptal: drop sonrasi {remaining_after_drop} feature kalacak (min 2 gerekli)")
+        logger.info(f"[leakage] Domain drop iptal: drop sonrasi {remaining_after_drop} feature kalacak (min 2 gerekli)")
         return df, domain_dropped
 
     # Drop uygula
@@ -866,7 +869,7 @@ def _apply_domain_leakage_drops(
             "reason": f"domain leakage (high confidence): {c.get('reasoning', '')[:120]}",
             "relationship_type": c.get("relationship_type", "unknown"),
         })
-        print(f"[leakage] DOMAIN DROP: '{col_name}' "
+        logger.info(f"[leakage] DOMAIN DROP: '{col_name}' "
               f"({c.get('relationship_type')}, high) - "
               f"{c.get('reasoning', '')[:80]}")
 
@@ -876,7 +879,7 @@ def _apply_domain_leakage_drops(
             "reason": "domain leakage (türev — parent kolon high confidence leaky)",
             "relationship_type": "temporal_derived",
         })
-        print(f"[leakage] DOMAIN DROP (türev): '{derived_col}' — leaky parent: {leaky_col_names}")
+        logger.info(f"[leakage] DOMAIN DROP (türev): '{derived_col}' — leaky parent: {leaky_col_names}")
 
     return df, domain_dropped
 
@@ -906,8 +909,8 @@ def _detect_leakage(
     dropped = []      # otomatik atılanlar (kesin)
     suspected = []    # şüpheli, kullanıcıya raporlanacak
     n_rows = len(df)
-    print(f"\n[leakage] === BASLIYOR ===")
-    print(f"[leakage] df shape: {df.shape}, y dtype: {y.dtype}")
+    logger.info(f"\n[leakage] === BASLIYOR ===")
+    logger.info(f"[leakage] df shape: {df.shape}, y dtype: {y.dtype}")
 
     # y'yi numeric'e çevir (korelasyon için), başarısızsa korelasyon atla
     try:
@@ -924,7 +927,7 @@ def _detect_leakage(
             if sem == "identifier":
                 df = df.drop(columns=[col], errors="ignore")
                 dropped.append({"column": col, "reason": "identifier (semantic_type)"})
-                print(f"[leakage] KESIN drop: '{col}' (identifier)")
+                logger.info(f"[leakage] KESIN drop: '{col}' (identifier)")
                 continue
 
         # ── KESİN 2: Aşırı yüksek kardinalite (ID-benzeri) ──
@@ -935,23 +938,23 @@ def _detect_leakage(
         if col not in protected_high_card and n_rows > 0 and nunique / n_rows > 0.95:
             df = df.drop(columns=[col], errors="ignore")
             dropped.append({"column": col, "reason": f"asiri kardinalite ({nunique}/{n_rows})"})
-            print(f"[leakage] KESIN drop: '{col}' (kardinalite orani {nunique/n_rows:.2f})")
+            logger.info(f"[leakage] KESIN drop: '{col}' (kardinalite orani {nunique/n_rows:.2f})")
             continue
 
     # ── Korelasyon tabanlı (yalnızca numeric + y numeric ise) ──
     if y_valid:
         num_cols = df.select_dtypes(include="number").columns.tolist()
-        print(f"[leakage DEBUG] numeric cols: {num_cols}")
-        print(f"[leakage DEBUG] y_num NaN orani: {y_num.isna().mean():.2f}")
+        logger.info(f"[leakage DEBUG] numeric cols: {num_cols}")
+        logger.info(f"[leakage DEBUG] y_num NaN orani: {y_num.isna().mean():.2f}")
         for col in num_cols:
             if df[col].nunique() <= 1:
                 continue
             try:
                 col_vals = pd.to_numeric(df[col], errors="coerce").astype(float)
                 corr = abs(col_vals.corr(y_num))
-                print(f"[leakage DEBUG] '{col}' corr = {corr}")
+                logger.info(f"[leakage DEBUG] '{col}' corr = {corr}")
             except Exception as e:
-                print(f"[leakage DEBUG] '{col}' corr hatasi: {e}")
+                logger.error(f"[leakage DEBUG] '{col}' corr hatasi: {e}")
                 continue
             if pd.isna(corr):
                 continue
@@ -960,11 +963,11 @@ def _detect_leakage(
                 # KESİN: birebir kopya (örn. target'in kendisi/duplikası)
                 df = df.drop(columns=[col], errors="ignore")
                 dropped.append({"column": col, "reason": f"birebir korelasyon ({corr:.4f})"})
-                print(f"[leakage] KESIN drop: '{col}' (corr={corr:.4f})")
+                logger.info(f"[leakage] KESIN drop: '{col}' (corr={corr:.4f})")
             elif corr > 0.85:
                 # ŞÜPHELİ: yüksek ama kesin değil → drop etme, uyar
                 suspected.append({"column": col, "reason": f"yuksek korelasyon ({corr:.3f})"})
-                print(f"[leakage] SUPHELI: '{col}' (corr={corr:.3f}) — droplanmadi, uyari verildi")
+                logger.warning(f"[leakage] SUPHELI: '{col}' (corr={corr:.3f}) — droplanmadi, uyari verildi")
 
     return df, {"dropped": dropped, "suspected": suspected}
 
@@ -1012,19 +1015,19 @@ def _apply_feature_specs(df: pd.DataFrame, state: dict, disallowed: set) -> list
                 continue
             missing = [c for c in spec.inputs if c not in df.columns]
             if missing:
-                print(f"[feature_eng] FeatureSpec '{spec.name}' atlandi: kolon yok {missing}")
+                logger.info(f"[feature_eng] FeatureSpec '{spec.name}' atlandi: kolon yok {missing}")
                 continue
             leaky = [c for c in spec.inputs if c in deny]
             if leaky:
-                print(f"[feature_eng] FeatureSpec '{spec.name}' atlandi: leakage girdisi {leaky}")
+                logger.info(f"[feature_eng] FeatureSpec '{spec.name}' atlandi: leakage girdisi {leaky}")
                 continue
             cols = [pd.to_numeric(df[c], errors="coerce") for c in spec.inputs]
             series = fn(*cols)
             df[spec.name] = series.replace([np.inf, -np.inf], 0).fillna(0)
             added.append(spec.name)
-            print(f"[feature_eng] Ajan feature'i uygulandi: {spec.name} = {spec.op}{tuple(spec.inputs)}")
+            logger.info(f"[feature_eng] Ajan feature'i uygulandi: {spec.name} = {spec.op}{tuple(spec.inputs)}")
         except Exception as e:
-            print(f"[feature_eng] FeatureSpec '{getattr(spec, 'name', '?')}' hatasi: {e}")
+            logger.error(f"[feature_eng] FeatureSpec '{getattr(spec, 'name', '?')}' hatasi: {e}")
     return added
 
 
@@ -1048,7 +1051,7 @@ def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata")
     try:
         recipes = pack.feature_recipes(ctx, state.get("db_intelligence"), analysis) or []
     except Exception as e:
-        print(f"[feature_eng] feature_recipes() hatasi ({e}); atlaniyor.")
+        logger.error(f"[feature_eng] feature_recipes() hatasi ({e}); atlaniyor.")
         return []
 
     added: list[str] = []
@@ -1063,7 +1066,7 @@ def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata")
                 df[name] = series
                 added.append(name)
         except Exception as e:
-            print(f"[feature_eng] Recipe '{getattr(r, 'name', '?')}' hatasi: {e}")
+            logger.error(f"[feature_eng] Recipe '{getattr(r, 'name', '?')}' hatasi: {e}")
     return added
 
 
@@ -1132,10 +1135,10 @@ def build_features(state: dict) -> dict:
     if not feature_plan:
         return {"error":"Feature plan yok."}
 
-    print(f"\n{'='*60}")
-    print(f"[feature_eng] BASLIYOR — BigData Feature Engineering")
-    print(f"{'='*60}")
-    print(f"[feature_eng] Analiz: {feature_plan.get('analysis_summary','?')}")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"[feature_eng] BASLIYOR — BigData Feature Engineering")
+    logger.info(f"{'='*60}")
+    logger.info(f"[feature_eng] Analiz: {feature_plan.get('analysis_summary','?')}")
 
     meta = ColumnMetadata(db_intelligence, profiling_report)
 
@@ -1143,19 +1146,19 @@ def build_features(state: dict) -> dict:
         df = _load_data(state)
     except Exception as e:
         import traceback
-        print(f"\n[feature_eng] HATA: {e}")
-        print(traceback.format_exc())
+        logger.error(f"\n[feature_eng] HATA: {e}")
+        logger.info(traceback.format_exc())
         return {"error": str(e)}
 
     if df.empty or len(df) < 5:
         return {"error": f"Veri seti yüklenemedi veya çok az veri var ({len(df)} satır)."}
 
-    print(f"[feature_eng] Veri: {len(df):,} satır × {len(df.columns)} kolon")
+    logger.info(f"[feature_eng] Veri: {len(df):,} satır × {len(df.columns)} kolon")
 
     # Multi-table join suffix'lerini temizle
     all_tables = [t["table_name"] for t in db_intelligence.get("tables", [])]
     df = _normalize_column_names(df, table_names=all_tables if all_tables else None)
-    print(f"[feature_eng] Normalizasyon sonrasi: {len(df.columns)} kolon")
+    logger.info(f"[feature_eng] Normalizasyon sonrasi: {len(df.columns)} kolon")
 
     # Critic'ten gelen drop_features uygula
     drop_features = feature_plan.get("drop_features", [])
@@ -1163,7 +1166,7 @@ def build_features(state: dict) -> dict:
         existing_drops = [c for c in drop_features if c in df.columns]
         if existing_drops:
             df = df.drop(columns=existing_drops, errors="ignore")
-            print(f"[feature_eng] Critic drop_features: {existing_drops}")
+            logger.info(f"[feature_eng] Critic drop_features: {existing_drops}")
 
     # Temizlik
     df = _clean_data(df)
@@ -1177,16 +1180,16 @@ def build_features(state: dict) -> dict:
     if modality == "timeseries":
         resolved_time_col = _resolve_time_col(df, time_col)
         if resolved_time_col is None:
-            print(f"[feature_eng] WARN timeseries lag: time_col '{time_col}' df'te yok → lag atlandi")
+            logger.info(f"[feature_eng] WARN timeseries lag: time_col '{time_col}' df'te yok → lag atlandi")
         elif float(pd.to_datetime(df[resolved_time_col], errors="coerce").notna().mean()) < 0.5:
-            print(f"[feature_eng] WARN timeseries lag: '{resolved_time_col}' parse edilemedi → lag atlandi")
+            logger.info(f"[feature_eng] WARN timeseries lag: '{resolved_time_col}' parse edilemedi → lag atlandi")
         else:
             # entity_col opsiyonel: _resolve_time_col generik ad-normalizasyonu yapar
             # (entity de _normalize_column_names suffix'inden etkilenebilir). Bos/bulunamaz
             # → GLOBAL yol (FAZ A/B1 birebir).
             resolved_entity_col = _resolve_time_col(df, entity_col) if entity_col else None
             if entity_col and resolved_entity_col is None:
-                print(f"[feature_eng] WARN timeseries: entity_col '{entity_col}' df'te yok → GLOBAL yol")
+                logger.info(f"[feature_eng] WARN timeseries: entity_col '{entity_col}' df'te yok → GLOBAL yol")
             df, ts_lag_info = _build_timeseries_features(
                 df, feature_plan, resolved_time_col, meta,
                 entity_col=resolved_entity_col or "",
@@ -1198,7 +1201,7 @@ def build_features(state: dict) -> dict:
     # Aggregation — timeseries'te zaman eksenini korumak icin ATLANIR (kapatinca
     # domain recipe'leri de inert kalir: avg_/std_ kolonlari olusmaz → onlara dokunmuyoruz).
     if modality == "timeseries":
-        print("[feature_eng] timeseries: aggregation atlandi (zaman ekseni korunuyor)")
+        logger.info("[feature_eng] timeseries: aggregation atlandi (zaman ekseni korunuyor)")
     else:
         entity_resolution = state.get("entity_resolution") or {}
         df, y = _aggregate_if_needed(df, y, feature_plan, meta, entity_resolution=entity_resolution)
@@ -1214,13 +1217,13 @@ def build_features(state: dict) -> dict:
         if c.get("confidence") == "high"
     }
     if leaky_cols_high:
-        print(f"[feature_eng] High-confidence leaky kolonlar (türev üretilmeyecek): {leaky_cols_high}")
+        logger.info(f"[feature_eng] High-confidence leaky kolonlar (türev üretilmeyecek): {leaky_cols_high}")
 
     # Date feature extraction — leaky olan timestamp kolonları atlanır
     for col in meta.get_by_type("timestamp"):
         if col in df.columns:
             if col in leaky_cols_high:
-                print(f"[feature_eng] SKIP türev: '{col}' domain leakage (high) — year/month/dayofweek üretilmiyor")
+                logger.info(f"[feature_eng] SKIP türev: '{col}' domain leakage (high) — year/month/dayofweek üretilmiyor")
                 continue
             try:
                 dt = pd.to_datetime(df[col], errors="coerce")
@@ -1240,26 +1243,26 @@ def build_features(state: dict) -> dict:
     if modality == "timeseries":
         resolved_time_col = _resolve_time_col(df, time_col)
         if resolved_time_col is None:
-            print(f"[feature_eng] WARN timeseries: time_col '{time_col}' df'te bulunamadı → RASTGELE split fallback")
+            logger.info(f"[feature_eng] WARN timeseries: time_col '{time_col}' df'te bulunamadı → RASTGELE split fallback")
         else:
             parsed = pd.to_datetime(df[resolved_time_col], errors="coerce")
             valid_ratio = float(parsed.notna().mean())
             if valid_ratio < 0.5:
-                print(f"[feature_eng] WARN timeseries: '{resolved_time_col}' tarih olarak parse edilemedi "
+                logger.info(f"[feature_eng] WARN timeseries: '{resolved_time_col}' tarih olarak parse edilemedi "
                       f"(%{valid_ratio*100:.0f} geçerli) → RASTGELE split fallback")
             else:
                 time_sort_key = parsed
-                print(f"[feature_eng] timeseries: kronolojik anahtar '{resolved_time_col}' yakalandı "
+                logger.info(f"[feature_eng] timeseries: kronolojik anahtar '{resolved_time_col}' yakalandı "
                       f"({parsed.notna().sum()}/{len(parsed)} geçerli tarih)")
                 # entity anahtari: time_sort_key gibi df.index'e hizali, drop'tan ONCE yakalanir
                 if entity_col:
                     resolved_entity_col = _resolve_time_col(df, entity_col)
                     if resolved_entity_col is not None:
                         entity_split_key = df[resolved_entity_col].copy()
-                        print(f"[feature_eng] timeseries: entity-aware split anahtari "
+                        logger.info(f"[feature_eng] timeseries: entity-aware split anahtari "
                               f"'{resolved_entity_col}' yakalandı ({entity_split_key.nunique()} entity)")
                     else:
-                        print(f"[feature_eng] WARN timeseries: entity_col '{entity_col}' split için "
+                        logger.info(f"[feature_eng] WARN timeseries: entity_col '{entity_col}' split için "
                               f"bulunamadı → GLOBAL split")
 
     # Drop identifier / timestamp / target kolonları
@@ -1280,7 +1283,7 @@ def build_features(state: dict) -> dict:
     existing = [c for c in cols_drop if c in df.columns]
     if existing:
         df = df.drop(columns=existing, errors="ignore")
-        print(f"[feature_eng] Drop (id/ts/target): {existing}")
+        logger.info(f"[feature_eng] Drop (id/ts/target): {existing}")
 
     # Math interactions
     for expr in feature_plan.get("math_interactions", []):
@@ -1293,7 +1296,7 @@ def build_features(state: dict) -> dict:
             safe_name = "math_" + "".join([c if c.isalnum() else "_" for c in expr])[:30]
             df[safe_name] = df.eval(safe_expr)
         except Exception as e:
-            print(f"[feature_eng] Math interaction hatasi ({expr}): {e}")
+            logger.error(f"[feature_eng] Math interaction hatasi ({expr}): {e}")
 
     # Domain pack feature'ları (additive + guarded). Pack 'none' ise hiç çalışmaz.
     #   (a) Ajan-karar yolu: expert ajanının propose_feature ile seçtiği FeatureSpec'ler,
@@ -1307,9 +1310,9 @@ def build_features(state: dict) -> dict:
         if not agent_cols:
             domain_feature_cols.extend(_apply_domain_recipes(df, state, meta))
         if domain_feature_cols:
-            print(f"[feature_eng] Domain feature'lari: {domain_feature_cols}")
+            logger.info(f"[feature_eng] Domain feature'lari: {domain_feature_cols}")
     except Exception as e:
-        print(f"[feature_eng] Domain feature hatasi ({e}); atlaniyor.")
+        logger.error(f"[feature_eng] Domain feature hatasi ({e}); atlaniyor.")
 
     # Encoding
     df = _encode_categorical(df, y)
@@ -1342,7 +1345,7 @@ def build_features(state: dict) -> dict:
         X_train = X_test = df.copy()
         y_train = y_test = pd.Series([], dtype=int)
         split_strategy = "none"
-        print(f"[feature_eng] Unsupervised — split atlandi")
+        logger.info(f"[feature_eng] Unsupervised — split atlandi")
     elif modality == "timeseries" and time_sort_key is not None and entity_split_key is not None:
         # ENTITY-AWARE holdout: her entity'nin kendi son %TEST_SIZE'i test → hicbir entity
         # tamamen bir tarafa dusmez (her biri gecmisiyle train, gelecegiyle test). Pozisyonel
@@ -1353,9 +1356,9 @@ def build_features(state: dict) -> dict:
         y_train, y_test = y.iloc[train_pos], y.iloc[test_pos]
         split_strategy = "entity_aware"
         if split_imbalanced:
-            print(f"[feature_eng] WARN entity-aware split: {split_imbalanced} entity train'i bos/yetersiz "
+            logger.info(f"[feature_eng] WARN entity-aware split: {split_imbalanced} entity train'i bos/yetersiz "
                   f"(cok kucuk entity) — modele zayif katki, sessiz gecilmiyor")
-        print(f"[feature_eng] ENTITY-AWARE split (timeseries): her entity son %{int(TEST_SIZE*100)} = test "
+        logger.info(f"[feature_eng] ENTITY-AWARE split (timeseries): her entity son %{int(TEST_SIZE*100)} = test "
               f"({entity_split_key.nunique()} entity, n_train={len(X_train)}, n_test={len(X_test)}), shuffle YOK")
     elif modality == "timeseries" and time_sort_key is not None:
         # Kronolojik holdout: geçmişle eğit, gelecekte test. shuffle/stratify YOK.
@@ -1367,7 +1370,7 @@ def build_features(state: dict) -> dict:
         X_train, X_test = df_sorted.iloc[:-n_test], df_sorted.iloc[-n_test:]
         y_train, y_test = y_sorted.iloc[:-n_test], y_sorted.iloc[-n_test:]
         split_strategy = "global_chronological"
-        print(f"[feature_eng] KRONOLOJIK split (timeseries): son %{int(TEST_SIZE*100)} = test "
+        logger.info(f"[feature_eng] KRONOLOJIK split (timeseries): son %{int(TEST_SIZE*100)} = test "
               f"(n_train={len(X_train)}, n_test={len(X_test)}), shuffle/stratify YOK")
     else:
         stratify_arg = y if intent.strip().lower() == "classification" else None
@@ -1390,12 +1393,12 @@ def build_features(state: dict) -> dict:
     dist_train_counts, hist_train = _target_distribution(y_train_arr, intent)
     dist_test_counts,  hist_test  = _target_distribution(y_test_arr, intent)
 
-    print(f"\n[feature_eng] TAMAMLANDI:")
-    print(f"  Hedef   : {target_name}")
-    print(f"  X_train : {X_train.shape}")
-    print(f"  X_test  : {X_test.shape}")
+    logger.info(f"\n[feature_eng] TAMAMLANDI:")
+    logger.info(f"  Hedef   : {target_name}")
+    logger.info(f"  X_train : {X_train.shape}")
+    logger.info(f"  X_test  : {X_test.shape}")
     if len(np.unique(y_train_arr)) <= 10:
-        print(f"  Train dist: {pd.Series(y_train_arr).value_counts().to_dict()}")  # type: ignore
+        logger.info(f"  Train dist: {pd.Series(y_train_arr).value_counts().to_dict()}")  # type: ignore
 
     feature_report = {
         "target_name":              target_name,

@@ -1,5 +1,8 @@
 import json
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 def build_chart_payload(chart_cfg: dict, rows: list, columns: list) -> dict | None:
     """JSON payload for Streamlit ECharts."""
     try:
@@ -44,5 +47,5 @@ def build_chart_payload(chart_cfg: dict, rows: list, columns: list) -> dict | No
             }
         return option
     except Exception as e:
-        print(f"Error building chart payload: {e}")
+        logger.error(f"Error building chart payload: {e}")
         return None

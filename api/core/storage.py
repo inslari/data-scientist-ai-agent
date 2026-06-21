@@ -29,6 +29,9 @@ import tempfile
 from contextlib import contextmanager
 from typing import Generator
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 _MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "").strip()
 _MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
 _MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
@@ -63,9 +66,9 @@ class StorageService:
             )
             self._bucket = _MINIO_BUCKET
             self._ensure_bucket()
-            print(f"[Storage] Using MinIO: {_MINIO_ENDPOINT} / bucket: {self._bucket}")
+            logger.info(f"[Storage] Using MinIO: {_MINIO_ENDPOINT} / bucket: {self._bucket}")
         else:
-            print("[Storage] Using local filesystem (MINIO_ENDPOINT not set).")
+            logger.info("[Storage] Using local filesystem (MINIO_ENDPOINT not set).")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -77,7 +80,7 @@ class StorageService:
             self._s3.head_bucket(Bucket=self._bucket)
         except Exception:
             self._s3.create_bucket(Bucket=self._bucket)
-            print(f"[Storage] Created MinIO bucket: {self._bucket}")
+            logger.info(f"[Storage] Created MinIO bucket: {self._bucket}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -154,13 +157,13 @@ class StorageService:
             try:
                 self._s3.delete_object(Bucket=self._bucket, Key=file_ref)
             except Exception as e:
-                print(f"[Storage] Warning: failed to delete {file_ref} from MinIO: {e}")
+                logger.error(f"[Storage] Warning: failed to delete {file_ref} from MinIO: {e}")
         else:
             if os.path.exists(file_ref):
                 try:
                     os.remove(file_ref)
                 except OSError as e:
-                    print(f"[Storage] Warning: failed to delete local file {file_ref}: {e}")
+                    logger.error(f"[Storage] Warning: failed to delete local file {file_ref}: {e}")
 
     def get_download_url(self, file_ref: str, expiry: int = _PRESIGNED_EXPIRY) -> str:
         """

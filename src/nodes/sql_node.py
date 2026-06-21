@@ -1,3 +1,4 @@
+from src.core.nodes import node
 import json
 from ..state import AgentState
 from ..core.db_provider import db_manager
@@ -14,6 +15,9 @@ from api.schemas.data_group import run_data_group_query_logic, QueryRequest
 from api.models.data_group import DataGroupModel
 import ast
 from ..services.chart_utils import build_chart_payload
+
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
 
 
 def _build_column_profiles(db_intelligence: dict) -> str:
@@ -52,6 +56,7 @@ def _build_column_profiles(db_intelligence: dict) -> str:
     return header + "Columns:\n" + "\n".join(lines)
 
 
+@node("sql_node")
 async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
     """
     SQL Query Node:
@@ -61,12 +66,11 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
       4. LLM ile chart konfigürasyonu belirler
       5. State'e yazar
     """
-    print("\n========================================\n[NODE START] sql_node başlıyor...\n========================================")
     llm        = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
     user_query = state["user_query"]
     data_group_id = config.get("configurable", {}).get("data_group_id")
     if not data_group_id:
-        return {**state, "error": "data_group_id is missing", "current_step": "sql_node"}
+        return {"error": "data_group_id is missing", "current_step": "sql_node"}
 
 
     # db_intelligence taken from db_context_node
@@ -83,7 +87,7 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
         if pack.name != "none" and (mc is not None or analysis is not None):
             domain_hint = pack.query_hints(mc, db_intelligence, analysis) or ""
     except Exception as e:  # pragma: no cover - defensive
-        print(f"[sql_node] Domain pack query ipucu başarısız ({e}); atlanıyor.")
+        logger.warning(f"[sql_node] Domain pack query ipucu başarısız ({e}); atlanıyor.")
 
     try:
         db_providers_info = ", ".join([f"{k} ({v.provider_display_name})" for k, v in db_manager.get_all_providers().items()])
@@ -102,13 +106,12 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
         is_approximation     = sql_result.is_approximation
         approximation_warning = sql_result.approximation_warning or ""
     except Exception as e:
-        return {**state, "error": f"SQL üretim hatası: {e}", "current_step": "sql_node"}
+        return {"error": f"SQL üretim hatası: {e}", "current_step": "sql_node"}
 
     # If no valid columns found, return warning
     if "NO_VALID_COLUMN" in sql:
         warning_msg = data_warning or "Bu veri setinde isteğinize uygun kolon bulunamadı."
         return {
-            **state,
             "sql_query_raw":     sql,
             "sql_query_columns": [],
             "sql_query_results": [],
@@ -152,11 +155,10 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
         finally:
             db.close()
     except Exception as e:
-        return {**state, "error": f"SQL çalıştırma hatası: {e}", "current_step": "sql_node"}
+        return {"error": f"SQL çalıştırma hatası: {e}", "current_step": "sql_node"}
 
     if not rows:
         return {
-            **state,
             "sql_query_raw":     sql,
             "sql_query_columns": columns,
             "sql_query_results": [],
@@ -191,7 +193,6 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
     results_as_dicts = [dict(zip(columns, row)) for row in rows]
 
     return {
-        **state,
         "sql_query_raw":     sql,
         "sql_query_columns": columns,
         "sql_query_results": results_as_dicts,

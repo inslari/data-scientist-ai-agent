@@ -1,9 +1,13 @@
+from src.core.nodes import node
 from ..state import AgentState
 from ..core.llm import get_llm
 from ..core.config import settings
 from ..core.prompt_loader import create_chat_prompt
 from ..schemas.intent_schemas import IntentResult
 from ..domains import get_active_pack
+
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
 
 
 # UI'dan açıkça set edilebilen intent'ler — LLM tespitine gerek yok
@@ -22,14 +26,15 @@ def _select_merchant_context(state: AgentState):
             return None, ""
         domain_doc = state.get("domain_doc") or ""
         ctx = pack.select_experts(state.get("user_query", ""), state.get("db_intelligence"), domain_doc)
-        print(f"[intent_node] Domain pack '{pack.name}' aktif → expert(ler): "
+        logger.info(f"[intent_node] Domain pack '{pack.name}' aktif → expert(ler): "
               f"{ctx.council if ctx.is_council else [ctx.primary_expert]}")
         return ctx.to_dict(), pack.enrich_intent_prompt(ctx, domain_doc)
     except Exception as e:  # pragma: no cover - defensive
-        print(f"[intent_node] Domain pack seçimi başarısız ({e}); atlanıyor.")
+        logger.warning(f"[intent_node] Domain pack seçimi başarısız ({e}); atlanıyor.")
         return None, ""
 
 
+@node("intent_node")
 def intent_node(state: AgentState) -> AgentState:
     """
     Node 1: Kullanıcının sorgusunu analiz edip intent'i belirler.
@@ -37,7 +42,6 @@ def intent_node(state: AgentState) -> AgentState:
     Eğer intent UI'dan açıkça verilmişse (ör. "Veri Analizi" modu seçilmiş),
     LLM tespiti atlanır — kullanıcı ne istediğini zaten söylemiştir.
     """
-    print("\n========================================\n[NODE START] intent_node başlıyor...\n========================================")
 
     # Domain pack (varsa) expert seçimi — UI explicit intent durumunda da çalışır
     merchant_context, domain_context = _select_merchant_context(state)
@@ -45,9 +49,8 @@ def intent_node(state: AgentState) -> AgentState:
     # UI'dan açık seçim varsa LLM'e sorma
     incoming_intent = state.get("intent")
     if incoming_intent in _UI_EXPLICIT_INTENTS:
-        print(f"[intent_node] UI'dan açık intent: '{incoming_intent}' — LLM atlandı")
+        logger.warning(f"[intent_node] UI'dan açık intent: '{incoming_intent}' — LLM atlandı")
         return {
-            **state,
             "intent": incoming_intent,
             "intent_confidence": 1.0,
             "merchant_context": merchant_context,
@@ -67,7 +70,6 @@ def intent_node(state: AgentState) -> AgentState:
     )
 
     return {
-        **state,
         "intent": result.intent,
         "intent_confidence": result.confidence,
         "merchant_context": merchant_context,

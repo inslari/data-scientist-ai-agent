@@ -17,6 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 # Data class
 @dataclass
 class TargetCandidate:
@@ -43,7 +46,7 @@ def _find_candidates(
 
     for col_info in db_intelligence.get("columns", []):
         if col_info.get("column_name") == "age":
-            print(f"[DEBUG] age col_info: {col_info}")
+            logger.info(f"[DEBUG] age col_info: {col_info}")
     
     for col_info in db_intelligence.get("columns", []):
         col_name      = col_info.get("column_name", "")
@@ -230,10 +233,10 @@ En uygun hedef kolon hangisi? Sadece kolon adını yaz:"""
         result = result.strip("'\"`*. \n")
         if " " in result:
             result = result.split()[0]
-        print(f"[target_discovery] LLM onerisi: '{result}'")
+        logger.info(f"[target_discovery] LLM onerisi: '{result}'")
         return result
     except Exception as e:
-        print(f"[target_discovery] LLM hatasi: {e}")
+        logger.error(f"[target_discovery] LLM hatasi: {e}")
         return ""
 
 # Final decision (Guardrail)
@@ -257,14 +260,14 @@ def _resolve_target(
         if llm_cand:
             score_gap = best.score - llm_cand.score
             if score_gap > 3.0:
-                print(f"[target_discovery] GUARDRAIL: LLM '{llm_suggestion}' secti ama "
+                logger.info(f"[target_discovery] GUARDRAIL: LLM '{llm_suggestion}' secti ama "
                       f"'{best.column_name}' cok daha yuksek skorlu "
                       f"({best.score:.2f} vs {llm_cand.score:.2f}). Override.")
             else:
                 best = llm_cand
-                print(f"[target_discovery] LLM onerisi kabul edildi.")
+                logger.info(f"[target_discovery] LLM onerisi kabul edildi.")
         else:
-            print(f"[target_discovery] LLM onerisi '{llm_suggestion}' adaylar arasinda yok.")
+            logger.info(f"[target_discovery] LLM onerisi '{llm_suggestion}' adaylar arasinda yok.")
 
     return best
 
@@ -326,24 +329,24 @@ def discover_target(state: dict) -> dict:
 
     # No target for EDA or SQL query
     if intent in ("sql_query", "eda"):
-        print(f"[target_discovery] Intent '{intent}' — atlandi.")
+        logger.warning(f"[target_discovery] Intent '{intent}' — atlandi.")
         return {**state, "target_definition": {}, "current_step": "target_discovery_node"}
 
-    print(f"\n{'='*60}")
-    print(f"[target_discovery] BASLIYOR")
-    print(f"  Intent : {intent}")
-    print(f"  Sorgu  : {user_query[:80].encode('ascii', 'replace').decode('ascii')}...")
-    print(f"{'='*60}")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"[target_discovery] BASLIYOR")
+    logger.info(f"  Intent : {intent}")
+    logger.info(f"  Sorgu  : {user_query[:80].encode('ascii', 'replace').decode('ascii')}...")
+    logger.info(f"{'='*60}")
 
     candidates = _find_candidates(db_intelligence, user_query, intent)
 
     if not candidates:
-        print("[target_discovery] Hic aday bulunamadi.")
+        logger.warning("[target_discovery] Hic aday bulunamadi.")
         return {**state, "target_definition": {}, "current_step": "target_discovery_node"}
 
     # Log top 5 candidates
     for c in candidates[:5]:
-        print(f"[target_discovery] Aday: '{c.column_name}' "
+        logger.info(f"[target_discovery] Aday: '{c.column_name}' "
               f"(skor={c.score:.2f}, binary={c.is_binary}) "
               f"reasons={c.reasons}")
 
@@ -354,7 +357,7 @@ def discover_target(state: dict) -> dict:
     best = _resolve_target(candidates, llm_suggestion)
 
     if not best:
-        print("[target_discovery] Hedef belirlenemedi.")
+        logger.info("[target_discovery] Hedef belirlenemedi.")
         return {**state, "target_definition": {}, "current_step": "target_discovery_node"}
 
     confidence = min(best.score / 10.0, 1.0)
@@ -367,7 +370,7 @@ def discover_target(state: dict) -> dict:
         "confirmed":   False, 
     }
 
-    print(f"\n[target_discovery] KARAR: '{best.column_name}' "
+    logger.info(f"\n[target_discovery] KARAR: '{best.column_name}' "
           f"(tablo: {best.table_name}, binary: {best.is_binary}, "
           f"confidence: {confidence:.2f})")
 

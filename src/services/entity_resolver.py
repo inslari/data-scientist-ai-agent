@@ -27,6 +27,9 @@ import duckdb
 
 from src.schemas.entity_resolution_schemas import EntitySignals, EntityResolution
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 # ── Sabitler ────────────────────────────────────────────────
 ENTITY_RATIO_THRESHOLD = 1.5   # Bu eşiğin üstünde entity-level kalıp var
 PARQUET_DIR = Path(tempfile.gettempdir()) / "ds_agent_data"
@@ -152,8 +155,8 @@ def _detect_entity_column(
             (c["column_name"], f"ratio={c['entity_ratio']:.1f}")
             for c in candidates
         ]
-        print(f"[entity_resolver] Entity kolon adayları: {candidate_summary}")
-        print(f"[entity_resolver] Seçilen entity kolonu: '{best['column_name']}' "
+        logger.info(f"[entity_resolver] Entity kolon adayları: {candidate_summary}")
+        logger.info(f"[entity_resolver] Seçilen entity kolonu: '{best['column_name']}' "
               f"(unique_rate={best['unique_rate']:.4f}, entity_ratio={best['entity_ratio']:.1f})")
 
         return best["column_name"]
@@ -183,7 +186,7 @@ def compute_entity_signals(
     # Entity kolonu tespit et
     entity_col = _detect_entity_column(db_intelligence, target_col, parquet_path)
     if not entity_col:
-        print("[entity_resolver] Entity kolonu bulunamadı → passthrough")
+        logger.warning("[entity_resolver] Entity kolonu bulunamadı → passthrough")
         return None
 
     conn = duckdb.connect(":memory:")
@@ -202,7 +205,7 @@ def compute_entity_signals(
         unique_entities = stats[1]
         entity_ratio = total_rows / max(unique_entities, 1)
 
-        print(f"[entity_resolver] Sinyal 1 — entity_ratio: "
+        logger.info(f"[entity_resolver] Sinyal 1 — entity_ratio: "
               f"{total_rows:,} satır / {unique_entities:,} entity = {entity_ratio:.2f}")
 
         # ── Sinyal 2: Target Stability ──
@@ -215,7 +218,7 @@ def compute_entity_signals(
 
         if actual_target_col:
             if actual_target_col != target_col:
-                print(f"[entity_resolver] Target '{target_col}' → "
+                logger.info(f"[entity_resolver] Target '{target_col}' → "
                       f"'{actual_target_col}' (suffix eşleşmesi)")
 
             target_nunique = conn.execute(f"""
@@ -230,10 +233,10 @@ def compute_entity_signals(
             max_nunique = target_nunique[0] if target_nunique and target_nunique[0] else 1
             target_stable = (max_nunique == 1)
 
-            print(f"[entity_resolver] Sinyal 2 — target_stable: {target_stable} "
+            logger.info(f"[entity_resolver] Sinyal 2 — target_stable: {target_stable} "
                   f"(max target nunique per entity = {max_nunique})")
         else:
-            print(f"[entity_resolver] Sinyal 2 — target '{target_col}' parquet'te bulunamadı "
+            logger.warning(f"[entity_resolver] Sinyal 2 — target '{target_col}' parquet'te bulunamadı "
                   f"(kolonlar: {parquet_cols}), target_stable=False varsayılıyor")
 
         # ── Sinyal 3: Temporal Kolon ──
@@ -245,7 +248,7 @@ def compute_entity_signals(
         ]
         has_temporal = len(temporal_columns) > 0
 
-        print(f"[entity_resolver] Sinyal 3 — has_temporal: {has_temporal} "
+        logger.info(f"[entity_resolver] Sinyal 3 — has_temporal: {has_temporal} "
               f"({temporal_columns})")
 
         return EntitySignals(
@@ -281,16 +284,16 @@ def decide_resolution(signals: EntitySignals | None) -> str:
         return "passthrough"
 
     if signals.entity_ratio <= ENTITY_RATIO_THRESHOLD:
-        print(f"[entity_resolver] KARAR: passthrough "
+        logger.info(f"[entity_resolver] KARAR: passthrough "
               f"(entity_ratio={signals.entity_ratio:.2f} <= {ENTITY_RATIO_THRESHOLD})")
         return "passthrough"
 
     if signals.target_stable:
-        print(f"[entity_resolver] KARAR: aggregate "
+        logger.info(f"[entity_resolver] KARAR: aggregate "
               f"(entity_ratio={signals.entity_ratio:.2f}, target_stable=True)")
         return "aggregate"
     else:
-        print(f"[entity_resolver] KARAR: entity_split "
+        logger.info(f"[entity_resolver] KARAR: entity_split "
               f"(entity_ratio={signals.entity_ratio:.2f}, target_stable=False)")
         return "entity_split"
 
@@ -347,10 +350,10 @@ def aggregate_entity_data(
         # Target'ın gerçek parquet adını ÖNCE bul (suffix'li olabilir: churn_referance_data_1_)
         actual_target_col = _match_target_column(target_col_clean, list(col_types.keys()))
         if actual_target_col:
-            print(f"[entity_resolver] Aggregation target: '{actual_target_col}' "
+            logger.info(f"[entity_resolver] Aggregation target: '{actual_target_col}' "
                   f"→ '{target_col_clean}' olarak yazılacak")
         else:
-            print(f"[entity_resolver] UYARI: target '{target_col_clean}' "
+            logger.warning(f"[entity_resolver] UYARI: target '{target_col_clean}' "
                   f"aggregation'da bulunamadı! Kolonlar: {list(col_types.keys())}")
 
         # Aggregation SQL parçaları
@@ -405,17 +408,17 @@ def aggregate_entity_data(
             GROUP BY "{entity_col}"
         """
 
-        print(f"[entity_resolver] Aggregation SQL (ilk 500 char):\n{agg_sql[:500]}")
+        logger.info(f"[entity_resolver] Aggregation SQL (ilk 500 char):\n{agg_sql[:500]}")
 
         result_df = conn.execute(agg_sql).df()
 
         # Target gerçekten çıktıda mı? (güvenlik kontrolü)
         if target_col_clean not in result_df.columns:
-            print(f"[entity_resolver] KRİTİK UYARI: target '{target_col_clean}' "
+            logger.warning(f"[entity_resolver] KRİTİK UYARI: target '{target_col_clean}' "
                   f"aggregate çıktısında YOK! Kolonlar: {list(result_df.columns)}")
         else:
             n_classes = result_df[target_col_clean].nunique(dropna=True)
-            print(f"[entity_resolver] Target '{target_col_clean}' çıktıda OK "
+            logger.info(f"[entity_resolver] Target '{target_col_clean}' çıktıda OK "
                   f"({n_classes} benzersiz değer)")
 
         output_name = f"entity_agg_{uuid.uuid4().hex[:8]}"
@@ -434,7 +437,7 @@ def aggregate_entity_data(
             "compression_ratio": round(original_rows / max(len(result_df), 1), 2),
         }
 
-        print(f"[entity_resolver] Aggregation tamamlandı: "
+        logger.info(f"[entity_resolver] Aggregation tamamlandı: "
               f"{original_rows:,} → {len(result_df):,} satır "
               f"({features_created} yeni feature, {len(result_df.columns)} kolon)")
 
@@ -460,9 +463,9 @@ def resolve_entities(state: dict) -> dict:
       - entity_resolution: EntityResolution dict
       - data_path: güncellenmiş parquet path (aggregate ise yeni, değilse aynı)
     """
-    print(f"\n{'='*60}")
-    print(f"[entity_resolver] BAŞLIYOR — Entity Resolution")
-    print(f"{'='*60}")
+    logger.info(f"\n{'='*60}")
+    logger.info(f"[entity_resolver] BAŞLIYOR — Entity Resolution")
+    logger.info(f"{'='*60}")
 
     data_path = state.get("data_path", "")
     target_def = state.get("target_definition") or {}
@@ -470,7 +473,7 @@ def resolve_entities(state: dict) -> dict:
     target_col = target_def.get("column_name", "")
 
     if not data_path:
-        print("[entity_resolver] data_path boş, atlaniyor")
+        logger.warning("[entity_resolver] data_path boş, atlaniyor")
         return {
             "entity_resolution": EntityResolution(
                 action="passthrough",
@@ -540,7 +543,7 @@ def resolve_entities(state: dict) -> dict:
             f"veri olduğu gibi kullanılacak."
         )
 
-    print(f"[entity_resolver] SONUÇ: {message}")
+    logger.info(f"[entity_resolver] SONUÇ: {message}")
 
     resolution = EntityResolution(
         action=action,

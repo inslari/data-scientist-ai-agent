@@ -100,6 +100,9 @@ def update_data_group(group_id: int, req: DataGroupUpdate, db: Session = Depends
 
 import time as _time
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
 
 def _read_db_cache(db_group: DataGroupModel) -> tuple[dict, str] | None:
     """
@@ -119,7 +122,7 @@ def _write_db_cache(db, db_group: DataGroupModel, db_intelligence: dict, raw_sch
     db_group.raw_schema_cache = raw_schema
     db_group.schema_cache_updated_at = int(_time.time())
     db.commit()
-    print(f"[schema-cache] SQLite'a yazıldı: data_group_id={db_group.id}")
+    logger.info(f"[schema-cache] SQLite'a yazıldı: data_group_id={db_group.id}")
 
 
 def _clear_db_cache(db, db_group: DataGroupModel) -> None:
@@ -130,7 +133,7 @@ def _clear_db_cache(db, db_group: DataGroupModel) -> None:
     db_group.raw_schema_cache = None
     db_group.schema_cache_updated_at = None
     db.commit()
-    print(f"[schema-cache] Cache temizlendi: data_group_id={db_group.id}")
+    logger.info(f"[schema-cache] Cache temizlendi: data_group_id={db_group.id}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,10 +273,10 @@ async def chat_with_data_group(
             initial_state["db_intelligence"] = db_intelligence
             initial_state["raw_schema"]      = raw_schema
             updated_at = db_group.schema_cache_updated_at
-            print(f"[ttd chat] SQLite cache hit: group_id={group_id}, "
+            logger.info(f"[ttd chat] SQLite cache hit: group_id={group_id}, "
                   f"cache_date={_time.strftime('%Y-%m-%d %H:%M', _time.localtime(updated_at)) if updated_at else '?'}")
         else:
-            print(f"[ttd chat] SQLite cache miss: group_id={group_id} — ttd_db_context_node çalışacak")
+            logger.info(f"[ttd chat] SQLite cache miss: group_id={group_id} — ttd_db_context_node çalışacak")
 
         config = {"configurable": {"data_group_id": group_id, "user_id": current_user.id}}
         # TTD graph'ı içindeki LLM/SQL/MCP çağrıları senkron ve uzun sürüyor
@@ -347,5 +350,5 @@ async def chat_with_data_group(
         )
 
     except Exception as e:
-        print(f"[chat_with_data_group] Hata: {e}")
+        logger.error(f"[chat_with_data_group] Hata: {e}")
         raise HTTPException(status_code=500, detail=f"Chat pipeline hatası: {str(e)}")
