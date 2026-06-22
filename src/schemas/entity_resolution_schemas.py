@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 
 class EntitySignals(BaseModel):
     """Entity-level sinyaller — saf matematik, LLM gerektirmez."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     entity_column: str = Field(
         description="Tespit edilen entity kolonu (ör: 'customer_id')"
@@ -47,7 +47,7 @@ class EntitySignals(BaseModel):
 
 class EntityResolution(BaseModel):
     """Entity resolution kararı + sonuçları."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     action: Literal["aggregate", "entity_split", "passthrough"] = Field(
         description=(

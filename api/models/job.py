@@ -17,6 +17,11 @@ class BackgroundJobModel(Base):
     # The project this job belongs to
     project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True)
 
+    # The text-analysis this job belongs to (task_type="run_text_analysis").
+    # No FK to keep the job model decoupled from the optional feature; the worker
+    # resolves it by id. NULL for the classic run_project jobs.
+    text_analysis_id = Column(Integer, nullable=True, index=True)
+
     # What kind of work needs to be done (extendable for future job types)
     task_type = Column(String, default="run_project", nullable=False)
 

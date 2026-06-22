@@ -58,6 +58,13 @@ class Settings:
     INTELLIGENCE_ENGINE_MODEL: str = os.getenv("INTELLIGENCE_ENGINE_MODEL", "gpt-4o")
     DEFAULT_TEMPERATURE: float = 0.0
 
+    # Embedding Configuration (semantic text clustering — text-analysis feature).
+    # Mirrors the LLM provider pattern: switch providers purely via env.
+    # Providers: "openai" (default), "ollama", "google". Empty/unknown model name
+    # falls back to a sensible per-provider default in get_embeddings().
+    EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
     # Intelligence Engine schema-analysis cache (project bazlı, application DB'de).
     # analyze_schema çıktısı aynı şema için deterministik (temperature=0); cache
     # pahalı LLM çağrısını tekrar etmeyi önler. Cache key (model + şema) hash'i

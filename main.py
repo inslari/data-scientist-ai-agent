@@ -11,6 +11,8 @@ from api.models.job import BackgroundJobModel  # Must be imported so the table i
 from api.models.data_group_query import DataGroupQueryModel  # Must be imported so the table is created
 from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # Must be imported so the table is created
 from api.models.log_entry import LogEntryModel  # Must be imported so the app_logs table is created
+from api.models.text_analysis import TextAnalysisModel  # Must be imported so the text_analyses table is created
+from api.models.text_cache import TextAnalysisCacheModel  # Must be imported so the text_analysis_cache table is created
 
 # Yapısal logging — süreç başında bir kez. API'de DB logging varsayılan kapalı
 # (LOG_DB_ENABLED=true ile açılabilir); tablo yine create_all ile oluşur.
@@ -20,6 +22,10 @@ setup_logging(process="api")
 # Create all DB tables
 Base.metadata.create_all(bind=engine)
 
+# Mevcut DB'lerde eksik kolonları idempotent ekle (background_jobs.text_analysis_id)
+from api.core.text_analysis_migrate import ensure_text_analysis_schema
+ensure_text_analysis_schema()
+
 from api.routes.mcp import router as mcp_router
 from api.routes.csv import router as csv_router
 from api.routes.data_group import router as data_group_router
@@ -27,6 +33,7 @@ from api.routes.project import router as project_router
 from api.routes.auth import router as auth_router
 from api.routes.domain_pack import router as domain_pack_router
 from api.routes.data_group_query import router as data_group_query_router
+from api.routes.text_analysis import router as text_analysis_router
 
 from contextlib import asynccontextmanager
 import asyncio
@@ -78,6 +85,7 @@ app.include_router(mcp_router)
 app.include_router(csv_router)
 app.include_router(auth_router)
 app.include_router(domain_pack_router)
+app.include_router(text_analysis_router)
 
 
 @app.get("/health", tags=["System"])

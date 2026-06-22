@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 class SQLGenerationResult(BaseModel):
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
     sql: str = Field(description="SQL sorgusu")
     db_name: str = Field(description="Sorgunun çalıştırılacağı veritabanı adı")
     data_warning: Optional[str] = Field(default="", description="Uygun kolon bulunamadığında verilecek uyarı mesajı")
@@ -10,7 +10,7 @@ class SQLGenerationResult(BaseModel):
     approximation_warning: Optional[str] = Field(default="", description="Yaklaşık bir eşleşme yapıldıysa verilecek uyarı mesajı")
 
 class ChartConfig(BaseModel):
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
     type: str = Field(description="Grafik türü")
     x: str = Field(description="X ekseni")
     y: str = Field(description="Y ekseni")

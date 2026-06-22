@@ -4,7 +4,7 @@ from typing import Literal
 
 class LeakageConcern(BaseModel):
     """Tek bir leakage şüphesi."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     column_name: str = Field(
         description="Şüpheli feature kolonunun adı"
@@ -28,7 +28,7 @@ class LeakageConcern(BaseModel):
 
 class LeakageReport(BaseModel):
     """LLM'in tüm leakage analizinin sonucu."""
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     concerns: list[LeakageConcern] = Field(
         default_factory=list,

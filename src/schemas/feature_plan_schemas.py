@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 from typing import Literal
 
 class TargetDefinition(BaseModel):
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     column_name: str = Field(
         description="Hedef değişkenin adı. Mevcut değilse türetilecek isim (örn: 'churn', 'revenue', 'segment')"
@@ -35,7 +35,7 @@ class TargetDefinition(BaseModel):
     )
 
 class AggregationConfig(BaseModel):
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     required: bool = Field(
         description="True ise veri aggregation gerektirir (müşteri bazında gibi)"
@@ -49,7 +49,7 @@ class AggregationConfig(BaseModel):
     )
 
 class FeaturePlan(BaseModel):
-    model_config = {"extra": "forbid"}
+    model_config = {"extra": "ignore"}
 
     analysis_summary: str = Field(
         description="Kullanıcının ne yapmak istediğinin tek cümlelik Türkçe özeti"

@@ -15,42 +15,10 @@ from api.models.user import UserModel
 from api.models.mcp import MCPConfigModel
 from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # table auto-created via create_all
 from api.models.log_entry import LogEntryModel  # app_logs table — DB logging hedefi
-from api.core.worker import job_worker_loop
+from api.models.text_analysis import TextAnalysisModel  # text_analyses table — create_all
+from api.models.text_cache import TextAnalysisCacheModel  # text_analysis_cache table — create_all
+from api.core.worker import job_worker_loop, recover_interrupted_jobs, PROJECT_TASK_TYPES
 
-def recover_interrupted_jobs():
-    """
-    On startup:
-      Re-queue any jobs that were left in 'running' or 'pending' state from
-      a previous worker crash (inbox recovery). We reset their status to
-      'pending' so the worker loop picks them up cleanly.
-    """
-    print("[Worker Process] Running startup job recovery...")
-    db = SessionLocal()
-    try:
-        # Recover interrupted jobs: set 'running' → 'pending' so the worker retries them
-        stuck_jobs = (
-            db.query(BackgroundJobModel)
-            .filter(BackgroundJobModel.status.in_(["running", "pending"]))
-            .all()
-        )
-        for job in stuck_jobs:
-            print(f"[Worker Process] Re-queuing interrupted job id={job.id} for project_id={job.project_id}")
-            job.status = "pending"
-            job.updated_at = int(time.time())
-
-        # Also make sure corresponding projects show 'queued' instead of 'running'
-        if stuck_jobs:
-            project_ids = [j.project_id for j in stuck_jobs if j.project_id]
-            db.query(ProjectModel).filter(ProjectModel.id.in_(project_ids)).update(
-                {"status": "queued"}, synchronize_session=False
-            )
-
-        db.commit()
-        print(f"[Worker Process] Recovered {len(stuck_jobs)} jobs.")
-    except Exception as e:
-        print(f"[Worker Process] Error recovering jobs: {e}")
-    finally:
-        db.close()
 
 def main():
     from src.core.logging_config import setup_logging
@@ -59,20 +27,26 @@ def main():
 
     print("==============================================")
     print("   Data Scientist AI Agent - Worker Process   ")
+    print("   (lane: ML projects — text analysis ayrı)   ")
     print("==============================================")
 
     # Ensure tables exist
     Base.metadata.create_all(bind=engine)
-    
-    # Clean up any stuck jobs
-    recover_interrupted_jobs()
-    
-    print("[Worker Process] Starting job loop...")
+
+    # Mevcut DB'lerde eksik kolonları idempotent ekle (background_jobs.text_analysis_id)
+    from api.core.text_analysis_migrate import ensure_text_analysis_schema
+    ensure_text_analysis_schema()
+
+    # Sadece KENDİ lane'indeki (proje) işleri kurtar — text analizi işlerine dokunma.
+    recovered = recover_interrupted_jobs(task_types=PROJECT_TASK_TYPES)
+    print(f"[Worker Process] Recovered {recovered} project jobs.")
+
+    print("[Worker Process] Starting job loop (project lane)...")
     try:
         import sys
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        asyncio.run(job_worker_loop())
+        asyncio.run(job_worker_loop(task_types=PROJECT_TASK_TYPES))
     except KeyboardInterrupt:
         print("\n[Worker Process] Shutting down cleanly due to KeyboardInterrupt.")
 

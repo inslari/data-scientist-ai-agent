@@ -33,16 +33,27 @@ logger = get_logger(__name__)
 # How long the worker sleeps between polling cycles when there is nothing to do.
 POLL_INTERVAL_SECONDS = 5
 
+# Job "lanes" — each worker process handles only its own task types so the
+# text-analysis worker and the ML-project worker are fully decoupled (they share
+# the queue table but never compete for each other's jobs).
+PROJECT_TASK_TYPES = ["run_project", "generate_ttd_suggestions"]
+TEXT_ANALYSIS_TASK_TYPES = ["run_text_analysis"]
 
-async def job_worker_loop() -> None:
+
+async def job_worker_loop(task_types: list[str] | None = None) -> None:
     """
     Continuously polls the background_jobs table and executes pending jobs.
     Designed to be run as a single long-lived asyncio.Task.
+
+    Args:
+        task_types: Only pick jobs whose task_type is in this list (the worker's
+            "lane"). None = pick any job (legacy behavior).
     """
-    logger.info("[Worker] Background job worker started.")
+    lane = "+".join(task_types) if task_types else "all"
+    logger.info(f"[Worker] Background job worker started (lane={lane}).")
     while True:
         try:
-            await _process_next_job()
+            await _process_next_job(task_types)
         except asyncio.CancelledError:
             logger.info("[Worker] Worker task cancelled — shutting down cleanly.")
             break
@@ -54,34 +65,37 @@ async def job_worker_loop() -> None:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
-async def _process_next_job() -> None:
+async def _process_next_job(task_types: list[str] | None = None) -> None:
     """
-    Picks the oldest pending job, marks it as running, and executes it.
-    Uses a fresh SessionLocal for each poll to avoid stale state.
+    Picks the oldest pending job (optionally restricted to a task-type lane),
+    marks it as running, and executes it. Uses a fresh SessionLocal per poll.
     """
     from api.core.database import SQLALCHEMY_DATABASE_URL
     is_postgres = SQLALCHEMY_DATABASE_URL.startswith("postgresql")
-    
+
     db = SessionLocal()
     try:
         # Build the query
         q = (
             db.query(BackgroundJobModel)
             .filter(BackgroundJobModel.status == "pending")
-            .order_by(BackgroundJobModel.created_at.asc())
         )
-        
+        if task_types:
+            q = q.filter(BackgroundJobModel.task_type.in_(task_types))
+        q = q.order_by(BackgroundJobModel.created_at.asc())
+
         # Apply row-level lock (SKIP LOCKED) for Postgres to prevent concurrent worker collisions
         if is_postgres:
             q = q.with_for_update(skip_locked=True)
-            
+
         # Pick the oldest pending job (FIFO)
         job: BackgroundJobModel | None = q.first()
 
         if job is None:
             return  # Nothing to do; caller will sleep
 
-        logger.info(f"[Worker] Picked up job id={job.id} for project_id={job.project_id}")
+        logger.info(f"[Worker] Picked up job id={job.id} (task_type={job.task_type}, "
+                    f"project_id={job.project_id}, text_analysis_id={job.text_analysis_id})")
         job.status = "running"
         job.updated_at = int(time.time())
         db.commit()
@@ -95,6 +109,53 @@ async def _process_next_job() -> None:
         await _execute_job(job)
 
 
+def recover_interrupted_jobs(task_types: list[str] | None = None) -> int:
+    """
+    Startup recovery (inbox pattern): re-queue jobs left in 'running'/'pending'
+    from a previous crash, restricted to the given lane. Also resets the owning
+    record (ProjectModel / TextAnalysisModel) status back to 'queued'.
+
+    Returns the number of jobs recovered. Each worker calls this for its OWN lane
+    only, so the two workers never reset each other's jobs.
+    """
+    db = SessionLocal()
+    try:
+        q = db.query(BackgroundJobModel).filter(
+            BackgroundJobModel.status.in_(["running", "pending"])
+        )
+        if task_types:
+            q = q.filter(BackgroundJobModel.task_type.in_(task_types))
+        stuck = q.all()
+
+        for job in stuck:
+            job.status = "pending"
+            job.updated_at = int(time.time())
+
+        # Reset owning records so the UI doesn't show a stale 'running'.
+        proj_ids = [j.project_id for j in stuck if j.task_type == "run_project" and j.project_id]
+        if proj_ids:
+            db.query(ProjectModel).filter(ProjectModel.id.in_(proj_ids)).update(
+                {"status": "queued"}, synchronize_session=False
+            )
+
+        ta_ids = [j.text_analysis_id for j in stuck
+                  if j.task_type == "run_text_analysis" and j.text_analysis_id]
+        if ta_ids:
+            from api.models.text_analysis import TextAnalysisModel
+            db.query(TextAnalysisModel).filter(TextAnalysisModel.id.in_(ta_ids)).update(
+                {"status": "queued"}, synchronize_session=False
+            )
+
+        db.commit()
+        return len(stuck)
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[Worker] Job recovery failed: {e}")
+        return 0
+    finally:
+        db.close()
+
+
 async def _execute_job(job: BackgroundJobModel) -> None:
     """
     Dispatches a job to the appropriate handler based on task_type.
@@ -104,8 +165,91 @@ async def _execute_job(job: BackgroundJobModel) -> None:
         await _run_project_job(job)
     elif job.task_type == "generate_ttd_suggestions":
         await _generate_ttd_suggestions_job(job)
+    elif job.task_type == "run_text_analysis":
+        await _run_text_analysis_job(job)
     else:
         _mark_job(job.id, "failed", f"Unknown task_type: {job.task_type}")
+
+
+async def _run_text_analysis_job(job: BackgroundJobModel) -> None:
+    """
+    Yazılı geri bildirim analizi grafiğini çalıştırır (paralel pipeline).
+
+    run_project'ten farklı olarak LangGraph checkpoint'i KULLANMAZ: iş kısa,
+    resume gerekmez. Sonuç `TextAnalysisModel.result` (JSON) + `.report`
+    (markdown) alanlarına yazılır; durum completed/failed olur.
+    """
+    from api.models.text_analysis import TextAnalysisModel
+    from src.graphs.textanalysis.graph import build_text_analysis_graph
+
+    ta_id = job.text_analysis_id
+    if not ta_id:
+        _mark_job(job.id, "failed", "run_text_analysis: text_analysis_id missing")
+        return
+
+    set_project(ta_id)
+
+    # Girdiyi oku + durumu 'running' yap.
+    db = SessionLocal()
+    title = None
+    raw_texts: list = []
+    language = "auto"
+    try:
+        ta = db.query(TextAnalysisModel).filter(TextAnalysisModel.id == ta_id).first()
+        if not ta:
+            _mark_job(job.id, "failed", f"TextAnalysis {ta_id} not found")
+            return
+        title = ta.title
+        raw_texts = list(ta.source_texts or [])
+        language = ta.language or "auto"
+        ta.status = "running"
+        ta.error = None
+        db.commit()
+    finally:
+        db.close()
+
+    error_trace: str | None = None
+    final_state: dict = {}
+    try:
+        app = build_text_analysis_graph()
+        initial_state = {"title": title, "raw_texts": raw_texts, "language": language}
+        final_state = await app.ainvoke(initial_state)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        error_trace = traceback.format_exc()
+        logger.error(f"[Worker] Text analysis failed for id={ta_id}:\n{error_trace}")
+
+    # Graf içi (taşınan) hata da başarısızlık sayılır.
+    graph_error = final_state.get("error") if isinstance(final_state, dict) else None
+
+    db = SessionLocal()
+    try:
+        ta = db.query(TextAnalysisModel).filter(TextAnalysisModel.id == ta_id).first()
+        if ta:
+            if error_trace or graph_error:
+                ta.status = "failed"
+                ta.error = error_trace or graph_error
+                ta.report = final_state.get("report") if isinstance(final_state, dict) else None
+            else:
+                ta.status = "completed"
+                ta.report = final_state.get("report", "")
+                ta.result = {
+                    "item_results": final_state.get("item_results", []),
+                    "sentiment_distribution": final_state.get("sentiment_distribution", {}),
+                    "category_distribution": final_state.get("category_distribution", {}),
+                    "urgency_distribution": final_state.get("urgency_distribution", {}),
+                    "aspect_distribution": final_state.get("aspect_distribution", {}),
+                    "timestamp_detection": final_state.get("timestamp_detection", {}),
+                    "time_trend": final_state.get("time_trend", []),
+                    "themes": final_state.get("themes", []),
+                    "priority_items": final_state.get("priority_items", []),
+                }
+            db.commit()
+    finally:
+        db.close()
+
+    _mark_job(job.id, "failed" if (error_trace or graph_error) else "completed", error_trace or graph_error)
 
 
 async def _generate_ttd_suggestions_job(job: BackgroundJobModel) -> None:

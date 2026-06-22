@@ -36,9 +36,12 @@ def get_llm(
         
     elif actual_provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        # Default fallback for google if openai default was passed implicitly
-        if actual_model_name == settings.DEFAULT_LLM_MODEL and "gemini" not in actual_model_name:
-            actual_model_name = "gemini-1.5-pro"
+        # Default fallback only when an obviously non-Google model name slipped
+        # through (e.g. the OpenAI default was left in place but provider=google).
+        # Gemini *and* Gemma names are valid Google models and must pass through.
+        is_google_model = ("gemini" in actual_model_name) or ("gemma" in actual_model_name)
+        if actual_model_name == settings.DEFAULT_LLM_MODEL and not is_google_model:
+            actual_model_name = "gemini-2.5-flash"
         return ChatGoogleGenerativeAI(model=actual_model_name, temperature=actual_temperature)
         
     elif actual_provider == "ollama":
