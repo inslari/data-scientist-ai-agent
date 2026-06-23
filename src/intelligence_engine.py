@@ -175,13 +175,44 @@ class _UnwrappingPydanticParser(BaseOutputParser):
         arbitrary_types_allowed = True
 
     def parse(self, text: str):
+        raw = text
         # Strip markdown code fences if present
-        text = text.strip()
+        text = (text or "").strip()
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
         if json_match:
-            text = json_match.group(1)
-        
-        data = json.loads(text)
+            text = json_match.group(1).strip()
+
+        if not text:
+            snippet = (raw or "")[:500]
+            logger.error(
+                f"[intelligence] LLM returned an empty/non-JSON response "
+                f"(len={len(raw or '')}). Raw snippet: {snippet!r}"
+            )
+            raise ValueError(
+                "Intelligence engine LLM returned an empty response; expected a JSON object."
+            )
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            # Fallback: the model may have wrapped JSON in prose. Salvage the
+            # outermost {...} object before giving up.
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    data = json.loads(text[start:end + 1])
+                except json.JSONDecodeError:
+                    data = None
+            else:
+                data = None
+
+            if data is None:
+                logger.error(
+                    f"[intelligence] Failed to parse LLM response as JSON: {e}. "
+                    f"Raw snippet: {text[:500]!r}"
+                )
+                raise
+
         data = _unwrap_llm_json(data)
         return self.pydantic_object.model_validate(data)
 

@@ -65,6 +65,13 @@ class Settings:
     EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
+    # Ollama generation limits. The defaults (num_ctx=2048, capped num_predict)
+    # are far too small for schema-analysis prompts + their large JSON output:
+    # the prompt overflows the context window (→ empty response) or the JSON is
+    # truncated mid-object (→ JSONDecodeError). Bump both generously.
+    OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
+    OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "8192"))
+
     # Intelligence Engine schema-analysis cache (project bazlı, application DB'de).
     # analyze_schema çıktısı aynı şema için deterministik (temperature=0); cache
     # pahalı LLM çağrısını tekrar etmeyi önler. Cache key (model + şema) hash'i
