@@ -48,10 +48,12 @@ from sklearn.metrics import (
     davies_bouldin_score,
     calinski_harabasz_score,
 )
-from sklearn.model_selection import StratifiedKFold, KFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold, KFold, cross_val_score, cross_val_predict
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import roc_curve, precision_recall_curve
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
+from scipy.optimize import minimize
 from src.state import AgentState
 
 from src.core.logging_config import get_logger
@@ -166,6 +168,18 @@ def _importances_from(est: Any, feature_names: list[str]):
 def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
     try:
         base = _unwrap_to_estimator(model)
+        # OOF ağırlıklı blend: fitted base'lerin importance'larını BLEND AĞIRLIĞIYLA ortala.
+        if isinstance(base, (WeightedProbaBlend, WeightedMeanBlend)) and hasattr(base, "fitted_"):
+            arrs = []
+            for w, sub in zip(base.weights_, base.fitted_):
+                a = _importances_from(_unwrap_to_estimator(sub), feature_names)
+                if a is not None:
+                    arrs.append(a * w)
+            if arrs:
+                avg = np.sum(arrs, axis=0)
+                imp = dict(zip(feature_names, avg.tolist()))
+                return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
+            return {}
         # StackingClassifier/Regressor: fitted base'lerin importance'larını ortala.
         # (RandomForest gibi 'estimators_'ı olan ama final_estimator_ olmayan
         #  modellerle karışmasın diye iki niteliği birlikte kontrol ederiz.)
@@ -504,6 +518,186 @@ def _build_stacking_candidate(models, results, X_train, y_train, scoring, is_imb
         return None, None
 
 
+# ── OOF (out-of-fold) ağırlıklı blend ────────────────────────
+# Grandmaster ensemble'ın özü: stacking gibi bir meta-model OGRENMEK yerine, en iyi
+# K modelin OOF (cross_val_predict ile leakage-free) tahminleri DOGRUDAN optimize
+# edilmis agirliklarla harmanlanir. Agirliklar OOF metrigini (AUC/R²) maksimize eder
+# (scipy, w>=0 & Σw=1). Stacking'den farki: meta-model yok → asiri-uyum riski dusuk,
+# yorumlanabilir (her modelin katki agirligi acik), grandmaster `preds_weights`'in
+# tabular karsiligi. Blend YALNIZCA OOF'ta en iyi tek modeli gecerse secilir.
+_BLEND_TOP_K = 4          # en fazla bu kadar modeli harmanla (maliyet siniri)
+_BLEND_MIN_SAMPLES = 50   # bundan az ornekte OOF agirlik optimizasyonu kararsiz → atla
+
+
+class WeightedProbaBlend(BaseEstimator, ClassifierMixin):
+    """K sinitlandiricinin predict_proba ciktilarinin sabit-agirlikli ortalamasi.
+    Modul-seviyesi sinif → joblib ile picklable. fit her base'i tum train'e fit eder;
+    predict_proba agirlikli olasilik ortalamasi, predict argmax."""
+
+    def __init__(self, estimators=None, weights=None):
+        self.estimators = estimators      # [(name, unfitted_estimator), ...]
+        self.weights = weights
+
+    def fit(self, X, y):
+        self.classes_ = np.unique(y)
+        self.fitted_ = []
+        for _name, est in self.estimators:
+            e = clone(est)
+            e.fit(X, y)
+            self.fitted_.append(e)
+        w = np.asarray(self.weights, dtype=float)
+        self.weights_ = w / w.sum() if w.sum() > 0 else np.ones(len(w)) / len(w)
+        return self
+
+    def predict_proba(self, X):
+        P = None
+        for w, e in zip(self.weights_, self.fitted_):
+            p = e.predict_proba(X)
+            P = w * p if P is None else P + w * p
+        return P
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+
+class WeightedMeanBlend(BaseEstimator, RegressorMixin):
+    """K regresörün predict ciktilarinin sabit-agirlikli ortalamasi (regression blend)."""
+
+    def __init__(self, estimators=None, weights=None):
+        self.estimators = estimators
+        self.weights = weights
+
+    def fit(self, X, y):
+        self.fitted_ = []
+        for _name, est in self.estimators:
+            e = clone(est)
+            e.fit(X, y)
+            self.fitted_.append(e)
+        w = np.asarray(self.weights, dtype=float)
+        self.weights_ = w / w.sum() if w.sum() > 0 else np.ones(len(w)) / len(w)
+        return self
+
+    def predict(self, X):
+        pred = None
+        for w, e in zip(self.weights_, self.fitted_):
+            p = e.predict(X)
+            pred = w * p if pred is None else pred + w * p
+        return pred
+
+
+def _optimize_blend_weights(oof_list: list, y_true: np.ndarray, metric_fn) -> tuple[np.ndarray, float]:
+    """OOF tahmin listesini metrigi maksimize edecek agirliklarla harmanla.
+    Nelder-Mead kullanilir (AUC gibi parcali-sabit/turevsiz metrikte SLSQP'den saglam);
+    her adimda agirliklar clip(>=0)+normalize edilir (basit simpleks projeksiyonu).
+    oof_list elemanlari binary'de 1D (pozitif olasilik / tahmin), multiclass'ta 2D (n,c).
+    Donus: (normalize agirliklar, en iyi metrik skoru)."""
+    P = np.stack(oof_list, axis=0)   # (K, n) | (K, n, c)
+    K = P.shape[0]
+
+    def _blend(w):
+        w = np.clip(w, 0, None)
+        s = w.sum()
+        w = w / s if s > 0 else np.ones(K) / K
+        return np.tensordot(w, P, axes=1)
+
+    def _neg(w):
+        try:
+            return -float(metric_fn(y_true, _blend(w)))
+        except Exception:
+            return 1e9
+
+    x0 = np.ones(K) / K
+    best_w, best_score = x0, -_neg(x0)
+    # Birkac baslangic (esit + her modele tam agirlik) ile yerel-minimum riskini azalt
+    starts = [x0] + [np.eye(K)[i] for i in range(K)]
+    for s0 in starts:
+        res = minimize(_neg, s0, method="Nelder-Mead",
+                       options={"maxiter": 1000, "xatol": 1e-4, "fatol": 1e-6})
+        w = np.clip(res.x, 0, None)
+        w = w / w.sum() if w.sum() > 0 else np.ones(K) / K
+        score = -_neg(w)
+        if score > best_score:
+            best_w, best_score = w, score
+    return best_w, float(best_score)
+
+
+def _build_oof_blend_candidate(
+    models, results, X_train, y_train, cv, is_binary, is_imbalanced,
+) -> tuple[Any, float | None, np.ndarray | None]:
+    """Top-K modelin OOF olasiliklarini optimize agirliklarla harmanlayan UNFITTED
+    WeightedProbaBlend + OOF skoru dondurur. Imbalanced'da her base SMOTE pipeline'ina
+    sarilir (fold-ici, leakage-free). Yetersiz veri/aday → (None, None, None)."""
+    if len(X_train) < _BLEND_MIN_SAMPLES:
+        return None, None, None
+    ranked = [n for n in sorted(results, key=lambda k: results[k]["score"], reverse=True)
+              if n in models]
+    base_names = ranked[:_BLEND_TOP_K]
+    if len(base_names) < 2:
+        return None, None, None
+
+    oof_list, used = [], []
+    for n in base_names:
+        m = _wrap_with_smote(clone(models[n]), y_train) if is_imbalanced else clone(models[n])
+        try:
+            oof = cross_val_predict(m, X_train, y_train, cv=cv, method="predict_proba", n_jobs=-1)
+        except Exception as e:
+            logger.info(f"[automl] OOF blend: '{n}' atlandi ({e})")
+            continue
+        oof_list.append(oof[:, 1] if is_binary else oof)
+        used.append(n)
+    if len(used) < 2:
+        return None, None, None
+
+    if is_binary:
+        metric = lambda y, p: roc_auc_score(y, p)
+    else:
+        metric = lambda y, p: roc_auc_score(y, p, multi_class="ovr", average="weighted")
+    w, blend_score = _optimize_blend_weights(oof_list, y_train, metric)
+
+    estimators = [
+        (n, _wrap_with_smote(clone(models[n]), y_train) if is_imbalanced else clone(models[n]))
+        for n in used
+    ]
+    blend = WeightedProbaBlend(estimators=estimators, weights=w)
+    logger.info(f"[automl] {'oof_blend':25s} ROC-AUC: {blend_score:.4f} "
+          f"(agirliklar={dict(zip(used, np.round(w, 3).tolist()))})")
+    return blend, float(blend_score), w
+
+
+def _build_oof_blend_candidate_reg(
+    models, results, X_train, y_train, cv,
+) -> tuple[Any, float | None, np.ndarray | None]:
+    """Regression OOF blend: top-K regresörün OOF tahminlerini R²'yi maksimize eden
+    agirliklarla harmanlar. UNFITTED WeightedMeanBlend + OOF R² dondurur."""
+    if len(X_train) < _BLEND_MIN_SAMPLES:
+        return None, None, None
+    ranked = [n for n in sorted(results, key=lambda k: results[k]["score"], reverse=True)
+              if n in models]
+    base_names = ranked[:_BLEND_TOP_K]
+    if len(base_names) < 2:
+        return None, None, None
+
+    oof_list, used = [], []
+    for n in base_names:
+        try:
+            oof = cross_val_predict(clone(models[n]), X_train, y_train, cv=cv, n_jobs=-1)
+        except Exception as e:
+            logger.info(f"[automl] OOF blend (reg): '{n}' atlandi ({e})")
+            continue
+        oof_list.append(oof)
+        used.append(n)
+    if len(used) < 2:
+        return None, None, None
+
+    metric = lambda y, p: r2_score(y, p)
+    w, blend_score = _optimize_blend_weights(oof_list, y_train, metric)
+    estimators = [(n, clone(models[n])) for n in used]
+    blend = WeightedMeanBlend(estimators=estimators, weights=w)
+    logger.info(f"[automl] {'oof_blend':25s} R²: {blend_score:.4f} "
+          f"(agirliklar={dict(zip(used, np.round(w, 3).tolist()))})")
+    return blend, float(blend_score), w
+
+
 def _calibrated_fit(model, X_train, y_train, sample_weight, n_samples):
     """Modeli CalibratedClassifierCV ile sarıp fit eder (olasılık kalibrasyonu).
 
@@ -621,19 +815,32 @@ def _run_classification(
     logger.info(f"\n[automl] Baseline en iyi (tek model): {best_name_single} "
           f"(ROC-AUC: {results[best_name_single]['score']:.4f})")
 
-    # ── Stacking ensemble adayı (top 2-3 model) ──
+    # ── Ensemble adayları: (1) stacking (meta-model), (2) OOF ağırlıklı blend ──
     ensemble_model, ensemble_score = _build_stacking_candidate(
         models, results, X_train, y_train, scoring, is_imbalanced
     )
     if ensemble_score is not None:
         results["stacking_ensemble"] = {"score": ensemble_score, "std": 0.0, "time": 0.0}
 
-    # ── Seçim: ensemble tek modeli geçti mi? ──
-    best_name = max(results, key=lambda k: results[k]["score"])
-    use_ensemble = best_name == "stacking_ensemble" and ensemble_model is not None
+    blend_model, blend_score, blend_weights = _build_oof_blend_candidate(
+        models, results, X_train, y_train, cv, is_binary, is_imbalanced
+    )
+    if blend_score is not None:
+        results["oof_blend"] = {"score": blend_score, "std": 0.0, "time": 0.0}
 
-    if use_ensemble:
-        logger.info(f"[automl] Ensemble seçildi (ROC-AUC: {ensemble_score:.4f} > "
+    # ── Seçim: en yüksek OOF/CV skorlu aday (tek model / stacking / blend) ──
+    best_name = max(results, key=lambda k: results[k]["score"])
+    use_blend    = best_name == "oof_blend" and blend_model is not None
+    use_stacking = best_name == "stacking_ensemble" and ensemble_model is not None
+    use_ensemble = use_blend or use_stacking   # metrik bayrağı (ikisi de "ensemble")
+
+    if use_blend:
+        logger.info(f"[automl] OOF blend seçildi (ROC-AUC: {blend_score:.4f} > "
+              f"tek model {results[best_name_single]['score']:.4f})")
+        selected_model = blend_model             # unfitted; base'ler SMOTE'la sarılı
+        gb_imbalanced_path = False
+    elif use_stacking:
+        logger.info(f"[automl] Stacking seçildi (ROC-AUC: {ensemble_score:.4f} > "
               f"tek model {results[best_name_single]['score']:.4f})")
         selected_model = ensemble_model          # unfitted; SMOTE base'lerin içinde
         gb_imbalanced_path = False
@@ -651,8 +858,10 @@ def _run_classification(
     # GradientBoosting+imbalanced sample_weight ile eğitilir; diğerlerinde SMOTE
     # pipeline veya class_weight zaten dengeyi sağlar.
     sample_weight = compute_sample_weight("balanced", y_train) if gb_imbalanced_path else None
-    # cv=3 kalibrasyon için her sınıfta yeterli örnek olmalı.
-    can_calibrate = is_binary and int(counts.min()) >= 6
+    # cv=3 kalibrasyon için her sınıfta yeterli örnek olmalı. Blend için kalibrasyon
+    # atlanır: AUC-optimize harman zaten sıralama-temelli, kalibrasyon ek maliyet +
+    # WeightedProbaBlend'i CV ile sarmak gereksiz pahalı.
+    can_calibrate = is_binary and int(counts.min()) >= 6 and not use_blend
     if can_calibrate:
         best_model, calibration_applied = _calibrated_fit(
             selected_model, X_train, y_train, sample_weight, n_samples=len(y_train)
@@ -702,8 +911,12 @@ def _run_classification(
         "optimal_threshold":   round(optimal_threshold, 4),
         "calibration_applied": calibration_applied,
         "ensemble_used":       use_ensemble,
+        "ensemble_type":       "oof_blend" if use_blend else ("stacking" if use_stacking else None),
     }
- 
+    if use_blend and blend_weights is not None:
+        _blend_bases = [name for name, _ in blend_model.estimators]
+        metrics["blend_weights"] = dict(zip(_blend_bases, np.round(blend_weights, 4).tolist()))
+
     if y_prob is not None:
         try:
             if is_binary:
@@ -787,13 +1000,29 @@ def _run_regression(
     if not results:
         raise ValueError("Hiçbir regression modeli çalışmadı.")
  
+    best_name_single = max(results, key=lambda k: results[k]["score"])
+    logger.info(f"\n[automl] Baseline en iyi: {best_name_single} (R²: {results[best_name_single]['score']:.4f})")
+
+    # ── OOF ağırlıklı blend adayı (top-K regresör, R² optimize ağırlık) ──
+    blend_model, blend_score, blend_weights = _build_oof_blend_candidate_reg(
+        models, results, X_train, y_train_transformed, cv
+    )
+    if blend_score is not None:
+        results["oof_blend"] = {"score": blend_score, "std": 0.0, "time": 0.0}
+
     best_name = max(results, key=lambda k: results[k]["score"])
-    logger.info(f"\n[automl] Baseline en iyi: {best_name} (R²: {results[best_name]['score']:.4f})")
- 
-    # Optuna tuning
-    tuned_model = _tune_model_regression(best_name, X_train, y_train_transformed, strong_regularization)
-    best_model  = tuned_model if tuned_model is not None else models[best_name]
- 
+    use_blend = best_name == "oof_blend" and blend_model is not None
+
+    if use_blend:
+        logger.info(f"[automl] OOF blend seçildi (R²: {blend_score:.4f} > "
+              f"tek model {results[best_name_single]['score']:.4f})")
+        best_model = blend_model          # unfitted; aşağıda fit edilir
+    else:
+        best_name = best_name_single
+        # Optuna tuning
+        tuned_model = _tune_model_regression(best_name, X_train, y_train_transformed, strong_regularization)
+        best_model  = tuned_model if tuned_model is not None else models[best_name]
+
     # Final training
     best_model.fit(X_train, y_train_transformed)
  
@@ -808,8 +1037,11 @@ def _run_regression(
         y_pred      = y_pred_transformed
         y_test_orig = y_test
  
-    # Negative predictions reset to 0 (safety after log transform)
-    y_pred = np.maximum(y_pred, 0)
+    # Negatif tahminleri 0'a kırp — YALNIZCA log1p uygulandıysa (orijinal hedef ≥0
+    # idi, expm1 sonrası negatif anlamsız). log YOKSA hedef meşru negatif alabilir
+    # (örn. kâr/zarar, sıcaklık farkı); koşulsuz kırpma o tahminleri bozar.
+    if log_applied:
+        y_pred = np.maximum(y_pred, 0)
  
     mse = mean_squared_error(y_test_orig, y_pred)
     r2  = r2_score(y_test_orig, y_pred)
@@ -824,8 +1056,13 @@ def _run_regression(
         "all_model_scores": {k: round(v["score"], 4) for k, v in results.items()},
         "cv_r2":        round(float(results[best_name]["score"]), 4),
         "cv_r2_std":    round(float(results[best_name]["std"]), 4),
+        "ensemble_used": use_blend,
+        "ensemble_type": "oof_blend" if use_blend else None,
     }
- 
+    if use_blend and blend_weights is not None:
+        _blend_bases = [name for name, _ in blend_model.estimators]
+        metrics["blend_weights"] = dict(zip(_blend_bases, np.round(blend_weights, 4).tolist()))
+
     metrics["feature_importance"] = _extract_feature_importance(best_model, feature_names)
     return best_name, best_model, metrics
 
@@ -1156,7 +1393,10 @@ def train_model(state: AgentState) -> dict:
 
     # Update top_models if first run
     if intent in ("classification", "regression") and not top_models:
-        all_scores = metrics.get("all_model_scores", {})
+        # Pseudo-ensemble anahtarlarini (oof_blend/stacking_ensemble) DISLA: bunlar
+        # gercek model degil → top_models'a girerse retry'da model filtresini bozar.
+        _pseudo = {"oof_blend", "stacking_ensemble"}
+        all_scores = {k: v for k, v in metrics.get("all_model_scores", {}).items() if k not in _pseudo}
         if all_scores:
             # Sort models by score descending and take top 2
             sorted_models = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
