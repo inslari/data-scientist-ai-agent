@@ -56,6 +56,13 @@ class Settings:
     DEFAULT_LLM_MODEL: str = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
     INTELLIGENCE_ENGINE_PROVIDER: str = os.getenv("INTELLIGENCE_ENGINE_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))
     INTELLIGENCE_ENGINE_MODEL: str = os.getenv("INTELLIGENCE_ENGINE_MODEL", "gpt-4o")
+
+    # Text-Analysis'e ÖZEL LLM. Intelligence engine'den BAĞIMSIZ seçilebilir
+    # (kendi env değişkenleri). Set edilmezse intelligence engine modeline düşer
+    # → geriye dönük uyumlu (mevcut kurulumlar etkilenmez).
+    TEXT_ANALYSIS_LLM_PROVIDER: str = os.getenv("TEXT_ANALYSIS_LLM_PROVIDER", INTELLIGENCE_ENGINE_PROVIDER)
+    TEXT_ANALYSIS_LLM_MODEL: str = os.getenv("TEXT_ANALYSIS_LLM_MODEL", INTELLIGENCE_ENGINE_MODEL)
+
     DEFAULT_TEMPERATURE: float = 0.0
 
     # Embedding Configuration (semantic text clustering — text-analysis feature).
@@ -64,6 +71,25 @@ class Settings:
     # falls back to a sensible per-provider default in get_embeddings().
     EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+    # ── Text-Analysis (yazılı geri bildirim) ayarları ──────────────────────────
+    # Sınıflandırma ADAPTİF partileme: sabit sayı yerine uzunluğa göre paketler.
+    # Her parti TA_BATCH_CHAR_BUDGET karaktere (≈ /4 token) kadar metin alır, ama
+    # en çok TA_BATCH_MAX_ITEMS öğe. Kısa metinler → çok öğe (verim ↑); uzun
+    # metinler → az öğe (truncation/doğruluk kaybı yok). Tek başına bütçeyi aşan
+    # uzun metin kendi partisinde gider.
+    TA_BATCH_MAX_ITEMS: int = int(os.getenv("TA_BATCH_MAX_ITEMS", "24"))
+    TA_BATCH_CHAR_BUDGET: int = int(os.getenv("TA_BATCH_CHAR_BUDGET", "6000"))
+    TA_MAX_CONCURRENCY: int = int(os.getenv("TA_MAX_CONCURRENCY", "4"))
+    # Kümeleme: embedding + yeterli veri varsa HDBSCAN dene (gürültü kümesi + değişken
+    # yoğunluk). Başarısız/uygunsuzsa KMeans'e zarifçe düşülür.
+    TA_USE_HDBSCAN: bool = os.getenv("TA_USE_HDBSCAN", "true").lower() in ("1", "true", "yes")
+    # Aspect kanonikleştirme için embedding kosinüs benzerlik eşiği (eşanlamlı birleştirme).
+    TA_ASPECT_MERGE_THRESHOLD: float = float(os.getenv("TA_ASPECT_MERGE_THRESHOLD", "0.82"))
+    # Yakın-tekrar (kopya/spam) birleştirme: normalize edilmiş metin eşitliği ile.
+    TA_DEDUP_NEAR_DUPLICATES: bool = os.getenv("TA_DEDUP_NEAR_DUPLICATES", "true").lower() in ("1", "true", "yes")
+    # PII redaksiyon: LLM'e gönderim/saklama öncesi e-posta/telefon/IBAN/kart maskeleme.
+    TA_REDACT_PII: bool = os.getenv("TA_REDACT_PII", "true").lower() in ("1", "true", "yes")
 
     # Ollama generation limits. The defaults (num_ctx=2048, capped num_predict)
     # are far too small for schema-analysis prompts + their large JSON output:

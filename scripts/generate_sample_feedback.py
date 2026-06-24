@@ -4,13 +4,17 @@ Sentetik Türkçe müşteri geri bildirimi üreteci (metin analizi özelliğini 
 Çıktı (data/sample_text_analysis/ altına, gitignored):
   - sample_feedback_tr.txt : "YYYY-MM-DD - <metin>" (satır başına bir geri bildirim)
                               → Metin Analizi ekranına DOĞRUDAN yapıştırılabilir.
-  - sample_feedback_tr.csv : date,sector,text  (gelecekteki CSV ingestion için)
+  - sample_feedback_tr.csv : date,sector,text,puan  → CSV kolon ingestion için
+                              (text_column=text, date_column=date, rating_column=puan)
 
-Özellikler:
+Özellikler (yeni pipeline'ın TÜM yollarını sınar):
   - 3 sektör (e-ticaret / banka / telekom), karışık sentiment + kategori + aspect
   - Tarih aralığı 2026-01..2026-06; aylara göre bilinçli trend (Şub-Mar kötü,
-    May-Haz toparlanma) → Zaman Trendi grafiğini anlamlı kılar.
-  - Ilımlı tekrar (dedup/cache yolunu da test eder).
+    May-Haz toparlanma) → Zaman Trendi + tema×zaman + spike sinyalini anlamlı kılar.
+  - puan (1-5) kolonu: polariteyle uyumlu → rating ↔ duygu doğrulaması
+  - Bilinçli puan-duygu UYUMSUZLUĞU (birkaç satır) → doğrulama sinyalini görünür kılar
+  - PII'li satırlar (e-posta/telefon/IBAN) → redaksiyon testi
+  - Yakın-tekrar (kopya/biçim varyantı) satırlar → dedup testi
   - Deterministik (RANDOM_SEED) → tekrar çalıştırınca aynı set.
 
 Çalıştırma:
@@ -104,6 +108,39 @@ TEMPLATES = {
 }
 
 
+# Polariteye göre puan (1-5) dağılımı — rating ↔ duygu doğrulaması için.
+RATING_BY_POLARITY = {
+    "neg": [1, 1, 2, 2, 3],
+    "neu": [3, 3, 4],
+    "pos": [4, 5, 5, 5],
+}
+
+# Bilinçli puan-duygu UYUMSUZLUKLARI (rating doğrulama sinyalini görünür kılar).
+MISMATCH_ROWS = [
+    ("e-ticaret", "Ürün tam bir hayal kırıklığı, hiç beğenmedim, paramı boşa harcadım.", 5),
+    ("telekom", "Her şey kusursuzdu, bağlantı hiç kopmadı, çok memnunum.", 1),
+    ("banka", "Uygulama berbat, sürekli çöküyor, rezalet bir deneyim.", 4),
+]
+
+# PII içeren satırlar (redaksiyon testi) — (sektör, metin, puan).
+PII_ROWS = [
+    ("e-ticaret", "Bana ulasin@example.com adresinden dönüş yapın, çok mağdur oldum.", 2),
+    ("telekom", "Telefonum 0532 123 45 67, lütfen hattımla ilgili acilen arayın.", 1),
+    ("banka", "İade için IBAN: TR33 0006 1005 1978 6457 8413 26 numaramı ilettim.", 3),
+]
+
+# Yakın-tekrarlar (dedup testi) — aynı şikâyetin kopya/biçim varyantları.
+NEAR_DUP_ROWS = [
+    ("e-ticaret", "Kargom hâlâ gelmedi çok bekledim!", 1),
+    ("e-ticaret", "kargom hala gelmedi cok bekledim", 1),
+    ("e-ticaret", "KARGOM HÂLÂ GELMEDİ, ÇOK BEKLEDİM.", 1),
+]
+
+
+def _rating_for(rng: random.Random, polarity: str) -> int:
+    return rng.choice(RATING_BY_POLARITY[polarity])
+
+
 def _random_date(rng: random.Random) -> date:
     month = rng.choices(list(MONTH_NEG_WEIGHT.keys()), k=1)[0]
     # Haziran'da bugüne (22) kadar; diğer aylar tam.
@@ -117,10 +154,10 @@ def _pick_text(rng: random.Random, sector: str, polarity: str) -> str:
     return tpl.format(n=rng.randint(2, 9), no=rng.randint(100000, 999999))
 
 
-def generate(rows: int) -> list[tuple[date, str, str]]:
+def generate(rows: int) -> list[tuple[date, str, str, int]]:
     rng = random.Random(SEED)
     sectors = list(TEMPLATES.keys())
-    out: list[tuple[date, str, str]] = []
+    out: list[tuple[date, str, str, int]] = []
     for _ in range(rows):
         d = _random_date(rng)
         sector = rng.choice(sectors)
@@ -130,7 +167,12 @@ def generate(rows: int) -> list[tuple[date, str, str]]:
         else:
             # kalan olasılık olumlu/nötr arasında
             polarity = "pos" if rng.random() < 0.7 else "neu"
-        out.append((d, sector, _pick_text(rng, sector, polarity)))
+        out.append((d, sector, _pick_text(rng, sector, polarity), _rating_for(rng, polarity)))
+
+    # Özel test satırları (PII / near-dup / mismatch) — rastgele tarihlerle serpiştir.
+    for sector, text, rating in (MISMATCH_ROWS + PII_ROWS + NEAR_DUP_ROWS):
+        out.append((_random_date(rng), sector, text, rating))
+
     out.sort(key=lambda r: r[0])
     return out
 
@@ -149,18 +191,19 @@ def main():
     csv_path = os.path.join(base, "sample_feedback_tr.csv")
 
     with open(txt_path, "w", encoding="utf-8") as f:
-        for d, _sector, text in rows:
+        for d, _sector, text, _rating in rows:
             f.write(f"{d.isoformat()} - {text}\n")
 
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["date", "sector", "text"])
-        for d, sector, text in rows:
-            w.writerow([d.isoformat(), sector, text])
+        w.writerow(["date", "sector", "text", "puan"])
+        for d, sector, text, rating in rows:
+            w.writerow([d.isoformat(), sector, text, rating])
 
     print(f"{len(rows)} satır üretildi.")
     print(f"  TXT (yapıştırmak için): {txt_path}")
-    print(f"  CSV (ileride ingestion): {csv_path}")
+    print(f"  CSV (kolon ingestion):  {csv_path}")
+    print("  CSV kolon eşlemesi → text_column=text, date_column=date, rating_column=puan")
 
 
 if __name__ == "__main__":

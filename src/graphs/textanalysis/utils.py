@@ -4,12 +4,41 @@ from src.core.llm import get_llm
 from src.core.config import settings
 from src.graphs.talktodata.utils import _StructuredJsonParser
 
+from src.core.logging_config import get_logger
+logger = get_logger(__name__)
+
+
+def log_token_usage(msg, where: str) -> None:
+    """Best-effort token/maliyet izleme. AIMessage'ta usage varsa loglar."""
+    try:
+        usage = getattr(msg, "usage_metadata", None) or {}
+        if usage:
+            logger.info(f"[TA tokens] {where}: in={usage.get('input_tokens')} "
+                        f"out={usage.get('output_tokens')} total={usage.get('total_tokens')}")
+    except Exception:
+        pass
+
+
+_LANG_NAMES = {"tr": "Türkçe", "en": "English"}
+
+
+def language_directive(lang: str) -> str:
+    """
+    Çıktı dilini LLM'e dayatan kısa yönerge. classify/theme/report promptlarına
+    eklenir; özet, aspect ve tema adları bu dilde üretilir.
+    """
+    name = _LANG_NAMES.get((lang or "tr").lower(), "Türkçe")
+    return f"ÖNEMLİ: Tüm serbest-metin çıktılarını (özet, aspect, tema adı, açıklama) {name} dilinde üret."
+
 
 def _get_llm(temperature: float = 0):
-    """Text-analysis için yapılandırılmış LLM (intelligence engine modeli)."""
+    """
+    Text-analysis'e ÖZEL LLM. TEXT_ANALYSIS_LLM_PROVIDER/MODEL ile ayrı seçilebilir;
+    set edilmezse intelligence engine modeline düşer (config'deki fallback).
+    """
     return get_llm(
-        provider=settings.INTELLIGENCE_ENGINE_PROVIDER,
-        model_name=settings.INTELLIGENCE_ENGINE_MODEL,
+        provider=settings.TEXT_ANALYSIS_LLM_PROVIDER,
+        model_name=settings.TEXT_ANALYSIS_LLM_MODEL,
         temperature=temperature,
     )
 

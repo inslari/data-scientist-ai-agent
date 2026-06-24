@@ -5,21 +5,22 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from src.core.nodes import node
 from src.core.config import settings
-from src.services.text_analysis_engine import distribution
+from src.services.text_analysis_engine import (
+    distribution,
+    canonicalize_aspects,
+    rating_sentiment_validation,
+    label_sentiment_validation,
+)
 from ..state import BatchClassification, ItemClassification
-from ..utils import structured_invoke
+from ..utils import structured_invoke, language_directive
 from ..cache import get_cached, set_cached
 
 from src.core.logging_config import get_logger
 logger = get_logger(__name__)
 
-# Token/güvenilirlik dengesi için metinler partiler hâlinde sınıflandırılır.
-BATCH_SIZE = 12
-# Aynı anda en fazla kaç parti LLM'e gönderilsin (rate-limit'e saygılı eşzamanlılık).
-MAX_CONCURRENCY = 4
-
 CLASSIFY_SYSTEM = """\
 Sen müşteri geri bildirimi (yorum, şikayet, talep, çağrı dökümü) analiz eden bir uzmansın.
+{lang_directive}
 Sana numaralı metinlerden oluşan bir parti verilecek. HER metin için tek tek şu alanları üret:
 
 - sentiment: positive | negative | neutral
@@ -48,7 +49,9 @@ CLASSIFY_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def _model_key() -> str:
-    return f"{settings.INTELLIGENCE_ENGINE_PROVIDER}:{settings.INTELLIGENCE_ENGINE_MODEL}"
+    # Cache anahtarı gerçek kullanılan modele bağlı: text-analiz modeli değişince
+    # eski sınıflandırma cache'i otomatik geçersizleşir.
+    return f"{settings.TEXT_ANALYSIS_LLM_PROVIDER}:{settings.TEXT_ANALYSIS_LLM_MODEL}"
 
 
 _TS_INSTRUCTION = (
@@ -74,7 +77,7 @@ def _to_payload(it: ItemClassification, text: str) -> dict:
     }
 
 
-def _classify_batch_sync(texts: list[str], ts_instruction: str = "") -> dict[str, dict]:
+def _classify_batch_sync(texts: list[str], ts_instruction: str = "", lang_directive: str = "") -> dict[str, dict]:
     """Bir partiyi (benzersiz metinler) sınıflandırır; {text: payload} döndürür."""
     numbered = "\n".join(f"[{i}] {t}" for i, t in enumerate(texts))
 
@@ -85,7 +88,8 @@ def _classify_batch_sync(texts: list[str], ts_instruction: str = "") -> dict[str
         try:
             result: BatchClassification = structured_invoke(
                 CLASSIFY_PROMPT, BatchClassification,
-                {"numbered_texts": numbered, "timestamp_instruction": ts_instruction},
+                {"numbered_texts": numbered, "timestamp_instruction": ts_instruction,
+                 "lang_directive": lang_directive},
             )
             items = list(result.items)
             break
@@ -106,6 +110,29 @@ def _classify_batch_sync(texts: list[str], ts_instruction: str = "") -> dict[str
                                     summary=text[:120], aspects=[])
         out[text] = _to_payload(it, text)
     return out
+
+
+def _make_batches(texts: list[str], max_items: int, char_budget: int) -> list[list[str]]:
+    """
+    Adaptif partileme: metinleri uzunluğa göre paketler. Bir parti en çok
+    `char_budget` karakter (≈ /4 token) veya `max_items` öğe taşır. Böylece kısa
+    metinler çok, uzun metinler az gruplanır; tek başına bütçeyi aşan uzun bir
+    metin kendi partisinde gider (kardeş metinlerce truncate edilmez).
+    """
+    batches: list[list[str]] = []
+    cur: list[str] = []
+    cur_chars = 0
+    for t in texts:
+        tlen = len(t)
+        # Mevcut parti doluysa (öğe ya da karakter sınırı) önce onu kapat.
+        if cur and (len(cur) >= max_items or cur_chars + tlen > char_budget):
+            batches.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(t)
+        cur_chars += tlen
+    if cur:
+        batches.append(cur)
+    return batches
 
 
 def _aggregate_aspects(item_results: list[dict]) -> dict:
@@ -134,7 +161,10 @@ async def ta_classify_node(state) -> dict:
     """
     texts: list[str] = state.get("texts") or []
     timestamps: list = state.get("timestamps") or []
+    ratings: list = state.get("ratings") or []
+    labels: list = state.get("labels") or []
     detection: dict = state.get("timestamp_detection") or {}
+    lang_directive = language_directive(state.get("detected_language") or "tr")
     model = _model_key()
 
     # Metin içine gömülü tarih varsa LLM'den çıkarmasını iste; kolon kaynağında
@@ -150,18 +180,21 @@ async def ta_classify_node(state) -> dict:
     cache_kind = "classify_ts" if ts_instruction else "classify"
     cached = get_cached(cache_kind, model, unique_texts)
     misses = [t for t in unique_texts if t not in cached]
-    logger.info(f"[TA] classify: {len(texts)} metin, {len(unique_texts)} benzersiz, "
-                f"{len(cached)} cache-hit, {len(misses)} LLM çağrısı (ts={'on' if ts_instruction else 'off'})")
 
-    # 3) Cache miss'leri partilere böl, eşzamanlı sınıflandır.
+    # 3) Cache miss'lerini ADAPTİF partilere böl (uzunluğa göre), eşzamanlı sınıflandır.
+    batches = _make_batches(misses, settings.TA_BATCH_MAX_ITEMS, settings.TA_BATCH_CHAR_BUDGET)
+    logger.info(f"[TA] classify: {len(texts)} metin, {len(unique_texts)} benzersiz, "
+                f"{len(cached)} cache-hit, {len(misses)} metin → {len(batches)} LLM çağrısı "
+                f"(adaptif: ≤{settings.TA_BATCH_MAX_ITEMS} öğe / ≤{settings.TA_BATCH_CHAR_BUDGET} karakter, "
+                f"eşzamanlı={settings.TA_MAX_CONCURRENCY}, ts={'on' if ts_instruction else 'off'})")
+
     results_by_text: dict[str, dict] = dict(cached)
-    if misses:
-        batches = [misses[i:i + BATCH_SIZE] for i in range(0, len(misses), BATCH_SIZE)]
-        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    if batches:
+        sem = asyncio.Semaphore(settings.TA_MAX_CONCURRENCY)
 
         async def run_batch(batch: list[str]) -> dict[str, dict]:
             async with sem:
-                return await asyncio.to_thread(_classify_batch_sync, batch, ts_instruction)
+                return await asyncio.to_thread(_classify_batch_sync, batch, ts_instruction, lang_directive)
 
         for batch_result in await asyncio.gather(*[run_batch(b) for b in batches]):
             results_by_text.update(batch_result)
@@ -183,10 +216,17 @@ async def ta_classify_node(state) -> dict:
             payload["timestamp"] = col_ts
         item_results.append({"index": i, **payload})
 
+    aspect_dist = canonicalize_aspects(_aggregate_aspects(item_results))
+    rating_validation = rating_sentiment_validation(item_results, ratings) if any(r is not None for r in ratings) else {}
+    label_validation = label_sentiment_validation(item_results, labels) if any(l is not None for l in labels) else {}
+
     return {
         "item_results": item_results,
         "sentiment_distribution": distribution([r["sentiment"] for r in item_results]),
         "category_distribution": distribution([r["category"] for r in item_results]),
         "urgency_distribution": distribution([r["urgency"] for r in item_results]),
-        "aspect_distribution": _aggregate_aspects(item_results),
+        "emotion_distribution": distribution([r.get("emotion") for r in item_results]),
+        "aspect_distribution": aspect_dist,
+        "rating_validation": rating_validation,
+        "label_validation": label_validation,
     }

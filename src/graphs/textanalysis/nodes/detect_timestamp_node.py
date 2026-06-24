@@ -1,3 +1,5 @@
+import re
+
 from langchain_core.prompts import ChatPromptTemplate
 
 from src.core.nodes import node
@@ -6,6 +8,15 @@ from ..utils import structured_invoke
 
 from src.core.logging_config import get_logger
 logger = get_logger(__name__)
+
+# Ucuz ön-kontrol: metinde tarih benzeri desen var mı? (LLM'den önce.)
+# 2026-05-01 | 01.05.2026 | 01/05/2026 | 1 Mayıs 2026 | May 1, 2026 ...
+_DATE_HINT = re.compile(
+    r"\b(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}|"
+    r"\d{1,2}\s+(?:ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık|"
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b)",
+    re.IGNORECASE,
+)
 
 DETECT_SYSTEM = """\
 Sana bir müşteri geri bildirimi kümesinden ÖRNEK satırlar verilecek. Görevin:
@@ -53,8 +64,16 @@ def ta_detect_timestamp_node(state) -> dict:
         logger.info(f"[TA] timestamp: kolon kaynağı ({col_filled}/{len(texts)})")
         return {"timestamp_detection": detection}
 
-    # 2) Metin içi tespit (örneklem üzerinden).
-    sample = "\n".join(f"- {t}" for t in texts[:12]) or "(metin yok)"
+    # 2) Ucuz ön-kontrol: örneklemin hiçbirinde tarih deseni yoksa LLM'i atla.
+    sample_texts = texts[:12]
+    if texts and not any(_DATE_HINT.search(t) for t in sample_texts):
+        logger.info("[TA] timestamp: regex ön-kontrol tarih bulamadı; LLM atlandı (source=none)")
+        return {"timestamp_detection": {
+            "has_timestamp": False, "source": "none", "confidence": 0.0, "example": "", "note": ""
+        }}
+
+    # 3) Metin içi tespit (örneklem üzerinden, LLM ile doğrulama/çıkarım).
+    sample = "\n".join(f"- {t}" for t in sample_texts) or "(metin yok)"
     try:
         result: TimestampDetection = structured_invoke(DETECT_PROMPT, TimestampDetection, {"sample": sample})
         detection = {

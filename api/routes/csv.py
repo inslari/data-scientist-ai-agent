@@ -12,6 +12,7 @@ from typing import List
 from api.core.database import get_db, DATA_DIR
 from api.core.jobs import enqueue_ttd_suggestions
 from api.core.storage import storage
+from api.core.csv_utils import read_csv_bytes, read_csv_path
 from api.models.csv import CSVFileModel
 from api.models.data_group import DataGroupModel
 from api.schemas.csv import (
@@ -90,7 +91,7 @@ async def upload_csv(
 
         # Process CSV (schema + stats) using a temp file when using MinIO
         def process_csv_bytes(csv_bytes: bytes):
-            df = pd.read_csv(io.BytesIO(csv_bytes))
+            df = read_csv_bytes(csv_bytes)
             row_count = len(df)
             columns_schema = [
                 {"name": col, "type": str(df[col].dtype)}
@@ -233,7 +234,7 @@ async def get_csv_sample_data(file_id: int, req: CSVSampleDataRequest, db: Sessi
 
     def get_sample(file_ref: str, limit: int):
         with storage.get_stream(file_ref) as stream:
-            df = pd.read_csv(stream, nrows=limit)
+            df = read_csv_bytes(stream.read(), nrows=limit)
             df = df.where(pd.notnull(df), None)  # type: ignore
             return list(df.columns), df.to_dict(orient="records")
 
@@ -259,7 +260,7 @@ async def get_csv_column_stats(file_id: int, db: Session = Depends(get_db), curr
         return {"status": "success", "data": db_file.column_stats_cache}
 
     def calculate_stats(tmp_path: str):
-        df = pd.read_csv(tmp_path)
+        df = read_csv_path(tmp_path)
         stats_df = df.describe(include='all').T
         stats_df['null_count'] = df.isnull().sum()
         stats_df['dtype'] = df.dtypes.astype(str)

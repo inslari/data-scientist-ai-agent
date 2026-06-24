@@ -17,11 +17,20 @@ class TextAnalysisState(TypedDict, total=False):
     # Opsiyonel, raw_texts ile hizalı zaman damgaları (örn. CSV tarih kolonundan).
     # Boş/None → zaman damgası metnin içinde aranır (agent tespiti).
     raw_timestamps: list          # list[str | None]
+    # Opsiyonel, raw_texts ile hizalı kullanıcı puanları (örn. CSV rating kolonu).
+    raw_ratings: list             # list[float | None]
+    # Opsiyonel, raw_texts ile hizalı ground-truth duygu etiketleri (örn. CSV
+    # "Durum"/"Görüş" gibi farklı isimli kolon; Olumlu/Olumsuz vb. serbest sözcük).
+    raw_labels: list              # list[str | None]
     language: str                 # "auto" | "tr" | "en" ...
 
     # ── preprocess çıktısı ──
     texts: list[str]              # temizlenmiş metinler (analiz bunun üzerinde)
     timestamps: list              # temizlenmiş metinlerle hizalı (str|None)
+    ratings: list                 # temizlenmiş metinlerle hizalı (float|None)
+    labels: list                  # temizlenmiş metinlerle hizalı ground-truth (str|None)
+    detected_language: str        # tespit/çözülmüş dil (tr|en) — prompt'lara aktarılır
+    duplicate_groups: dict        # {temsilci_metin: birleşen_kopya_sayısı} (near-dup)
 
     # ── timestamp tespiti (agent) ──
     # {has_timestamp: bool, source: "column"|"text"|"none", confidence: float, example: str, note: str}
@@ -33,16 +42,24 @@ class TextAnalysisState(TypedDict, total=False):
     sentiment_distribution: dict
     category_distribution: dict
     urgency_distribution: dict
+    emotion_distribution: dict
     # Aspect-based: {aspect: {positive, negative, neutral, total}}
     aspect_distribution: dict
+    # LLM duygusu ↔ CSV puanı tutarlılığı (rating kolonu varsa)
+    rating_validation: dict
+    # LLM tahmini ↔ ground-truth etiket karşılaştırmalı performansı (label kolonu varsa):
+    # {n, accuracy, confusion, per_class, mismatches, labels_seen}
+    label_validation: dict
 
     # ── theme çıktısı ──
     # {label, description, count, share, sentiment_breakdown, example_texts}
     themes: list[dict]
     priority_items: list[dict]    # en acil şikayet/talepler
+    # Tema × zaman: her temanın dönem-dönem hacmi/yönü (yükselen/düşen)
+    theme_trends: list[dict]
 
     # ── trend çıktısı (zaman damgası varsa) ──
-    # [{period, count, avg_sentiment, positive, negative, neutral}]
+    # [{period, count, avg_sentiment, positive, negative, neutral, ma_sentiment, delta_sentiment, spike}]
     time_trend: list[dict]
 
     # ── report çıktısı ──
@@ -152,5 +169,33 @@ class ThemeLabel(BaseModel):
     def _normalize(cls, values: Any) -> Any:
         if isinstance(values, dict):
             allowed = {"label", "description"}
+            return {k: v for k, v in values.items() if k in allowed}
+        return values
+
+
+class ClusterLabel(BaseModel):
+    """Batch tema etiketlemede tek bir kümenin sonucu (cluster_id ile hizalı)."""
+    cluster_id: int = Field(description="0-based id of the cluster being labeled")
+    label: str = Field(description="Short theme name (2-5 words)")
+    description: str = Field(default="", description="One-sentence description")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, values: Any) -> Any:
+        if isinstance(values, dict):
+            allowed = {"cluster_id", "label", "description"}
+            return {k: v for k, v in values.items() if k in allowed}
+        return values
+
+
+class BatchThemeLabel(BaseModel):
+    """Tüm kümeleri tek LLM çağrısında etiketler (N çağrı yerine 1)."""
+    clusters: list[ClusterLabel] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, values: Any) -> Any:
+        if isinstance(values, dict):
+            allowed = {"clusters"}
             return {k: v for k, v in values.items() if k in allowed}
         return values

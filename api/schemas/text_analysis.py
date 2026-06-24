@@ -9,10 +9,19 @@ class TextAnalysisBase(BaseModel):
 
 
 class TextAnalysisCreate(TextAnalysisBase):
-    # Kullanıcı ya yapılandırılmış bir liste (texts) ya da tek bir blok metin
-    # (raw_text — satırlara/boş satırlara göre bölünür) gönderebilir.
+    # Üç giriş yolu (öncelik sırası): yapılandırılmış liste (texts) → blok metin
+    # (raw_text, satır/boş satıra göre bölünür) → CSV kolonu (csv_file_id +
+    # text_column; opsiyonel date_column / rating_column ile hizalı tarih/puan).
     texts: Optional[List[str]] = None
     raw_text: Optional[str] = None
+
+    # CSV kolon girişi (ürünün asıl veri akışı).
+    csv_file_id: Optional[int] = None
+    text_column: Optional[str] = None
+    date_column: Optional[str] = None
+    rating_column: Optional[str] = None
+    # Ground-truth duygu etiketi kolonu (Durum/sentiment...). Performans karşılaştırması açar.
+    label_column: Optional[str] = None
 
     @field_validator("texts")
     @classmethod
@@ -20,6 +29,19 @@ class TextAnalysisCreate(TextAnalysisBase):
         if v is None:
             return v
         return [t.strip() for t in v if isinstance(t, str) and t.strip()]
+
+
+class TextAppendRequest(BaseModel):
+    """Mevcut bir analize yeni geri bildirim ekler (incremental). Re-run cache'ten
+    yararlanır: değişmeyen metinler yeniden LLM'e gitmez."""
+    texts: Optional[List[str]] = None
+    raw_text: Optional[str] = None
+    csv_file_id: Optional[int] = None
+    text_column: Optional[str] = None
+    date_column: Optional[str] = None
+    rating_column: Optional[str] = None
+    label_column: Optional[str] = None
+    run: bool = True  # ekledikten sonra otomatik çalıştır
 
 
 class TextAnalysisUpdate(BaseModel):

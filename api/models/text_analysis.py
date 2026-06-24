@@ -28,6 +28,11 @@ class TextAnalysisModel(Base):
 
     # Ham yapıştırılan metinler (her eleman bir geri bildirim).
     source_texts = Column(JSON, nullable=True)   # list[str]
+    # Opsiyonel, source_texts ile hizalı (örn. CSV kolonlarından). NULL = yok.
+    source_timestamps = Column(JSON, nullable=True)  # list[str | None]
+    source_ratings = Column(JSON, nullable=True)     # list[float | None]
+    # Ground-truth duygu etiketi (CSV'deki farklı isimli kolon: Durum/sentiment...).
+    source_labels = Column(JSON, nullable=True)      # list[str | None]
     language = Column(String, nullable=True)     # "auto" | "tr" | "en" ...
 
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)

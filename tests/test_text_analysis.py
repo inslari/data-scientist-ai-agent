@@ -211,7 +211,7 @@ def test_worker_lane_recovery_isolation(db_tables):
     from api.models.job import BackgroundJobModel
     from api.models.project import ProjectModel
     from api.models.text_analysis import TextAnalysisModel
-    from api.core.worker import recover_interrupted_jobs, TEXT_ANALYSIS_TASK_TYPES
+    from api.core.text_analysis_worker import recover_interrupted_jobs, TEXT_ANALYSIS_TASK_TYPES
 
     db = SessionLocal()
     try:

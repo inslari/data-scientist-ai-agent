@@ -31,7 +31,7 @@ from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # noqa: F
 from api.models.log_entry import LogEntryModel  # noqa: F401
 from api.models.text_analysis import TextAnalysisModel  # noqa: F401
 from api.models.text_cache import TextAnalysisCacheModel  # noqa: F401
-from api.core.worker import job_worker_loop, recover_interrupted_jobs, TEXT_ANALYSIS_TASK_TYPES
+from api.core.text_analysis_worker import job_worker_loop, recover_interrupted_jobs, TEXT_ANALYSIS_TASK_TYPES
 
 
 def main():
