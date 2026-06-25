@@ -52,7 +52,8 @@ def critic_node(state: AgentState) -> AgentState:
               f"(teşhis: {primary['type']}, severity: {primary['severity']})")
         for fb in decision["feedback"]:
             logger.info(f"[critic_node]   {fb}")
-        return {
+
+        result = {
             "retry_count": state.get("retry_count", 0) + 1,
             "critic_feedback": decision["feedback"],   # reducer ekler (delta)
             "retry_history": [this_turn],              # reducer ekler (delta)
@@ -60,6 +61,20 @@ def critic_node(state: AgentState) -> AgentState:
             "quality_gate": quality_gate,
             "current_step": "critic_node",
         }
+
+        # Leakage şüpheli kolonları → feature_builder'ın retry'da DETERMINISTIK
+        # düşürmesi için state'e biriktir (LLM'in drop_features'ına bağlı kalmadan).
+        forced = decision.get("forced_drops") or []
+        if forced:
+            existing = state.get("forced_leakage_drops") or []
+            merged = list(existing)
+            for c in forced:
+                if c not in merged:
+                    merged.append(c)
+            result["forced_leakage_drops"] = merged
+            logger.info(f"[critic_node] Forced leakage drop (retry'da uygulanacak): {merged}")
+
+        return result
 
     # Retry yok — dur
     logger.info(f"[critic_node] DURDU: {decision['stop_reason']}")

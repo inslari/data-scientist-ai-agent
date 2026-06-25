@@ -26,7 +26,9 @@ from pydantic import BaseModel, Field
 
 from src.core.llm import get_llm
 from src.domains.base import Expert, trim_doc
-from src.domains.schemas import ExpertFinding, MerchantAnalysis
+from src.domains.schemas import (
+    ExpertFinding, MerchantAnalysis, FEATURE_OP_SPEC, validate_feature_spec_shape,
+)
 
 from src.core.logging_config import get_logger
 logger = get_logger(__name__)
@@ -79,8 +81,12 @@ class _RecordQuery(BaseModel):
 
 class _ProposeFeature(BaseModel):
     name: str = Field(description="Output column name, e.g. 'amount_to_balance_ratio'")
-    op: str = Field(description="One of: ratio, product, difference (2 inputs); zscore, log (1 input)")
+    op: str = Field(description=(
+        "One of: ratio, product (2-3 inputs); difference (2 inputs); zscore, log, normalize (1 input); "
+        "power (1 input + params=[exponent]); weighted_sum (2-3 inputs + one weight per input in params)"
+    ))
     inputs: List[str] = Field(description="Existing column name(s) the op consumes, in order — use the EXACT columns you saw in the data")
+    params: List[float] = Field(default_factory=list, description="Numeric constants: power→[exponent], weighted_sum→one weight per input. Empty for the others.")
     rationale: str = Field(default="", description="Why this feature matters for this dataset")
 
 
@@ -100,17 +106,21 @@ def build_expert_agent(expert: Expert, run_sql_tool, *, engine_label: str, domai
         return {"status": "recorded", "title": title}
 
     @tool(args_schema=_ProposeFeature)
-    def propose_feature(name: str, op: str, inputs: List[str], rationale: str = "") -> dict:
+    def propose_feature(name: str, op: str, inputs: List[str], params: List[float] = [], rationale: str = "") -> dict:
         """Propose ONE executable, deterministic feature to engineer. Call up to 3 times.
 
         Pick an `op` from the fixed palette and reference the EXACT existing columns you saw:
-          - ratio(a, b)       → a / |b|   (scale-invariant signals, e.g. max_amount / avg_amount)
-          - product(a, b)     → a * b
-          - difference(a, b)  → a - b
-          - zscore(a)         → standardized a (how far from the population mean)
-          - log(a)            → log1p of a (compress heavy-tailed amounts)
-        Only propose a feature when your data investigation showed it carries signal. Do NOT use
-        the target column or anything derived from it as an input (leakage)."""
+          - ratio(a, b[, c])        → a / |b|  (or a / |b*c|)   e.g. max_amount / avg_amount
+          - product(a, b[, c])      → a * b (* c)
+          - difference(a, b)        → a - b
+          - power(a) params=[k]     → a ** k                    e.g. squared / sqrt features
+          - weighted_sum(a, b[, c]) params=[w1, w2(, w3)] → w1*a + w2*b (+ w3*c)
+          - zscore(a)               → standardized a (how far from the population mean)
+          - log(a)                  → log1p of a (compress heavy-tailed amounts)
+          - normalize(a)            → min-max scale a to [0, 1]
+        `params` is empty except for power and weighted_sum. Only propose a feature when your data
+        investigation showed it carries signal. Do NOT use the target column or anything derived
+        from it as an input (leakage)."""
         return {"status": "recorded", "name": name}
 
     system_prompt = (
@@ -140,8 +150,10 @@ def build_expert_agent(expert: Expert, run_sql_tool, *, engine_label: str, domai
     return agent
 
 
-_VALID_FEATURE_OPS = {"ratio", "product", "difference", "zscore", "log"}
-_FEATURE_OP_ARITY = {"ratio": 2, "product": 2, "difference": 2, "zscore": 1, "log": 1}
+# Derived from the single source of truth (schemas.FEATURE_OP_SPEC). Kept as
+# module-level names because the financial shim + offline tests import them.
+_VALID_FEATURE_OPS = set(FEATURE_OP_SPEC.keys())
+_FEATURE_OP_ARITY = {op: spec[0] for op, spec in FEATURE_OP_SPEC.items()}  # min inputs (compat)
 
 
 def parse_feature_spec(args: dict):
@@ -151,12 +163,16 @@ def parse_feature_spec(args: dict):
     name = (args.get("name") or "").strip()
     op = (args.get("op") or "").strip().lower()
     inputs = [str(c).strip() for c in (args.get("inputs") or []) if str(c).strip()]
-    if not name or op not in _VALID_FEATURE_OPS:
+    try:
+        params = [float(v) for v in (args.get("params") or [])]
+    except (TypeError, ValueError):
         return None
-    if len(inputs) != _FEATURE_OP_ARITY[op]:
+    if not name or op not in FEATURE_OP_SPEC:
+        return None
+    if not validate_feature_spec_shape(op, len(inputs), len(params)):
         return None
     try:
-        return FeatureSpec(name=name, op=op, inputs=inputs, rationale=args.get("rationale", ""))
+        return FeatureSpec(name=name, op=op, inputs=inputs, params=params, rationale=args.get("rationale", ""))
     except Exception:
         return None
 
