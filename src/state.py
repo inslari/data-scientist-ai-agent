@@ -47,10 +47,16 @@ class AgentState(TypedDict, total=False):
 
     # Feature Engineering output
     feature_report: dict             # Summary of applied transformations
-    X_train: list[dict]              # Training features
-    X_test: list[dict]               # Test features
-    y_train: list                    # Training labels
-    y_test: list                     # Test labels
+    X_train: list[dict]              # Training features (DEPRECATED inline; bkz. *_path)
+    X_test: list[dict]               # Test features (DEPRECATED inline; bkz. *_path)
+    y_train: list                    # Training labels (DEPRECATED inline; bkz. *_path)
+    y_test: list                     # Test labels (DEPRECATED inline; bkz. *_path)
+    # Ağır split dizileri checkpoint payload'unu şişirmesin diye diske (parquet)
+    # yazılır; state'te yalnızca dosya yolu taşınır (src/utils/dataset_store.py).
+    X_train_path: str                # data/splits/*_xtrain.parquet
+    X_test_path: str                 # data/splits/*_xtest.parquet
+    y_train_path: str                # data/splits/*_ytrain.parquet
+    y_test_path: str                 # data/splits/*_ytest.parquet
 
     # AutoML output
     model_name: str                  # Selected model name
