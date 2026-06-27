@@ -28,7 +28,14 @@ warnings.filterwarnings("ignore")
 CORRELATION_THRESHOLD = 0.95
 VARIANCE_THRESHOLD    = 0.01
 TEST_SIZE             = 0.2
-ML_SAMPLE_ROWS        = 100_000   
+ML_SAMPLE_ROWS        = 100_000
+
+# Denetimli univariate seçim (ANOVA / f_regression): hedefle istatistiksel ilişkisi
+# anlamsız feature'ları eler. p-value eşiği keyfi skor eşiğinden (örn. "score<50")
+# prensiplidir; küçük feature setlerini bozmamak için kapılıdır.
+UNIVARIATE_PVALUE     = 0.05      # bu p-value'dan büyük (anlamsız) feature aday-drop
+UNIVARIATE_MIN_KEEP   = 5         # seçim sonrası asla bu sayının altına inme
+UNIVARIATE_MIN_COLS   = 12        # bu kadardan az sayısal feature varsa hiç uygulama
 
 
 # Column metadata
@@ -1193,6 +1200,51 @@ def _select_features_tt(
     return X_train, X_test
 
 
+def _select_univariate_tt(
+    X_train: pd.DataFrame, X_test: pd.DataFrame, y_train, intent: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Hedefle istatistiksel ilişkisi ANLAMSIZ (ANOVA/f_regression p-value > eşik)
+    sayısal feature'ları eler — _select_features_tt feature-feature redundancy'yi
+    atarken bu, target-irrelevant gürültü kolonlarını atar (notebook'taki
+    SelectKBest/corrwith tekniğinin leakage-safe karşılığı).
+
+    İstatistik YALNIZCA X_train'den öğrenilir, aynı kolonlar X_test'ten de düşürülür
+    (P0 disiplini). Keyfi skor eşiği yerine p-value kullanılır. Over-prune koruması:
+    feature seti küçükse hiç uygulanmaz ve seçim sonrası en az UNIVARIATE_MIN_KEEP
+    feature garanti kalır. Drop edilen kolon adlarını döndürür."""
+    from sklearn.feature_selection import f_classif, f_regression
+
+    is_cls = intent.strip().lower() == "classification"
+    score_fn = f_classif if is_cls else f_regression
+    num = X_train.select_dtypes(include="number").columns.tolist()
+    if len(num) < UNIVARIATE_MIN_COLS:
+        return X_train, X_test, []
+    y = np.asarray(y_train)
+    if is_cls and len(np.unique(y)) < 2:  # tek sınıf → ANOVA tanımsız
+        return X_train, X_test, []
+    try:
+        _f, pvals = score_fn(X_train[num].to_numpy(dtype="float64"), y)
+    except Exception as e:
+        logger.info(f"[feature_eng] Univariate seçim atlandı ({e})")
+        return X_train, X_test, []
+    pvals = np.nan_to_num(np.asarray(pvals, dtype="float64"), nan=1.0)  # sabit feature → anlamsız
+    insignificant = [num[i] for i in range(len(num)) if pvals[i] > UNIVARIATE_PVALUE]
+    if not insignificant:
+        return X_train, X_test, []
+    # En az UNIVARIATE_MIN_KEEP feature kalmalı: gerekirse en yüksek p-value'lulardan
+    # başlayarak yalnızca izin verilen sayıda drop et.
+    if len(num) - len(insignificant) < UNIVARIATE_MIN_KEEP:
+        order = sorted(insignificant, key=lambda c: pvals[num.index(c)], reverse=True)
+        insignificant = order[: max(0, len(num) - UNIVARIATE_MIN_KEEP)]
+    if not insignificant:
+        return X_train, X_test, []
+    X_train = X_train.drop(columns=insignificant)
+    X_test  = X_test.drop(columns=insignificant, errors="ignore")
+    logger.info(f"[feature_eng] Univariate ({'ANOVA' if is_cls else 'f_regression'}) "
+                f"irrelevant drop (p>{UNIVARIATE_PVALUE}, train-fit): {insignificant}")
+    return X_train, X_test, insignificant
+
+
 def _detect_leakage_tt(
     X_train: pd.DataFrame, X_test: pd.DataFrame, y_train: pd.Series,
     meta=None, protected_high_card=None,
@@ -1772,6 +1824,7 @@ def build_features(state: dict) -> dict:
 
     # 14. Train/test split
     split_imbalanced = 0
+    univariate_dropped: list[str] = []   # denetimli univariate seçim (yalnızca supervised dalda dolar)
     if intent in ("clustering","anomaly_detection"):
         # Unsupervised: holdout yok → transform'lar TÜM veriye fit edilir (kümeleme
         # için doğru/istenen davranış; target sızıntısı kavramı zaten yok). Eski
@@ -1846,6 +1899,11 @@ def build_features(state: dict) -> dict:
         # Final NaN/numeric temizliği (sabit fillna(0) — deterministik, sızıntısız)
         X_train = X_train.apply(pd.to_numeric, errors="coerce").fillna(0)
         X_test  = X_test.apply(pd.to_numeric, errors="coerce").fillna(0)
+        # Denetimli univariate seçim: hedefle alakasız feature'ları ele (train-fit).
+        # NaN/numeric temizliği SONRASI çalışır (ANOVA/f_regression NaN kabul etmez).
+        if intent.strip().lower() in ("classification", "regression"):
+            X_train, X_test, univariate_dropped = _select_univariate_tt(
+                X_train, X_test, y_train, intent)
         # Leakage detection train'den öğrenir, test'ten de senkron düşürür
         X_train, X_test, leakage_report = _detect_leakage_tt(
             X_train, X_test, y_train, meta, protected_high_card=ts_protected_cols)
@@ -1877,6 +1935,7 @@ def build_features(state: dict) -> dict:
         "total_rows_available":     None,  # execution_node profiling'den alınabilir
         "leakage_dropped":          leakage_report["dropped"],
         "leakage_suspected":        leakage_report["suspected"],
+        "univariate_dropped":       univariate_dropped,
         "derived_features":         [c for c in derived_feature_cols if c in X_train.columns],
         "domain_features":          [c for c in domain_feature_cols if c in X_train.columns],
         "auto_features":            [c for c in auto_feature_cols if c in X_train.columns],
@@ -1885,11 +1944,15 @@ def build_features(state: dict) -> dict:
         "split_imbalanced_entities": split_imbalanced,
     }
 
-    return {
-        "feature_report": feature_report,
-        "X_train":        X_train.to_dict(orient="records"),
-        "y_train":        y_train.tolist(),
-        "X_test":         X_test.to_dict(orient="records"),
-        "y_test":         y_test.tolist(),
-        "error":          None
-    }
+    # Ağır split dizilerini diske yaz; state'te yalnızca dosya yolu taşı
+    # (checkpoint payload şişmesini önler). Yazma başarısız olursa inline'a düş.
+    from src.utils.dataset_store import dump_split
+    split_paths = dump_split(X_train, X_test, y_train, y_test, tag=f"p{state.get('project_id', '')}")
+    out: dict = {"feature_report": feature_report, "error": None, **split_paths}
+    if not split_paths.get("X_train_path"):   # disk yazımı kısmen/tamamen başarısız → inline fallback
+        out["X_train"] = X_train.to_dict(orient="records")
+        out["X_test"]  = X_test.to_dict(orient="records")
+    if not split_paths.get("y_train_path"):
+        out["y_train"] = y_train.tolist() if hasattr(y_train, "tolist") else list(y_train)
+        out["y_test"]  = y_test.tolist() if hasattr(y_test, "tolist") else list(y_test)
+    return out
