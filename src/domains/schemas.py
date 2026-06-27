@@ -13,24 +13,61 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
-# The safe, parameterized op palette an expert agent may compose. Each op is a
-# deterministic, leakage-checkable transform — the agent never writes raw code.
-FeatureOp = Literal["ratio", "product", "difference", "zscore", "log"]
+# The safe, parameterized op palette an expert agent (or the generic feature
+# planner) may compose. Each op is a deterministic, leakage-checkable transform —
+# the LLM never writes raw code, it only picks an op + the real columns/constants.
+FeatureOp = Literal[
+    "ratio", "product", "difference", "zscore", "log",
+    "power", "weighted_sum", "normalize",
+]
+
+# Single source of truth for op shape: op -> (min_inputs, max_inputs, n_params).
+# ``n_params == "match"`` means one numeric param per input (weighted_sum).
+# Both the proposer (parse-time validation) and the builder (execution) consult
+# this so the two can never drift.
+FEATURE_OP_SPEC: dict[str, tuple[int, int, object]] = {
+    "ratio":        (2, 3, 0),   # a / |b|  (or a / |b*c|) — velocity = distance/time
+    "product":      (2, 3, 0),   # a * b (* c)             — momentum = mass*velocity
+    "difference":   (2, 2, 0),   # a - b
+    "zscore":       (1, 1, 0),   # standardized a
+    "log":          (1, 1, 0),   # log1p(a)
+    "power":        (1, 1, 1),   # a ** k  (k = params[0]) — height**2
+    "weighted_sum": (2, 3, "match"),  # w1*a + w2*b (+ w3*c), one weight per input
+    "normalize":    (1, 1, 0),   # min-max scale a to [0, 1]
+}
+
+
+def validate_feature_spec_shape(op: str, n_inputs: int, n_params: int) -> bool:
+    """True iff ``op`` accepts this many inputs and params per FEATURE_OP_SPEC."""
+    spec = FEATURE_OP_SPEC.get(op)
+    if spec is None:
+        return False
+    min_in, max_in, n_param = spec
+    if not (min_in <= n_inputs <= max_in):
+        return False
+    if n_param == "match":
+        return n_params == n_inputs
+    return n_params == n_param
 
 
 class FeatureSpec(BaseModel):
-    """An executable feature the expert agent *decided* to build.
+    """An executable feature the LLM *decided* to build.
 
-    The agent picks an ``op`` from the fixed palette and names the REAL input
-    columns it saw while investigating the data — so there is no dependency on
-    any internal naming convention. The feature builder validates the spec
-    against the actual schema (columns exist, not the target/leaky) and applies
-    the op deterministically. Invalid specs are skipped, never executed.
+    The LLM (an expert agent, or the generic feature planner) picks an ``op``
+    from the fixed palette and names the REAL input columns it saw while
+    investigating the data — so there is no dependency on any internal naming
+    convention. The feature builder validates the spec against the actual schema
+    (columns exist, not the target/leaky) and applies the op deterministically.
+    Invalid specs are skipped, never executed.
     """
 
     name: str = Field(description="Output column name, e.g. 'amount_to_balance_ratio'")
-    op: FeatureOp = Field(description="Transform: ratio|product|difference (2 inputs), zscore|log (1 input)")
+    op: FeatureOp = Field(description="Transform from the fixed palette (see FEATURE_OP_SPEC)")
     inputs: list[str] = Field(description="Existing column name(s) the op consumes, in order")
+    params: list[float] = Field(
+        default_factory=list,
+        description="Numeric constants the op needs: power→[exponent], weighted_sum→one weight per input. Empty otherwise.",
+    )
     rationale: str = Field(default="", description="Why this feature matters for this dataset")
 
 

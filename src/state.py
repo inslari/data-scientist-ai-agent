@@ -85,6 +85,9 @@ class AgentState(TypedDict, total=False):
     
     # Leakage Detection
     domain_leakage_report: dict
+    # Critic'in 'too-good/leakage' teşhisinden gelen, retry'da deterministik
+    # düşürülecek kolonlar (importance-bazlı leakage_suspects). feature_builder okur.
+    forced_leakage_drops: list[str]
 
     # Entity Resolution
     entity_resolution: dict          # EntityResolution raporu (action, signals, stats)

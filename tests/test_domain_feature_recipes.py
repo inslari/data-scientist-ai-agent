@@ -7,9 +7,13 @@ import pandas as pd
 from src.domains import NullDomainPack
 from src.domains.base import MerchantContext
 from src.domains.financial.pack import FinancialPack
+import numpy as np
+
 from src.domains.financial.feature_recipes import (
     VolatilityRecipe,
     SpikeRatioRecipe,
+    LogAmountRecipe,
+    TimePartsRecipe,
     recipes_for,
 )
 
@@ -49,6 +53,59 @@ class SpikeRatioRecipeTest(unittest.TestCase):
         # max/avg: 40/10 = 4.0, 100/100 = 1.0
         self.assertAlmostEqual(cols["peak_ratio_amount"].iloc[0], 4.0, places=4)
         self.assertAlmostEqual(cols["peak_ratio_amount"].iloc[1], 1.0, places=4)
+
+
+class LogAmountRecipeTest(unittest.TestCase):
+    def _skewed_df(self):
+        rng = np.random.RandomState(0)
+        return pd.DataFrame({
+            "transaction_amount": rng.lognormal(3, 1.5, 300),   # money, skewed
+            "account_balance": rng.lognormal(5, 1.0, 300),      # money, skewed
+            "cv_amount": rng.rand(300),                          # derived → skip
+            "customer_id": np.arange(300),                       # not money → skip
+        })
+
+    def test_builds_log_for_skewed_money_cols(self):
+        df = self._skewed_df()
+        r = LogAmountRecipe()
+        self.assertTrue(r.applies(df))
+        cols = r.build(df)
+        self.assertIn("log_transaction_amount", cols)
+        self.assertIn("log_account_balance", cols)
+        # log compresses the right tail: post-transform skew is far smaller.
+        self.assertLess(abs(cols["log_transaction_amount"].skew()), 1.0)
+
+    def test_skips_derived_and_nonmoney_cols(self):
+        cols = LogAmountRecipe().build(self._skewed_df())
+        self.assertNotIn("log_cv_amount", cols)       # derived prefix excluded
+        self.assertNotIn("log_customer_id", cols)     # name not monetary
+
+    def test_skips_negative_columns(self):
+        df = pd.DataFrame({"amount": [-1.0, 2.0, 3.0, 4.0]})  # has negatives
+        self.assertFalse(LogAmountRecipe().applies(df))
+
+
+class TimePartsRecipeTest(unittest.TestCase):
+    def _ts_df(self):
+        return pd.DataFrame({
+            "event_timestamp": pd.date_range("2024-01-01", periods=200, freq="37min"),
+            "amount": np.arange(200, dtype=float),
+        })
+
+    def test_builds_hour_cyclical_and_dow(self):
+        df = self._ts_df()
+        r = TimePartsRecipe()
+        self.assertTrue(r.applies(df))
+        cols = r.build(df)
+        for c in ("hour_event_timestamp", "hour_sin_event_timestamp",
+                  "hour_cos_event_timestamp", "dow_event_timestamp"):
+            self.assertIn(c, cols)
+        self.assertGreaterEqual(cols["hour_event_timestamp"].min(), 0)
+        self.assertLessEqual(cols["hour_event_timestamp"].max(), 23)
+
+    def test_skips_when_no_timestamp(self):
+        df = pd.DataFrame({"amount": [1.0, 2.0, 3.0]})
+        self.assertFalse(TimePartsRecipe().applies(df))
 
 
 class RecipeGatingTest(unittest.TestCase):

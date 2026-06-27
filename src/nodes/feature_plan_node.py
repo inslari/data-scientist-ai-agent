@@ -75,7 +75,7 @@ Bu öneriyi dikkate al ama kendi guardrail kontrolünü yap."""
     
 ⚠️ LEAKAGE UYARISI:
 Şu kolonlar target ile şüpheli ilişki içinde (leakage riski): {', '.join(suspect_cols)}
-Bu kolonları math_interactions önerilerinde KULLANMA. 
+Bu kolonları derived_features önerilerinde girdi olarak KULLANMA.
 Bunlardan türetilmiş yeni feature'lar da leakage taşır."""
     
     # Retry bağlamı: critic feedback'i prompt'a ekle
@@ -147,8 +147,9 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
     logger.info(f"[feature_plan] Aggregation   : {plan.aggregation.level} "
           f"(group_by: {plan.aggregation.group_by_column})")
     logger.info(f"[feature_plan] Feature grupları: {plan.feature_groups}")
-    if plan.math_interactions:
-        logger.info(f"[feature_plan] Math etkileşimler: {plan.math_interactions}")
+    if plan.derived_features:
+        _summ = [f"{d.name}={d.op}{tuple(d.inputs)}" for d in plan.derived_features]
+        logger.info(f"[feature_plan] Türetilmiş feature'lar: {_summ}")
     logger.info(f"[feature_plan] Data split    : {plan.use_data_split_for_label}")
     logger.info(f"[feature_plan] Neden         : {plan.reasoning}")
 

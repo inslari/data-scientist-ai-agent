@@ -1,6 +1,8 @@
 from pydantic import BaseModel, Field
 from typing import Literal
 
+from src.domains.schemas import FeatureSpec
+
 class TargetDefinition(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -73,12 +75,14 @@ class FeaturePlan(BaseModel):
             "time_based hedeflerde genellikle True olmalı."
         )
     )
-    math_interactions: list[str] = Field(
+    derived_features: list[FeatureSpec] = Field(
         default_factory=list,
         description=(
-            "LLM tarafından önerilen mantıksal matematiksel etkileşimler. "
-            "Örn: ['revenue / max(1, order_count)', 'price * quantity']. "
-            "Sadece sayısal kolonlar için kullanılmalıdır."
+            "Anlamlı türetilmiş kolonlar — LLM ham formül YAZMAZ, sabit op paletinden "
+            "(ratio/product/difference/power/weighted_sum/zscore/log/normalize) bir op seçip "
+            "MEVCUT sayısal kolonları girdi verir. Örn: hız = ratio(distance, time); "
+            "alan = product(width, height); kare = power(x) params=[2]. "
+            "Hedef kolonu ve leakage şüphelilerini ASLA girdi olarak kullanma."
         )
     )
     reasoning: str = Field(

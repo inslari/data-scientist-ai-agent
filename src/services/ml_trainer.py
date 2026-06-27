@@ -24,6 +24,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import (
+    AdaBoostClassifier,
     ExtraTreesClassifier,
     ExtraTreesRegressor,
     GradientBoostingClassifier,
@@ -68,7 +69,10 @@ def _get_classification_models() -> dict:
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
         "extra_trees": ExtraTreesClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
-        "gradient_boosting": GradientBoostingClassifier(n_estimators=200, random_state=RANDOM_STATE),
+        # AdaBoost: hızlı, dengesiz fraud verisinde rekabetçi bir zayıf-öğrenici topluluğu.
+        "adaboost": AdaBoostClassifier(n_estimators=200, learning_rate=0.8, random_state=RANDOM_STATE),
+        # şimdilik devre dışı: çok yavaş (~331s) + ROC-AUC olarak zayıf
+        # "gradient_boosting": GradientBoostingClassifier(n_estimators=200, random_state=RANDOM_STATE),
         "logistic_regression": Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)),
@@ -103,7 +107,8 @@ def _get_regression_models() -> dict:
     models = {
         "random_forest": RandomForestRegressor(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
         "extra_trees": ExtraTreesRegressor(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
-        "gradient_boosting": GradientBoostingRegressor(n_estimators=200, random_state=RANDOM_STATE),
+        # şimdilik devre dışı: çok yavaş (~331s) + zayıf
+        # "gradient_boosting": GradientBoostingRegressor(n_estimators=200, random_state=RANDOM_STATE),
         "ridge": Pipeline([("scaler", StandardScaler()), ("reg", Ridge())]),
         "lasso": Pipeline([("scaler", StandardScaler()), ("reg", Lasso(max_iter=5000))]),
     }
@@ -245,6 +250,12 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
                 "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2"]) if strong_regularization else "sqrt",
             }
             model = ExtraTreesClassifier(**params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "adaboost":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 1.0, log=True),
+            }
+            model = AdaBoostClassifier(**params, random_state=RANDOM_STATE)
         elif model_name == "gradient_boosting":
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 300),
@@ -288,6 +299,8 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
             return RandomForestClassifier(**best_params, random_state=settings.RANDOM_SEED, n_jobs=-1)
         elif model_name == "extra_trees":
             return ExtraTreesClassifier(**best_params, random_state=settings.RANDOM_SEED, n_jobs=-1)
+        elif model_name == "adaboost":
+            return AdaBoostClassifier(**best_params, random_state=settings.RANDOM_SEED)
         elif model_name == "gradient_boosting":
             return GradientBoostingClassifier(**best_params, random_state=settings.RANDOM_SEED)
         elif model_name == "xgboost":
@@ -426,10 +439,16 @@ def _get_classification_models_balanced(class_weights: dict) -> dict:
             n_estimators=200, random_state=RANDOM_STATE,
             n_jobs=-1, class_weight=cw
         ),
-        "gradient_boosting": GradientBoostingClassifier(
-            n_estimators=200, random_state=RANDOM_STATE
-            # GradientBoosting class_weight desteklemiyor, sample_weight kullanacağız
+        # AdaBoost class_weight parametresini desteklemez; dengesizlikte CV döngüsü
+        # bunu otomatik SMOTE pipeline'ına sarar (fold-içi, leakage-free).
+        "adaboost": AdaBoostClassifier(
+            n_estimators=200, learning_rate=0.8, random_state=RANDOM_STATE
         ),
+        # şimdilik devre dışı: çok yavaş (~331s) + ROC-AUC olarak zayıf
+        # "gradient_boosting": GradientBoostingClassifier(
+        #     n_estimators=200, random_state=RANDOM_STATE
+        #     # GradientBoosting class_weight desteklemiyor, sample_weight kullanacağız
+        # ),
         "logistic_regression": Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(
@@ -1068,6 +1087,31 @@ def _run_regression(
 
 
 
+def _safe_silhouette(X, labels, cap: int = 5000) -> float:
+    """silhouette_score with a row cap to stay O(cap²), not O(n²).
+
+    silhouette builds a full pairwise-distance matrix, so on large datasets it
+    is the single most expensive (and memory-hungry) call in the AutoML path —
+    on a 100k+ row set it can stall the worker for minutes or OOM it. A long
+    stall here is also what lets the idle LangGraph **checkpoint** connection get
+    dropped by the server/pooler, surfacing later as a confusing
+    ``aput_writes`` connection error. We therefore evaluate the score on a
+    deterministic random subsample (seed-fixed) when ``n`` exceeds ``cap`` — a
+    standard, unbiased estimate of the full-data silhouette.
+    """
+    X = np.asarray(X)
+    labels = np.asarray(labels)
+    n = X.shape[0]
+    if n > cap:
+        rng = np.random.RandomState(RANDOM_STATE)
+        idx = rng.choice(n, size=cap, replace=False)
+        X, labels = X[idx], labels[idx]
+    # Need >=2 distinct labels among the (sub)sample, else silhouette is undefined.
+    if len(np.unique(labels)) < 2:
+        return -1.0
+    return float(silhouette_score(X, labels))
+
+
 # Clustering
 def _run_clustering(
     X_train: pd.DataFrame,
@@ -1092,7 +1136,7 @@ def _run_clustering(
             labels = km.fit_predict(X_all)
             if len(np.unique(labels)) < 2:
                 continue
-            sil = silhouette_score(X_all, labels)
+            sil = _safe_silhouette(X_all, labels)
             if sil > best_kmeans_score:
                 best_kmeans_score = sil
                 best_k = k
@@ -1121,7 +1165,7 @@ def _run_clustering(
 
         if n_clusters_db >= 2:
             mask = db_labels != -1
-            db_sil = silhouette_score(X_all[mask], db_labels[mask]) if mask.sum() > 1 else -1
+            db_sil = _safe_silhouette(X_all[mask], db_labels[mask]) if mask.sum() > 1 else -1
         else:
             db_sil = -1
 
@@ -1193,66 +1237,140 @@ def _run_clustering(
 
 
 # Anomaly Detection
+
+class GaussianDensityAnomalyDetector(BaseEstimator):
+    """Multivariate-normal (independent-Gaussian product) anomaly detector.
+
+    A from-scratch port of the credit-card anomaly notebook's density model:
+    fit a univariate normal per feature, score a row by the *product* of those
+    densities, and flag rows whose density falls below a threshold. We work in
+    **log space** (sum of per-feature log-pdfs) instead of multiplying raw
+    densities — mathematically identical for thresholding, but immune to the
+    floating-point underflow that makes the raw product collapse to 0 once you
+    have more than a handful of features (the notebook's threshold was already
+    ~1e-19 at 9 features).
+
+    The independence assumption is the same one the notebook leans on, and it is
+    reasonable here because the upstream feature builder's columns are largely
+    decorrelated aggregates. ``contamination`` sets the quantile of the training
+    score distribution used as the decision threshold, matching the
+    IsolationForest convention so both algorithms are directly comparable.
+
+    sklearn-compatible surface (``fit`` / ``predict`` / ``score_samples`` /
+    ``decision_function``) so it slots into the existing selection + persistence
+    path with no special-casing.
+    """
+
+    def __init__(self, contamination: float = 0.10):
+        self.contamination = contamination
+
+    def fit(self, X, y=None):  # noqa: ANN001
+        X = np.asarray(X, dtype=float)
+        self.n_features_in_ = X.shape[1]
+        self.mu_ = np.nanmean(X, axis=0)
+        sigma = np.nanstd(X, axis=0)
+        # Floor sigma so a constant feature can't divide by zero / dominate.
+        floor = np.maximum(1e-6, 1e-6 * np.abs(self.mu_))
+        self.sigma_ = np.where(sigma > floor, sigma, floor)
+        scores = self.score_samples(X)
+        # Low density = anomalous → threshold is the lower-tail quantile.
+        self.offset_ = float(np.quantile(scores, self.contamination))
+        return self
+
+    def score_samples(self, X):  # noqa: ANN001
+        """Log joint density (higher = more normal). NaNs treated as neutral."""
+        X = np.asarray(X, dtype=float)
+        z = (X - self.mu_) / self.sigma_
+        log_pdf = -0.5 * z**2 - np.log(self.sigma_) - 0.5 * np.log(2 * np.pi)
+        log_pdf = np.where(np.isfinite(log_pdf), log_pdf, 0.0)
+        return log_pdf.sum(axis=1)
+
+    def decision_function(self, X):  # noqa: ANN001
+        """>= 0 → normal, < 0 → anomaly (sklearn outlier convention)."""
+        return self.score_samples(X) - self.offset_
+
+    def predict(self, X):  # noqa: ANN001
+        return np.where(self.decision_function(X) >= 0, 1, -1)
+
+    def fit_predict(self, X, y=None):  # noqa: ANN001
+        return self.fit(X, y).predict(X)
+
+
+def _build_anomaly_candidates(cont: float) -> dict[str, Any]:
+    """Candidate unsupervised detectors evaluated at a given contamination."""
+    return {
+        "isolation_forest": IsolationForest(
+            contamination=cont, random_state=RANDOM_STATE, n_estimators=200, n_jobs=-1,
+        ),
+        "gaussian_density": GaussianDensityAnomalyDetector(contamination=cont),
+    }
+
+
 def _run_anomaly_detection(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     feature_names: list[str],
 ) -> tuple[str, Any, dict]:
     """
-    IsolationForest ile anomaly detection.
-    Contamination otomatik tahmin edilir (veri setinin %5-15'i anomali varsayılır).
+    Anomaly detection with two complementary unsupervised detectors:
+      - IsolationForest (tree-isolation depth)
+      - GaussianDensityAnomalyDetector (multivariate-normal density — port of the
+        credit-card anomaly notebook)
+    Both are scanned over candidate contamination rates (%5–15 anomaly varsayımı)
+    and the (algorithm, contamination) pair with the best silhouette wins.
     """
     X_all = pd.concat([X_train, X_test], ignore_index=True).values
 
-    # Test different contamination rates
+    # Test different contamination rates × both algorithms
     contaminations = [0.05, 0.10, 0.15]
-    best_contamination = 0.10
+    best_key: tuple[str, float] | None = None
     best_score = -np.inf
-    results: dict[float, dict[str, Any]] = {}
+    results: dict[tuple[str, float], dict[str, Any]] = {}
 
-    logger.info("[automl] IsolationForest — contamination taraması...")
+    logger.info("[automl] Anomaly detection — IsolationForest + GaussianDensity taraması...")
     for cont in contaminations:
-        try:
-            iso = IsolationForest(
-                contamination=cont,
-                random_state=RANDOM_STATE,
-                n_estimators=200,
-                n_jobs=-1,
-            )
-            labels = iso.fit_predict(X_all)
-            # -1 anomaly, 1 normal → convert for silhouette
-            labels_bin = (labels == -1).astype(int)
-            n_anomalies = (labels == -1).sum()
+        for algo, model in _build_anomaly_candidates(cont).items():
+            try:
+                labels = model.fit_predict(X_all)
+                # -1 anomaly, 1 normal → convert for silhouette
+                labels_bin = (labels == -1).astype(int)
+                n_anomalies = int((labels == -1).sum())
 
-            if n_anomalies > 1 and n_anomalies < len(labels) - 1:
-                try:
-                    sil = silhouette_score(X_all, labels_bin)
-                except Exception:
+                if 1 < n_anomalies < len(labels) - 1:
+                    try:
+                        sil = _safe_silhouette(X_all, labels_bin)
+                    except Exception:
+                        sil = -1
+                else:
                     sil = -1
-            else:
-                sil = -1
 
-            results[cont] = {
-                "model": iso,
-                "labels": labels,
-                "n_anomalies": int(n_anomalies),
-                "anomaly_pct": round(float(n_anomalies / len(labels) * 100), 2),
-                "silhouette": sil,
-            }
-            logger.info(f"[automl]   contamination={cont}: anomalies={n_anomalies} (%{results[cont]['anomaly_pct']})")
+                results[(algo, cont)] = {
+                    "algo": algo,
+                    "model": model,
+                    "labels": labels,
+                    "n_anomalies": n_anomalies,
+                    "anomaly_pct": round(float(n_anomalies / len(labels) * 100), 2),
+                    "silhouette": sil,
+                }
+                logger.info(f"[automl]   {algo} contamination={cont}: "
+                            f"anomalies={n_anomalies} (%{results[(algo, cont)]['anomaly_pct']}), "
+                            f"silhouette={sil if sil == -1 else round(float(sil), 4)}")
 
-            if sil > best_score:
-                best_score = sil
-                best_contamination = cont
-        except Exception as e:
-            logger.error(f"[automl]   contamination={cont}: HATA {e}")
+                if sil > best_score:
+                    best_score = sil
+                    best_key = (algo, cont)
+            except Exception as e:
+                logger.error(f"[automl]   {algo} contamination={cont}: HATA {e}")
 
-    best = results.get(best_contamination, list(results.values())[0])
+    if best_key is None:
+        best_key = next(iter(results))
+    best = results[best_key]
+    best_algo, best_contamination = best_key
     best_model = best["model"]
     best_labels = best["labels"]
 
-    logger.info(f"\n[automl] En iyi contamination: {best_contamination} "
-          f"({best['n_anomalies']} anomalies, %{best['anomaly_pct']})")
+    logger.info(f"\n[automl] En iyi: {best_algo} (contamination={best_contamination}) "
+          f"— {best['n_anomalies']} anomalies, %{best['anomaly_pct']}")
 
     # Anomaly scores (decision function)
     anomaly_scores = best_model.decision_function(X_all)
@@ -1261,7 +1379,7 @@ def _run_anomaly_detection(
     n_train = len(X_train)
     metrics: dict[str, Any] = {
         "task": "anomaly_detection",
-        "algorithm": "isolation_forest",
+        "algorithm": best_algo,
         "best_contamination": best_contamination,
         "n_anomalies": best["n_anomalies"],
         "anomaly_pct": best["anomaly_pct"],
@@ -1269,25 +1387,31 @@ def _run_anomaly_detection(
         "score_threshold": round(score_threshold, 4),
         "silhouette_score": round(float(best_score), 4) if best_score > -np.inf else None,
         "contamination_scan": {
-            str(c): {
+            f"{algo}@{c}": {
                 "n_anomalies": r["n_anomalies"],
                 "anomaly_pct": r["anomaly_pct"],
+                "silhouette": r["silhouette"] if r["silhouette"] == -1 else round(float(r["silhouette"]), 4),
             }
-            for c, r in results.items()
+            for (algo, c), r in results.items()
         },
         "train_labels": best_labels[:n_train].tolist(),
         "test_labels": best_labels[n_train:].tolist(),
     }
 
-    # Feature importance - IsolationForest using mean depth
+    # Feature importance — IsolationForest exposes mean-depth importances;
+    # the Gaussian model ranks features by mean standardized deviation |z|.
     try:
-        fi_raw = best_model.feature_importances_
-        fi = dict(zip(feature_names, fi_raw.tolist()))
+        if best_algo == "isolation_forest":
+            fi_raw = best_model.feature_importances_
+            fi = dict(zip(feature_names, fi_raw.tolist()))
+        else:
+            z = np.abs((X_all - best_model.mu_) / best_model.sigma_)
+            fi = dict(zip(feature_names, np.nanmean(z, axis=0).tolist()))
         metrics["feature_importance"] = dict(sorted(fi.items(), key=lambda x: x[1], reverse=True))
     except Exception:
         metrics["feature_importance"] = {}
 
-    return "isolation_forest", best_model, metrics
+    return best_algo, best_model, metrics
 
 # Main node
 def train_model(state: AgentState) -> dict:
@@ -1310,10 +1434,8 @@ def train_model(state: AgentState) -> dict:
         model_artifact : Trained model object
         metrics        : Task-specific metrics
     """
-    X_train_raw = state.get("X_train", [])
-    X_test_raw = state.get("X_test", [])
-    y_train_raw = state.get("y_train", [])
-    y_test_raw = state.get("y_test", [])
+    from src.utils.dataset_store import load_raw, dump_y
+    X_train_raw, X_test_raw, y_train_raw, y_test_raw = load_raw(state)
     intent = state.get("intent", "classification")
     intent_norm = intent.strip().lower() if isinstance(intent, str) else "classification"
 
@@ -1415,11 +1537,14 @@ def train_model(state: AgentState) -> dict:
         logger.warning(f"[automl] UYARI: Model diske kaydedilemedi: {e}")
         model_path = None
 
+    # Label-encode SONRASI y'yi diske yaz (downstream evaluator encoded y bekler);
+    # inline yerine yol taşı (checkpoint payload şişmesini önler).
+    y_paths = dump_y(y_train, y_test)
+
     return {
         **state,
         "intent": intent,
-        "y_train": y_train.tolist() if isinstance(y_train, np.ndarray) else y_train,
-        "y_test": y_test.tolist() if isinstance(y_test, np.ndarray) else y_test,
+        **y_paths,
         "model_name": model_name,
         "model_params": {"intent": intent},
         "model_artifact": model_path,

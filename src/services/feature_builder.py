@@ -772,7 +772,7 @@ def _encode_categorical(df: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
 def _scale_features(df: pd.DataFrame, outlier_cols: list[str]) -> pd.DataFrame:
     num = df.select_dtypes(include="number").columns.tolist()
     if not num: return df
-    # inf temizliği: ratio/math_interaction kolonları 0'a bölünmeden inf üretebilir.
+    # inf temizliği: ratio/derived_feature kolonları 0'a bölünmeden inf üretebilir.
     # Scaler inf kabul etmez → inf'leri NaN'a, sonra kolon medyanına (yoksa 0) çevir.
     # Not: kolonlar nullable/object dtype olabilir (Int64, Float64, ratio çıktıları),
     # bu yüzden isinf öncesi her kolonu güvenle float'a coerce ediyoruz.
@@ -894,6 +894,99 @@ def _apply_domain_leakage_drops(
 
 # ── Data leakage detection ───────────────────────────────────
 # ── Data leakage detection (Adım 1: identifier + kesin korelasyon) ──
+def _binned_max_purity(s: pd.Series, yv: pd.Series, n_bins: int = 10,
+                       min_frac: float = 0.03) -> float:
+    """Sayisal feature'i binle; yeterince buyuk bir bolmede target tek sinifa
+    kilitleniyorsa (saflik) bu safliklarin MAX'ini dondurur. Dusuk kardinalite
+    (kategorik/indicator) → her deger ayri grup; yuksek → qcut. Multiclass icin
+    AUC'ye gerek kalmadan calisir (herhangi sayida sinif)."""
+    n = len(yv)
+    d = pd.DataFrame({"s": s.values, "y": yv.values}).dropna()
+    if len(d) < 30:
+        return 0.0
+    if d["s"].nunique() <= n_bins:
+        groups = d.groupby("s", observed=True)["y"]
+    else:
+        try:
+            bins = pd.qcut(d["s"], q=n_bins, duplicates="drop")
+        except Exception:
+            return 0.0
+        groups = d.groupby(bins, observed=True)["y"]
+    floor = max(10, min_frac * n)
+    best = 0.0
+    for _, g in groups:
+        if len(g) < floor:
+            continue
+        purity = float(g.value_counts(normalize=True).max())
+        if purity > best:
+            best = purity
+    return best
+
+
+def _single_feature_target_lock(
+    df: pd.DataFrame, y: pd.Series,
+    *, auc_drop: float = 0.998, auc_suspect: float = 0.97,
+    reg_drop: float = 0.999, reg_suspect: float = 0.95,
+    pur_drop: float = 0.99, pur_suspect: float = 0.97,
+) -> tuple[list[dict], list[dict]]:
+    """Tek-feature 'hedef kilidi' tespiti — DOĞRUSAL OLMAYAN sızıntıları yakalar.
+
+    Lineer korelasyon, ``ALERT_ID`` gibi 'bir eşikten target'ı birebir ayıran ama lineer
+    korelasyonu düşük' kolonları kaçırır (−1 vs pozitif id → ağaç tek split'le ayırır,
+    corr ~orta). Burada her sayısal feature'ın TEK BAŞINA target'ı ne kadar ayırdığını
+    ölçeriz: binary → tek-feature AUC (yöne duyarsız, max(auc,1−auc)); multiclass →
+    bin-bazlı max sınıf saflığı (kategorik/indicator dahil); regresyon → |Spearman|.
+    Eşik üstü = sızıntı.
+
+    df'i DEĞİŞTİRMEZ; (drop_listesi, suspect_listesi) döndürür — {"column","reason"}."""
+    drop: list[dict] = []
+    suspect: list[dict] = []
+    if len(y) < 30:
+        return drop, suspect
+    yv = pd.to_numeric(y, errors="coerce")
+    if yv.isna().mean() > 0.2:
+        return drop, suspect
+    n_classes = len(yv.dropna().unique())
+    if n_classes < 2:
+        return drop, suspect
+    mode = "binary" if n_classes == 2 else ("multiclass" if n_classes <= 20 else "regression")
+    num_cols = df.select_dtypes(include="number").columns.tolist()
+    for col in num_cols:
+        s = pd.to_numeric(df[col], errors="coerce")
+        if s.nunique() <= 1:
+            continue
+        mask = s.notna() & yv.notna()
+        if int(mask.sum()) < 30:
+            continue
+        try:
+            if mode == "binary":
+                from sklearn.metrics import roc_auc_score
+                auc = float(roc_auc_score(yv[mask], s[mask]))
+                score = max(auc, 1.0 - auc)
+                if score >= auc_drop:
+                    drop.append({"column": col, "reason": f"tek-feature AUC={score:.4f} → hedef kilidi (leakage)"})
+                elif score >= auc_suspect:
+                    suspect.append({"column": col, "reason": f"tek-feature AUC={score:.3f} (asiri ayirt edici)"})
+            elif mode == "multiclass":
+                purity = _binned_max_purity(s[mask], yv[mask])
+                if purity >= pur_drop:
+                    drop.append({"column": col, "reason": f"tek-feature bin-safligi={purity:.3f} → hedef kilidi (leakage)"})
+                elif purity >= pur_suspect:
+                    suspect.append({"column": col, "reason": f"tek-feature bin-safligi={purity:.3f} (asiri ayirt edici)"})
+            else:  # regression
+                rho = s[mask].corr(yv[mask], method="spearman")
+                if pd.isna(rho):
+                    continue
+                rho = abs(float(rho))
+                if rho >= reg_drop:
+                    drop.append({"column": col, "reason": f"tek-feature |Spearman|={rho:.4f} → hedef kilidi"})
+                elif rho >= reg_suspect:
+                    suspect.append({"column": col, "reason": f"tek-feature |Spearman|={rho:.3f} (asiri ayirt edici)"})
+        except Exception:
+            continue
+    return drop, suspect
+
+
 def _detect_leakage(
     df: pd.DataFrame,
     y: pd.Series,
@@ -930,21 +1023,28 @@ def _detect_leakage(
         y_num = None
 
     for col in list(df.columns):
+        sem = meta.columns.get(col, {}).get("semantic_type", "") if meta is not None else ""
+
         # ── KESİN 1: Identifier semantic_type ──
-        if meta is not None:
-            sem = meta.columns.get(col, {}).get("semantic_type", "")
-            if sem == "identifier":
-                df = df.drop(columns=[col], errors="ignore")
-                dropped.append({"column": col, "reason": "identifier (semantic_type)"})
-                logger.info(f"[leakage] KESIN drop: '{col}' (identifier)")
-                continue
+        if sem == "identifier":
+            df = df.drop(columns=[col], errors="ignore")
+            dropped.append({"column": col, "reason": "identifier (semantic_type)"})
+            logger.info(f"[leakage] KESIN drop: '{col}' (identifier)")
+            continue
 
         # ── KESİN 2: Aşırı yüksek kardinalite (ID-benzeri) ──
-        # Time-series lag kolonlari MUAF: deterministik turetildi, continuous olmalari
-        # dogal (her satir farkli) → ID degiller. SADECE bu kuraldan muaf; korelasyon/
-        # sizinti kontrolu (asagida) onlara da aynen uygulanir.
+        # KRİTİK: Sürekli ÖLÇÜMLER (PCA bileşenleri V1..V28, float metrikler, tutar) doğal
+        # olarak yüksek-kardinalitelidir ama ID DEĞİLdir → onları ID sanıp atma. Gerçek
+        # identifier'lar integer/string'dir. Aksi halde bütün ayırt edici sürekli feature'lar
+        # silinir (creditcard V1-V28 vakası). Muaf: semantic_type metric/numeric VEYA float dtype
+        # VEYA protected_high_card (time-series lag). Korelasyon/sızıntı kontrolü onlara yine uygulanır.
+        is_continuous = (
+            sem in ("metric", "numeric")
+            or pd.api.types.is_float_dtype(df[col])
+        )
         nunique = df[col].nunique()
-        if col not in protected_high_card and n_rows > 0 and nunique / n_rows > 0.95:
+        if (col not in protected_high_card and not is_continuous
+                and n_rows > 0 and nunique / n_rows > 0.95):
             df = df.drop(columns=[col], errors="ignore")
             dropped.append({"column": col, "reason": f"asiri kardinalite ({nunique}/{n_rows})"})
             logger.info(f"[leakage] KESIN drop: '{col}' (kardinalite orani {nunique/n_rows:.2f})")
@@ -977,6 +1077,21 @@ def _detect_leakage(
                 # ŞÜPHELİ: yüksek ama kesin değil → drop etme, uyar
                 suspected.append({"column": col, "reason": f"yuksek korelasyon ({corr:.3f})"})
                 logger.warning(f"[leakage] SUPHELI: '{col}' (corr={corr:.3f}) — droplanmadi, uyari verildi")
+
+    # ── Tek-feature hedef kilidi (NON-LINEER sizinti) ──
+    # Korelasyonun kacirdigi 'esikten birebir ayiran' kolonlari (ALERT_ID, *_isna) yakalar.
+    if y_valid:
+        tl_drop, tl_suspect = _single_feature_target_lock(df, y)
+        for d in tl_drop:
+            if d["column"] in df.columns:
+                df = df.drop(columns=[d["column"]], errors="ignore")
+                dropped.append(d)
+                logger.info(f"[leakage] KESIN drop: '{d['column']}' ({d['reason']})")
+        already = {x["column"] for x in dropped} | {x["column"] for x in suspected}
+        for s in tl_suspect:
+            if s["column"] not in already:
+                suspected.append(s)
+                logger.warning(f"[leakage] SUPHELI: '{s['column']}' ({s['reason']}) — droplanmadi")
 
     return df, {"dropped": dropped, "suspected": suspected}
 
@@ -1118,12 +1233,37 @@ _GROUPBY_MAX_CAT_COLS  = 3
 _MISSING_IND_MAX_COLS  = 30
 
 
-def _add_missing_indicators(df: pd.DataFrame, max_cols: int = _MISSING_IND_MAX_COLS) -> list[str]:
+def _leakage_exclude_cols(feature_plan: dict, meta, domain_leakage_report: dict) -> set:
+    """Auto-feature ailelerinin TURETMEMESI gereken kolonlar: target + semantic_type
+    identifier/timestamp/target + domain leakage suspect'leri. Bu kolonlardan _isna/
+    count_/dev_ uretmek 'own-goal' leakage yaratir (orn. ALERT_TYPE_isna)."""
+    excl: set = set()
+    tgt = ((feature_plan or {}).get("target") or {}).get("column_name", "")
+    if tgt:
+        excl.add(tgt)
+    cols_meta = getattr(meta, "columns", {}) or {}
+    for col, info in cols_meta.items():
+        if (info or {}).get("semantic_type", "") in ("identifier", "timestamp", "target"):
+            excl.add(col)
+    for c in (domain_leakage_report or {}).get("concerns", []):
+        name = c.get("column_name") if isinstance(c, dict) else None
+        if name:
+            excl.add(name)
+    return {c for c in excl if c}
+
+
+def _add_missing_indicators(df: pd.DataFrame, max_cols: int = _MISSING_IND_MAX_COLS,
+                            exclude: set | None = None) -> list[str]:
     """fillna ONCESI cagrilir: null tasiyan kolonlar icin '<col>_isna' (0/1) ekler →
     eksiklik sinyalini korur (impute bu bilgiyi siler). Row-wise: capraz-satir istatistik
     YOK → leakage YOK, split'ten once guvenli. Cok az/cok cok null tasiyan kolonlar dusuk
-    varyansla _select_features'ta zaten elenir. df IN-PLACE; eklenen kolon adlarini dondurur."""
-    null_cols = [c for c in df.columns if df[c].isnull().any()]
+    varyansla _select_features'ta zaten elenir. df IN-PLACE; eklenen kolon adlarini dondurur.
+
+    ``exclude``: target/identifier/leakage-suspect kolonlar — bunlardan '<col>_isna'
+    TURETME (own-goal onleme): leaky bir kolon 'sadece pozitifte dolu' ise '<col>_isna'
+    target'i birebir kopyalar; bu kolonu hic uretmeyiz."""
+    exclude = exclude or set()
+    null_cols = [c for c in df.columns if c not in exclude and df[c].isnull().any()]
     null_cols = sorted(null_cols, key=lambda c: df[c].isnull().mean(), reverse=True)[:max_cols]
     added: list[str] = []
     for c in null_cols:
@@ -1138,13 +1278,15 @@ def _add_missing_indicators(df: pd.DataFrame, max_cols: int = _MISSING_IND_MAX_C
 
 
 def _count_encode_tt(
-    X_train: pd.DataFrame, X_test: pd.DataFrame
+    X_train: pd.DataFrame, X_test: pd.DataFrame, exclude: set | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """Her uygun kategorik kolon icin 'count_<col>' = o kategorinin TRAIN frekansi.
     Frekanslar SADECE train'den ogrenilir; test train frekansiyla maplenir, gorulmeyen
     kategori → 0. Leakage-safe (target kullanmaz); ucuz ama guclu kategorik sinyal
-    (nadir/sik kategori ayrimi). Encode ONCESI calismali (ham kategorikleri kullanir)."""
-    cat_cols = X_train.select_dtypes(include="object").columns.tolist()
+    (nadir/sik kategori ayrimi). Encode ONCESI calismali (ham kategorikleri kullanir).
+    ``exclude``: leakage-suspect/target kolonlardan 'count_' turetme (own-goal onleme)."""
+    exclude = exclude or set()
+    cat_cols = [c for c in X_train.select_dtypes(include="object").columns if c not in exclude]
     added: list[str] = []
     for c in cat_cols:
         card = X_train[c].nunique()
@@ -1163,7 +1305,7 @@ def _count_encode_tt(
 
 
 def _groupby_deviation_tt(
-    X_train: pd.DataFrame, X_test: pd.DataFrame, meta=None
+    X_train: pd.DataFrame, X_test: pd.DataFrame, meta=None, exclude: set | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     """'dev_<num>_by_<cat>' = num - (o kategorinin TRAIN'deki num ortalamasi): bir satirin
     kendi grup-normundan SAPMASI. Grandmaster tablo feature'larinin en guclulerinden
@@ -1171,13 +1313,16 @@ def _groupby_deviation_tt(
     ortalamalari SADECE train'den; gorulmeyen kategori → train GLOBAL ortalamasi (sapma=0
     civari). Leakage-safe (target kullanmaz). Patlama korumasi: dusuk-kardinaliteli cat'ler
     (dolu/stabil grup) × en yuksek normalize-varyansli sayisal kolonlar, cift sayisi cap'li.
-    Encode ONCESI calismali (ham kategorikleri grup anahtari yapar)."""
+    Encode ONCESI calismali (ham kategorikleri grup anahtari yapar).
+    ``exclude``: leakage-suspect/target kolonlari ne grup anahtari ne sayisal girdi yap."""
+    exclude = exclude or set()
     cat_cols = [c for c in X_train.select_dtypes(include="object").columns
-                if _GROUPBY_MAX_CARD >= X_train[c].nunique() >= 2]
+                if c not in exclude and _GROUPBY_MAX_CARD >= X_train[c].nunique() >= 2]
     num_cols = X_train.select_dtypes(include="number").columns.tolist()
     # Turetilmis kolonlari (count_/dev_/isna) grup-deviation GIRDISI yapma → gurultu/dongu onle
     num_cols = [c for c in num_cols
-                if not c.startswith(("count_", "dev_")) and not c.endswith("_isna")]
+                if c not in exclude
+                and not c.startswith(("count_", "dev_")) and not c.endswith("_isna")]
     if not cat_cols or not num_cols:
         return X_train, X_test, []
 
@@ -1214,43 +1359,76 @@ def _groupby_deviation_tt(
 # ── MAIN NODE ────────────────────────────────────────────────
 _FEATURE_SPEC_EPS = 1e-9
 
-# Safe, deterministic op palette an expert agent may compose via FeatureSpec.
-# (arity, fn) — fn receives that many pandas Series and returns one Series.
+# Bounds keep the deterministic ops numerically safe regardless of what the LLM picks.
+_POWER_EXP_BOUNDS = (-3.0, 3.0)
+
+
+def _prod_series(cols: list) -> "pd.Series":
+    out = cols[0]
+    for c in cols[1:]:
+        out = out * c
+    return out
+
+
+def _weighted_sum_series(cols: list, params: list) -> "pd.Series":
+    out = None
+    for w, c in zip(params, cols):
+        term = float(w) * c
+        out = term if out is None else out + term
+    return out
+
+
+# Safe, deterministic op palette the LLM may compose via FeatureSpec. Each fn
+# takes ``(cols, params)`` — a list of pandas Series + a list of numeric constants —
+# and returns one Series. Arity/params are validated against
+# ``schemas.FEATURE_OP_SPEC`` (the single source of truth) before any fn runs.
 _FEATURE_OPS = {
-    "ratio":      (2, lambda a, b: a / (b.abs() + _FEATURE_SPEC_EPS)),
-    "product":    (2, lambda a, b: a * b),
-    "difference": (2, lambda a, b: a - b),
-    "zscore":     (1, lambda a: (a - a.mean()) / (a.std(ddof=0) + _FEATURE_SPEC_EPS)),
-    "log":        (1, lambda a: np.log1p(a.clip(lower=0))),
+    "ratio":        lambda cols, p: cols[0] / (_prod_series(cols[1:]).abs() + _FEATURE_SPEC_EPS),
+    "product":      lambda cols, p: _prod_series(cols),
+    "difference":   lambda cols, p: cols[0] - cols[1],
+    "zscore":       lambda cols, p: (cols[0] - cols[0].mean()) / (cols[0].std(ddof=0) + _FEATURE_SPEC_EPS),
+    "log":          lambda cols, p: np.log1p(cols[0].clip(lower=0)),
+    "power":        lambda cols, p: cols[0] ** float(p[0]),
+    "weighted_sum": lambda cols, p: _weighted_sum_series(cols, p),
+    "normalize":    lambda cols, p: (cols[0] - cols[0].min()) / ((cols[0].max() - cols[0].min()) + _FEATURE_SPEC_EPS),
 }
 
 
-def _apply_feature_specs(df: pd.DataFrame, state: dict, disallowed: set) -> list[str]:
-    """Apply agent-decided ``FeatureSpec``s (from ``merchant_analysis``) in place.
+def _sanitize_params(op: str, params: list) -> list:
+    """Coerce/clamp an op's numeric params into a safe range. None if invalid."""
+    try:
+        out = [float(v) for v in (params or [])]
+    except (TypeError, ValueError):
+        return None
+    if op == "power" and out:
+        lo, hi = _POWER_EXP_BOUNDS
+        out[0] = max(lo, min(hi, out[0]))
+    return out
 
-    This is the "agent decides, builder executes" path: the expert agent chose
-    these transforms over the REAL columns it investigated. Each spec is validated
-    against the actual schema + a leakage denylist before its op runs; anything
-    invalid or unsafe is skipped, never executed. Returns the columns added.
+
+def _run_feature_specs(df: pd.DataFrame, specs: list, disallowed: set, *, source_label: str) -> list[str]:
+    """Validate + deterministically apply a list of ``FeatureSpec``s in place.
+
+    Shared executor for both the agent-driven path (``merchant_analysis``) and the
+    generic plan-driven path (``feature_plan.derived_features``). Each spec is
+    checked against the op palette (shape via ``FEATURE_OP_SPEC``), the actual
+    schema (columns exist, name not already taken), and a leakage denylist before
+    its op runs; anything invalid or unsafe is skipped, never executed. Returns the
+    columns actually added.
     """
-    from src.domains.schemas import MerchantAnalysis
-
-    analysis = MerchantAnalysis.from_dict(state.get("merchant_analysis"))
-    if analysis is None:
-        return []
-    specs = [s for f in analysis.findings for s in (f.feature_specs or [])]
-    if not specs:
-        return []
+    from src.domains.schemas import validate_feature_spec_shape
 
     deny = {c for c in (disallowed or set()) if c}
     added: list[str] = []
     for spec in specs:
         try:
-            entry = _FEATURE_OPS.get(spec.op)
-            if entry is None:
+            if spec.op not in _FEATURE_OPS:
                 continue
-            arity, fn = entry
-            if len(spec.inputs) != arity or spec.name in df.columns or spec.name in added:
+            params = _sanitize_params(spec.op, getattr(spec, "params", None))
+            if params is None or not validate_feature_spec_shape(spec.op, len(spec.inputs), len(params)):
+                logger.info(f"[feature_eng] FeatureSpec '{spec.name}' atlandi: gecersiz sekil ({spec.op})")
+                continue
+            if spec.name in df.columns or spec.name in added:
                 continue
             missing = [c for c in spec.inputs if c not in df.columns]
             if missing:
@@ -1261,13 +1439,55 @@ def _apply_feature_specs(df: pd.DataFrame, state: dict, disallowed: set) -> list
                 logger.info(f"[feature_eng] FeatureSpec '{spec.name}' atlandi: leakage girdisi {leaky}")
                 continue
             cols = [pd.to_numeric(df[c], errors="coerce") for c in spec.inputs]
-            series = fn(*cols)
+            series = _FEATURE_OPS[spec.op](cols, params)
             df[spec.name] = series.replace([np.inf, -np.inf], 0).fillna(0)
             added.append(spec.name)
-            logger.info(f"[feature_eng] Ajan feature'i uygulandi: {spec.name} = {spec.op}{tuple(spec.inputs)}")
+            logger.info(f"[feature_eng] {source_label} feature'i uygulandi: "
+                        f"{spec.name} = {spec.op}{tuple(spec.inputs)}"
+                        + (f" params={params}" if params else ""))
         except Exception as e:
             logger.error(f"[feature_eng] FeatureSpec '{getattr(spec, 'name', '?')}' hatasi: {e}")
     return added
+
+
+def _apply_feature_specs(df: pd.DataFrame, state: dict, disallowed: set) -> list[str]:
+    """Apply agent-decided ``FeatureSpec``s (from ``merchant_analysis``) in place.
+
+    This is the sector-specific "agent decides, builder executes" path: the expert
+    agent chose these transforms over the REAL columns it investigated. Delegates to
+    :func:`_run_feature_specs` for validation + execution. Returns columns added.
+    """
+    from src.domains.schemas import MerchantAnalysis
+
+    analysis = MerchantAnalysis.from_dict(state.get("merchant_analysis"))
+    if analysis is None:
+        return []
+    specs = [s for f in analysis.findings for s in (f.feature_specs or [])]
+    if not specs:
+        return []
+    return _run_feature_specs(df, specs, disallowed, source_label="Ajan")
+
+
+def _apply_plan_derived_features(df: pd.DataFrame, feature_plan: dict, disallowed: set) -> list[str]:
+    """Apply the generic, sector-independent ``feature_plan.derived_features``.
+
+    The feature planner LLM proposes dataset-meaningful derived columns (e.g.
+    velocity = ratio(distance, time)) as structured FeatureSpecs — never raw code.
+    This runs for ANY dataset, with or without a domain pack, through the same
+    validated/leakage-guarded executor. Returns columns added.
+    """
+    from src.domains.schemas import FeatureSpec
+
+    raw = feature_plan.get("derived_features") or []
+    specs: list[FeatureSpec] = []
+    for d in raw:
+        try:
+            specs.append(d if isinstance(d, FeatureSpec) else FeatureSpec(**d))
+        except Exception as e:
+            logger.info(f"[feature_eng] derived_feature atlandi (parse): {e}")
+    if not specs:
+        return []
+    return _run_feature_specs(df, specs, disallowed, source_label="Plan")
 
 
 def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata") -> list[str]:
@@ -1371,10 +1591,29 @@ def build_features(state: dict) -> dict:
             df = df.drop(columns=existing_drops, errors="ignore")
             logger.info(f"[feature_eng] Critic drop_features: {existing_drops}")
 
+    # Critic 'too-good/leakage' teşhisinden gelen DETERMINISTIK drop (retry).
+    # LLM'in drop_features'ına bağlı kalmadan, importance-bazlı leakage_suspect'leri
+    # doğrudan düşürür — schema'da drop_features alanı olmadığı için bu yol garanti.
+    forced_drops = state.get("forced_leakage_drops") or []
+    if forced_drops:
+        existing_forced = [c for c in forced_drops if c in df.columns]
+        if existing_forced:
+            df = df.drop(columns=existing_forced, errors="ignore")
+            logger.info(f"[feature_eng] Forced leakage drop (critic): {existing_forced}")
+
+    # Auto-feature ailelerinin türetmemesi gereken leaky/target/identifier kolonlar.
+    # ÖNEMLİ (own-goal önleme): leaky bir kolondan _isna/count_/dev_ türetmek target'ı
+    # birebir kopyalayan bir feature yaratabilir (örn. ALERT_TYPE_isna).
+    leakage_exclude = _leakage_exclude_cols(
+        feature_plan, meta, state.get("domain_leakage_report") or {})
+    leakage_exclude |= set(forced_drops)  # forced drop'lardan da auto-feature türetme
+    if leakage_exclude:
+        logger.info(f"[feature_eng] Auto-feature exclude (leakage-safe): {sorted(leakage_exclude)}")
+
     # Missing-value indicator'lari (fillna ONCESI — _clean_data dolduruyor): null
     # sinyalini koru. Row-wise → leakage yok, split'ten once guvenli. Eklenen kolonlar
     # auto_feature_cols'ta birikir; supervised yolda count/deviation ile genisler.
-    auto_feature_cols: list[str] = _add_missing_indicators(df)
+    auto_feature_cols: list[str] = _add_missing_indicators(df, exclude=leakage_exclude)
 
     # Temizlik
     df = _clean_data(df)
@@ -1493,18 +1732,17 @@ def build_features(state: dict) -> dict:
         df = df.drop(columns=existing, errors="ignore")
         logger.info(f"[feature_eng] Drop (id/ts/target): {existing}")
 
-    # Math interactions
-    for expr in feature_plan.get("math_interactions", []):
-        try:
-            # Noktalı kolon isimlerini backtick ile sar
-            safe_expr = expr
-            for col in df.columns:
-                if "." in col and col in expr:
-                    safe_expr = safe_expr.replace(col, f"`{col}`")
-            safe_name = "math_" + "".join([c if c.isalnum() else "_" for c in expr])[:30]
-            df[safe_name] = df.eval(safe_expr)
-        except Exception as e:
-            logger.error(f"[feature_eng] Math interaction hatasi ({expr}): {e}")
+    # Leakage denylist for every derived-feature path below: target + its aliases +
+    # high-confidence leaky cols can never become an input.
+    disallowed = {target_name, target_col} | set(related) | set(leaky_cols_high)
+
+    # Generic (sector-independent) derived features: the feature planner LLM picks
+    # an op from the safe palette over REAL columns (e.g. velocity = ratio(x, t)).
+    # Validated + deterministically executed — replaces the old raw df.eval path,
+    # which let the LLM write code with no leakage guard.
+    derived_feature_cols = _apply_plan_derived_features(df, feature_plan, disallowed)
+    if derived_feature_cols:
+        logger.info(f"[feature_eng] Plan turevli feature'lar: {derived_feature_cols}")
 
     # Domain pack feature'ları (additive + guarded). Pack 'none' ise hiç çalışmaz.
     #   (a) Ajan-karar yolu: expert ajanının propose_feature ile seçtiği FeatureSpec'ler,
@@ -1512,7 +1750,6 @@ def build_features(state: dict) -> dict:
     #   (b) Statik fallback: ajan bir şey üretmediyse, convention-bazlı recipe'ler devreye girer.
     domain_feature_cols: list[str] = []
     try:
-        disallowed = {target_name, target_col} | set(related) | set(leaky_cols_high)
         agent_cols = _apply_feature_specs(df, state, disallowed)
         domain_feature_cols.extend(agent_cols)
         if not agent_cols:
@@ -1598,8 +1835,9 @@ def build_features(state: dict) -> dict:
         # Grandmaster feature aileleri: count-encoding + groupby-deviation. ENCODE
         # ONCESI calisirlar (ham kategorikleri girdi/grup-anahtari olarak kullanirlar).
         # Ikisi de train-fit → leakage-safe; target kullanmazlar.
-        X_train, X_test, _ce_cols = _count_encode_tt(X_train, X_test)
-        X_train, X_test, _gd_cols = _groupby_deviation_tt(X_train, X_test, meta)
+        _auto_exclude = disallowed | leakage_exclude
+        X_train, X_test, _ce_cols = _count_encode_tt(X_train, X_test, exclude=_auto_exclude)
+        X_train, X_test, _gd_cols = _groupby_deviation_tt(X_train, X_test, meta, exclude=_auto_exclude)
         auto_feature_cols = auto_feature_cols + _ce_cols + _gd_cols
 
         X_train, X_test = _encode_categorical_tt(X_train, X_test, y_train)
@@ -1639,6 +1877,7 @@ def build_features(state: dict) -> dict:
         "total_rows_available":     None,  # execution_node profiling'den alınabilir
         "leakage_dropped":          leakage_report["dropped"],
         "leakage_suspected":        leakage_report["suspected"],
+        "derived_features":         [c for c in derived_feature_cols if c in X_train.columns],
         "domain_features":          [c for c in domain_feature_cols if c in X_train.columns],
         "auto_features":            [c for c in auto_feature_cols if c in X_train.columns],
         "timeseries_lag":           ts_lag_info,

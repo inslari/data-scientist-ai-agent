@@ -92,18 +92,18 @@ def _evaluate_classification(
             # j_scores = tpr - fpr
             # optimal_idx = int(np.argmax(j_scores))
             # optimal_threshold = round(float(thresholds[optimal_idx]), 4)
-            
+
             # Optimal threshold: F1 Skorunu maksimize ederek secelim (Dengesiz veriler icin daha iyi)
             from sklearn.metrics import precision_recall_curve
             precision, recall, pr_thresholds = precision_recall_curve(y_test, y_prob_test[:, 1])
-            
+
             num = 2 * recall * precision
             den = recall + precision
             f1_scores = np.divide(num, den, out=np.zeros_like(num), where=(den!=0))
-            
+
             best_pr_idx = int(np.argmax(f1_scores[:-1]))
             optimal_threshold = round(float(pr_thresholds[best_pr_idx]), 4)
-            
+
             # ROC curve uzerindeki karsilik gelen index'i bulalim (UI grafiklerinde gostermek icin)
             optimal_idx = int(np.argmin(np.abs(thresholds - optimal_threshold)))
             # Update predictions based on optimal threshold for better recall
