@@ -392,15 +392,28 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             from typing import Any
             
             pg_conn_str = SQLALCHEMY_DATABASE_URL.replace("postgresql+psycopg2://", "postgresql://")
-            
+
             pool_kwargs = {
                 "autocommit": True,
                 "row_factory": dict_row,
+                # TCP keepalives: a DS node can run for minutes (training/silhouette),
+                # leaving the checkpoint connection idle. Without keepalives a remote
+                # Postgres / pooler / firewall silently drops that idle socket, and the
+                # next `aput_writes` fails with "server closed the connection
+                # unexpectedly". These probe the socket so it stays alive.
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 5,
             }
-            
+
             async with AsyncConnectionPool(
-                pg_conn_str, 
-                kwargs=pool_kwargs
+                pg_conn_str,
+                kwargs=pool_kwargs,
+                # Validate (and transparently recycle) a pooled connection on
+                # checkout, so a connection that died during a long node is
+                # reconnected before we try to write the checkpoint with it.
+                check=AsyncConnectionPool.check_connection,
             ) as pool:
                 saver = AsyncPostgresSaver(pool)  # type: ignore
                 await saver.setup()
