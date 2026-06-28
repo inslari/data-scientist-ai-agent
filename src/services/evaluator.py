@@ -517,7 +517,24 @@ def _overfitting_description(status: str, gap: float, basis: str = "cv_vs_test")
 
 # Feature Importance
 def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
-    """Model'den feature importance çıkarır — model tipine göre adaptif."""
+    """Model'den feature importance çıkarır — ensemble/calibration/pipeline
+    sarmalayıcılarını çözen ml_trainer implementasyonuna delege eder.
+
+    Bu naif yerel sürüm yalnızca düz ``feature_importances_``/``coef_`` ve basit
+    Pipeline'ı çözüyordu; seçilen model ``oof_blend`` (WeightedProbaBlend),
+    ``stacking_ensemble``, kalibre edilmiş veya seed-bagging'li olduğunda boş dönüp
+    raporda 'Feature Importance' grafiğini boş bırakıyordu. ml_trainer'ın sürümü
+    blend/stacking/seed-bag üyelerini ortalar ve CalibratedClassifierCV/Pipeline'ı
+    soyar (tek doğruluk kaynağı)."""
+    try:
+        from src.services.ml_trainer import _extract_feature_importance as _rich
+        fi = _rich(model, feature_names)
+        if fi:
+            return fi
+    except Exception:
+        pass
+
+    # Fallback: ml_trainer import edilemez/boş dönerse basit çıkarım
     try:
         est = model
         if hasattr(model, "named_steps"):

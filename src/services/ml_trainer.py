@@ -100,6 +100,8 @@ def _get_classification_models() -> dict:
         )
     except ImportError:
         pass
+    if getattr(settings, "EXTRA_MODELS_ENABLED", False):
+        models.update(_extra_classification_models(balanced=False))
     return models
 
 
@@ -182,6 +184,18 @@ def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
                     arrs.append(a * w)
             if arrs:
                 avg = np.sum(arrs, axis=0)
+                imp = dict(zip(feature_names, avg.tolist()))
+                return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
+            return {}
+        # Seed-bagging: aynı modelin seed-üyelerinin importance'larını eşit ortala.
+        if isinstance(base, (SeedBaggingClassifier, SeedBaggingRegressor)) and hasattr(base, "fitted_"):
+            arrs = []
+            for sub in base.fitted_:
+                a = _importances_from(_unwrap_to_estimator(sub), feature_names)
+                if a is not None:
+                    arrs.append(a)
+            if arrs:
+                avg = np.mean(arrs, axis=0)
                 imp = dict(zip(feature_names, avg.tolist()))
                 return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
             return {}
@@ -487,9 +501,51 @@ def _get_classification_models_balanced(class_weights: dict) -> dict:
     except ImportError:
         pass
 
+    if getattr(settings, "EXTRA_MODELS_ENABLED", False):
+        models.update(_extra_classification_models(balanced=True))
+
     return models
- 
- 
+
+
+def _extra_classification_models(balanced: bool = False) -> dict:
+    """Klasik baseline sınıflandırıcılar (notebook'tan): decision_tree, naive_bayes,
+    knn, svm, mlp. ``settings.EXTRA_MODELS_ENABLED`` ile her iki kataloğa da merge edilir.
+
+    class_weight destekleyenler (decision_tree, svm→LinearSVC) balanced'da 'balanced'
+    alır; desteklemeyenler (naive_bayes, knn, mlp) düz döner ve dengesiz yolda çağıran
+    tarafça ``_wrap_with_smote`` ile dengelenir. LinearSVC predict_proba sunmadığından
+    CalibratedClassifierCV ile sarılır (CV/stacking/OOF-blend olasılık bekler). knn/svm/mlp
+    ölçeğe duyarlı olduğundan StandardScaler pipeline'ı içinde verilir."""
+    from sklearn.tree import DecisionTreeClassifier
+    from sklearn.naive_bayes import GaussianNB
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.svm import LinearSVC
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.neural_network import MLPClassifier
+
+    cw = "balanced" if balanced else None
+    return {
+        "decision_tree": DecisionTreeClassifier(random_state=RANDOM_STATE, class_weight=cw),
+        "naive_bayes": GaussianNB(),
+        "knn": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", KNeighborsClassifier()),
+        ]),
+        "svm": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", CalibratedClassifierCV(
+                LinearSVC(random_state=RANDOM_STATE, class_weight=cw), cv=3,
+            )),
+        ]),
+        "mlp": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", MLPClassifier(
+                random_state=RANDOM_STATE, early_stopping=True, max_iter=300,
+            )),
+        ]),
+    }
+
+
 def _build_stacking_candidate(models, results, X_train, y_train, scoring, is_imbalanced):
     """En iyi 2-3 modeli StackingClassifier ile birleştirip CV skorunu döndürür.
 
@@ -602,6 +658,130 @@ class WeightedMeanBlend(BaseEstimator, RegressorMixin):
             p = e.predict(X)
             pred = w * p if pred is None else pred + w * p
         return pred
+
+
+# ── Multi-seed bagging (final-model variance reduction) ──────────────────────
+# Models whose fit is genuinely seed-sensitive. Bagging a deterministic model
+# (knn / naive_bayes) would just clone identical members → no variance gain, so
+# we skip those. Keyed by the catalog name returned as best_name.
+_SEED_BAGGABLE = {
+    "random_forest", "extra_trees", "gradient_boosting", "adaboost",
+    "xgboost", "lightgbm", "catboost", "decision_tree", "mlp",
+}
+
+# Slow-to-fit models: cap their bagging rounds so a single slow final model
+# (boosting / NN) doesn't multiply runtime under bagging × calibration.
+_SLOW_MODELS = {"catboost", "xgboost", "lightgbm", "gradient_boosting", "mlp", "svm"}
+_SLOW_MODEL_MAX_ROUNDS = 2
+
+
+def _seed_list(rounds: int) -> list[int]:
+    """Consecutive seeds anchored on the global RANDOM_SEED (deterministic)."""
+    base = int(settings.RANDOM_SEED)
+    return [base + i for i in range(max(1, int(rounds)))]
+
+
+def _set_all_random_states(est: Any, seed: int) -> Any:
+    """Set every nested ``random_state`` param (this estimator + any SMOTE/Pipeline
+    step) to ``seed`` so a clone diverges from its siblings. Best-effort, never raises."""
+    try:
+        params = est.get_params(deep=True)
+    except Exception:
+        return est
+    updates = {k: seed for k in params if k == "random_state" or k.endswith("__random_state")}
+    if updates:
+        try:
+            est.set_params(**updates)
+        except Exception:
+            pass
+    return est
+
+
+class SeedBaggingClassifier(ClassifierMixin, BaseEstimator):
+    """Fit the same estimator under several seeds on the FULL train set and average
+    predict_proba — variance reduction for the final single model. Mirrors the
+    WeightedProbaBlend artifact contract (module-level → joblib-picklable; base is
+    cloned per member; predict is argmax of the mean probability).
+
+    Mixin is listed FIRST (sklearn's required MRO order) so ``__sklearn_tags__``
+    reports a classifier — otherwise CalibratedClassifierCV rejects the bag."""
+
+    def __init__(self, base_estimator=None, seeds=None):
+        self.base_estimator = base_estimator
+        self.seeds = seeds
+
+    def fit(self, X, y, sample_weight=None):
+        self.classes_ = np.unique(y)
+        self.fitted_ = []
+        for s in (self.seeds or [None]):
+            e = clone(self.base_estimator)
+            if s is not None:
+                _set_all_random_states(e, s)
+            if sample_weight is not None:
+                e.fit(X, y, sample_weight=sample_weight)
+            else:
+                e.fit(X, y)
+            self.fitted_.append(e)
+        return self
+
+    def predict_proba(self, X):
+        P = None
+        for e in self.fitted_:
+            p = e.predict_proba(X)
+            P = p if P is None else P + p
+        return P / len(self.fitted_)
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+
+class SeedBaggingRegressor(RegressorMixin, BaseEstimator):
+    """Regression counterpart: average the predict outputs of the same regressor
+    fit under several seeds (variance reduction). Mirrors WeightedMeanBlend.
+    Mixin-first MRO keeps ``__sklearn_tags__`` reporting a regressor."""
+
+    def __init__(self, base_estimator=None, seeds=None):
+        self.base_estimator = base_estimator
+        self.seeds = seeds
+
+    def fit(self, X, y, sample_weight=None):
+        self.fitted_ = []
+        for s in (self.seeds or [None]):
+            e = clone(self.base_estimator)
+            if s is not None:
+                _set_all_random_states(e, s)
+            if sample_weight is not None:
+                e.fit(X, y, sample_weight=sample_weight)
+            else:
+                e.fit(X, y)
+            self.fitted_.append(e)
+        return self
+
+    def predict(self, X):
+        pred = None
+        for e in self.fitted_:
+            p = e.predict(X)
+            pred = p if pred is None else pred + p
+        return pred / len(self.fitted_)
+
+
+def _maybe_seed_bag(model: Any, best_name: str, task: str) -> tuple[Any, int]:
+    """Wrap the selected single model in a seed-bagging ensemble when enabled and
+    the model is seed-sensitive. Returns ``(model_or_bag, rounds_used)`` where
+    rounds_used is 0 when bagging is skipped (so callers can record it)."""
+    if not getattr(settings, "SEED_BAGGING_ENABLED", False):
+        return model, 0
+    rounds = int(getattr(settings, "SEED_BAGGING_ROUNDS", 0) or 0)
+    if best_name in _SLOW_MODELS:                       # yavaş modelde maliyeti sınırla
+        rounds = min(rounds, _SLOW_MODEL_MAX_ROUNDS)
+    if rounds < 2 or best_name not in _SEED_BAGGABLE:
+        return model, 0
+    seeds = _seed_list(rounds)
+    bag = (SeedBaggingClassifier if task == "classification" else SeedBaggingRegressor)(
+        base_estimator=model, seeds=seeds
+    )
+    logger.info(f"[automl] Multi-seed bagging: '{best_name}' × {rounds} seed {seeds}")
+    return bag, rounds
 
 
 def _optimize_blend_weights(oof_list: list, y_true: np.ndarray, metric_fn) -> tuple[np.ndarray, float]:
@@ -852,6 +1032,7 @@ def _run_classification(
     use_blend    = best_name == "oof_blend" and blend_model is not None
     use_stacking = best_name == "stacking_ensemble" and ensemble_model is not None
     use_ensemble = use_blend or use_stacking   # metrik bayrağı (ikisi de "ensemble")
+    seed_bagging_rounds = 0   # yalnızca tek-model yolunda set edilir
 
     if use_blend:
         logger.info(f"[automl] OOF blend seçildi (ROC-AUC: {blend_score:.4f} > "
@@ -872,6 +1053,9 @@ def _run_classification(
         if is_imbalanced and best_name != "gradient_boosting":
             selected_model = _wrap_with_smote(selected_model, y_train)
         gb_imbalanced_path = best_name == "gradient_boosting" and is_imbalanced
+        # Multi-seed bagging: seçilen tek modeli birkaç seed'le eğitip ortala
+        # (varyans düşürme). SMOTE/Optuna sarmalı modeli olduğu gibi base alır.
+        selected_model, seed_bagging_rounds = _maybe_seed_bag(selected_model, best_name, "classification")
 
     # ── Final training (+ opsiyonel olasılık kalibrasyonu) ──
     # GradientBoosting+imbalanced sample_weight ile eğitilir; diğerlerinde SMOTE
@@ -931,6 +1115,7 @@ def _run_classification(
         "calibration_applied": calibration_applied,
         "ensemble_used":       use_ensemble,
         "ensemble_type":       "oof_blend" if use_blend else ("stacking" if use_stacking else None),
+        "seed_bagging_rounds": seed_bagging_rounds,
     }
     if use_blend and blend_weights is not None:
         _blend_bases = [name for name, _ in blend_model.estimators]
@@ -1031,6 +1216,7 @@ def _run_regression(
 
     best_name = max(results, key=lambda k: results[k]["score"])
     use_blend = best_name == "oof_blend" and blend_model is not None
+    seed_bagging_rounds = 0   # yalnızca tek-model yolunda set edilir
 
     if use_blend:
         logger.info(f"[automl] OOF blend seçildi (R²: {blend_score:.4f} > "
@@ -1041,6 +1227,8 @@ def _run_regression(
         # Optuna tuning
         tuned_model = _tune_model_regression(best_name, X_train, y_train_transformed, strong_regularization)
         best_model  = tuned_model if tuned_model is not None else models[best_name]
+        # Multi-seed bagging: seçilen tek regresörü birkaç seed'le eğitip ortala
+        best_model, seed_bagging_rounds = _maybe_seed_bag(best_model, best_name, "regression")
 
     # Final training
     best_model.fit(X_train, y_train_transformed)
@@ -1077,6 +1265,7 @@ def _run_regression(
         "cv_r2_std":    round(float(results[best_name]["std"]), 4),
         "ensemble_used": use_blend,
         "ensemble_type": "oof_blend" if use_blend else None,
+        "seed_bagging_rounds": seed_bagging_rounds,
     }
     if use_blend and blend_weights is not None:
         _blend_bases = [name for name, _ in blend_model.estimators]

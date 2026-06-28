@@ -70,16 +70,27 @@ def evaluate_quality_gate(state: dict) -> dict:
             "value": round(gap, 3),
         })
 
-    # Domain leakage (high confidence)
+    # Domain leakage (high confidence) — yalnızca MODELDE KALAN kolonlar için uyar.
+    # Detector'ın high-confidence suspect'leri feature_builder tarafından zaten
+    # düşürülmüş olabilir (feature_report.leakage_dropped'a kaydedilir). Düşürülen
+    # kolon modele hiç girmediğinden onun için "tahminler güvenilir olmayabilir"
+    # demek yanıltıcı (örn. RowNumber/CustomerId/Surname gibi tanımlayıcılar drop
+    # edilip yine de uyarı veriyordu). Drop edilmişleri uyarıdan çıkar.
     checks_performed.append("domain_leakage")
+    feature_report = state.get("feature_report") or {}
+    dropped_cols = {
+        d.get("column") for d in (feature_report.get("leakage_dropped") or [])
+        if isinstance(d, dict)
+    }
     concerns = domain_leakage.get("concerns", []) or []
     high_concerns = [c for c in concerns if c.get("confidence") == "high"]
-    if high_concerns:
-        cols = [c["column_name"] for c in high_concerns]
+    high_in_model = [c for c in high_concerns if c.get("column_name") not in dropped_cols]
+    if high_in_model:
+        cols = [c["column_name"] for c in high_in_model]
         warnings.append({
             "code": "domain_leakage_high",
             "message": f"Yüksek şüpheli leakage: {', '.join(cols)}. Tahminler güvenilir olmayabilir.",
-            "details": high_concerns,
+            "details": high_in_model,
         })
 
     # Importance-based leakage (Adım 2'den)

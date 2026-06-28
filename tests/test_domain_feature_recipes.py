@@ -14,6 +14,10 @@ from src.domains.financial.feature_recipes import (
     SpikeRatioRecipe,
     LogAmountRecipe,
     TimePartsRecipe,
+    InstallmentBurdenRecipe,
+    AffordabilityRatioRecipe,
+    ZeroBalanceFlagRecipe,
+    HoldingCountBandRecipe,
     recipes_for,
 )
 
@@ -108,12 +112,163 @@ class TimePartsRecipeTest(unittest.TestCase):
         self.assertFalse(TimePartsRecipe().applies(df))
 
 
+class InstallmentBurdenRecipeTest(unittest.TestCase):
+    def _credit_df(self):
+        # Mirrors the German-credit schema: a monetary principal + a loan term.
+        return pd.DataFrame({
+            "Credit amount": [1200.0, 6000.0, 3000.0],
+            "Duration": [6, 48, 12],          # months
+            "Age": [30, 22, 45],              # term-like? no → not matched
+        })
+
+    def test_builds_burden_ratio(self):
+        df = self._credit_df()
+        r = InstallmentBurdenRecipe()
+        self.assertTrue(r.applies(df))
+        cols = r.build(df)
+        self.assertIn("burden_Credit amount_per_Duration", cols)
+        # amount / term: 1200/6 = 200, 6000/48 = 125, 3000/12 = 250
+        burden = cols["burden_Credit amount_per_Duration"]
+        self.assertAlmostEqual(burden.iloc[0], 200.0, places=2)
+        self.assertAlmostEqual(burden.iloc[1], 125.0, places=2)
+        self.assertAlmostEqual(burden.iloc[2], 250.0, places=2)
+
+    def test_skips_without_term_column(self):
+        df = pd.DataFrame({"Credit amount": [100.0, 200.0]})  # amount but no term
+        self.assertFalse(InstallmentBurdenRecipe().applies(df))
+
+    def test_skips_without_amount_column(self):
+        df = pd.DataFrame({"Duration": [6, 12, 24]})  # term but no money col
+        self.assertFalse(InstallmentBurdenRecipe().applies(df))
+
+    def test_zero_term_is_safe(self):
+        df = pd.DataFrame({"Credit amount": [100.0], "Duration": [0]})
+        # max term is 0 → not a valid term column → recipe stays inert (no div/0)
+        self.assertFalse(InstallmentBurdenRecipe().applies(df))
+
+
+class AffordabilityRatioRecipeTest(unittest.TestCase):
+    def _bnpl_df(self):
+        # Mirrors the BNPL schema: an obligation (purchase) + recurring income.
+        return pd.DataFrame({
+            "purchase_amount": [5000.0, 1000.0, 2000.0],
+            "monthly_income": [50000.0, 10000.0, 8000.0],
+            "credit_score": [700, 300, 450],   # money? no → ignored
+        })
+
+    def test_builds_affordability_ratio(self):
+        df = self._bnpl_df()
+        r = AffordabilityRatioRecipe()
+        self.assertTrue(r.applies(df))
+        cols = r.build(df)
+        self.assertIn("purchase_amount_to_income", cols)
+        # obligation / income: 5000/50000 = 0.1, 1000/10000 = 0.1, 2000/8000 = 0.25
+        ratio = cols["purchase_amount_to_income"]
+        self.assertAlmostEqual(ratio.iloc[0], 0.1, places=4)
+        self.assertAlmostEqual(ratio.iloc[2], 0.25, places=4)
+
+    def test_skips_without_income(self):
+        df = pd.DataFrame({"purchase_amount": [100.0, 200.0]})  # obligation, no income
+        self.assertFalse(AffordabilityRatioRecipe().applies(df))
+
+    def test_skips_without_obligation(self):
+        df = pd.DataFrame({"monthly_income": [5000.0, 8000.0]})  # income, no obligation
+        self.assertFalse(AffordabilityRatioRecipe().applies(df))
+
+    def test_income_not_treated_as_obligation(self):
+        # An income-only money column must never pair with itself.
+        from src.domains.financial.feature_recipes import _obligation_cols, _income_cols
+        df = pd.DataFrame({"salary": [5000.0, 8000.0]})
+        self.assertEqual(_obligation_cols(df), [])
+        self.assertEqual(_income_cols(df), ["salary"])
+
+
+class ZeroBalanceFlagRecipeTest(unittest.TestCase):
+    def _churn_df(self):
+        # Mirrors the banking-churn schema: a balance with a chunk of zeros.
+        return pd.DataFrame({
+            "Balance": [0.0, 0.0, 0.0, 120000.0, 85000.0, 99000.0],
+            "EstimatedSalary": [50000.0, 60000.0, 70000.0, 80000.0, 90000.0, 75000.0],
+            "credit_score": [600, 700, 650, 720, 580, 690],  # score, not a magnitude
+        })
+
+    def test_builds_zero_flag_for_balance(self):
+        df = self._churn_df()
+        r = ZeroBalanceFlagRecipe()
+        self.assertTrue(r.applies(df))
+        cols = r.build(df)
+        self.assertIn("is_zero_Balance", cols)
+        # rows with Balance == 0 → 1.0, else 0.0
+        self.assertEqual(list(cols["is_zero_Balance"]), [1, 1, 1, 0, 0, 0])
+
+    def test_skips_score_and_no_zero_columns(self):
+        cols = ZeroBalanceFlagRecipe().build(self._churn_df())
+        self.assertNotIn("is_zero_credit_score", cols)       # score, not a magnitude
+        self.assertNotIn("is_zero_EstimatedSalary", cols)    # no zero rows → no signal
+
+    def test_skips_all_zero_and_no_zero(self):
+        all_zero = pd.DataFrame({"balance": [0.0, 0.0, 0.0, 0.0]})
+        no_zero = pd.DataFrame({"balance": [1.0, 2.0, 3.0, 4.0]})
+        self.assertFalse(ZeroBalanceFlagRecipe().applies(all_zero))
+        self.assertFalse(ZeroBalanceFlagRecipe().applies(no_zero))
+
+    def test_skips_negative_columns(self):
+        df = pd.DataFrame({"balance": [0.0, -5.0, 10.0, 0.0]})  # overdraft → negatives
+        self.assertFalse(ZeroBalanceFlagRecipe().applies(df))
+
+
+class HoldingCountBandRecipeTest(unittest.TestCase):
+    def _churn_df(self):
+        # Mirrors NumOfProducts (1 / 2 / 3 / 4) from the banking-churn notebook.
+        return pd.DataFrame({
+            "NumOfProducts": [1, 2, 3, 1, 4, 2, 1, 2],
+            "Tenure": [3, 5, 1, 8, 2, 6, 10, 4],   # not a holding count by name
+        })
+
+    def test_builds_single_and_multi_bands(self):
+        df = self._churn_df()
+        r = HoldingCountBandRecipe()
+        self.assertTrue(r.applies(df))
+        cols = r.build(df)
+        self.assertIn("numofproducts_is_single", cols)
+        self.assertIn("numofproducts_is_multi", cols)
+        self.assertEqual(list(cols["numofproducts_is_single"]), [1, 0, 0, 1, 0, 0, 1, 0])
+        self.assertEqual(list(cols["numofproducts_is_multi"]),  [0, 1, 1, 0, 1, 1, 0, 1])
+
+    def test_skips_when_all_single(self):
+        df = pd.DataFrame({"products": [1, 1, 1, 1]})  # no multi-holders → no signal
+        self.assertFalse(HoldingCountBandRecipe().applies(df))
+
+    def test_skips_non_integer_and_oversized(self):
+        frac = pd.DataFrame({"products": [1.0, 2.5, 3.0]})         # non-integer
+        huge = pd.DataFrame({"product_count": [1, 999, 2]})        # > _HOLDING_MAX
+        self.assertFalse(HoldingCountBandRecipe().applies(frac))
+        self.assertFalse(HoldingCountBandRecipe().applies(huge))
+
+    def test_skips_unrelated_count_column(self):
+        df = pd.DataFrame({"Tenure": [1, 2, 3, 4]})  # name not a holding count
+        self.assertFalse(HoldingCountBandRecipe().applies(df))
+
+
 class RecipeGatingTest(unittest.TestCase):
     def test_fires_for_fraud(self):
         self.assertTrue(recipes_for(["fraud"]))
 
     def test_fires_for_revenue(self):
         self.assertTrue(recipes_for(["revenue"]))
+
+    def test_fires_for_customer_with_churn_recipes(self):
+        names = {r.name for r in recipes_for(["customer"])}
+        self.assertIn("financial.zero_balance_flag", names)
+        self.assertIn("financial.holding_count_band", names)
+        self.assertIn("financial.log_amount", names)
+
+    def test_council_union_dedups_log_amount(self):
+        recipes = recipes_for(["fraud", "customer"])
+        names = [r.name for r in recipes]
+        self.assertEqual(names.count("financial.log_amount"), 1)  # shared, once only
+        self.assertIn("financial.zero_balance_flag", names)       # from customer
+        self.assertIn("financial.volatility_cv", names)           # from fraud
 
     def test_silent_for_unrelated_expert(self):
         self.assertEqual(recipes_for(["growth"]), [])
@@ -128,6 +283,13 @@ class PackHookTest(unittest.TestCase):
         names = {r.name for r in recipes}
         self.assertIn("financial.volatility_cv", names)
         self.assertIn("financial.spike_ratio", names)
+
+    def test_financial_pack_returns_churn_recipes_for_customer(self):
+        pack = FinancialPack()
+        ctx = MerchantContext(pack_name="financial", primary_expert="customer", council=["customer"])
+        names = {r.name for r in pack.feature_recipes(ctx)}
+        self.assertIn("financial.zero_balance_flag", names)
+        self.assertIn("financial.holding_count_band", names)
 
     def test_financial_pack_silent_for_growth(self):
         pack = FinancialPack()

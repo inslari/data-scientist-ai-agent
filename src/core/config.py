@@ -16,6 +16,17 @@ class Settings:
     RANDOM_SEED : int = 42
     ENABLE_DETERMINISM : bool = True
 
+    # Multi-seed bagging: retrain the final single model under several seeds and
+    # average their predictions (pure variance reduction). Only fires on the
+    # single-model path (stacking / OOF-blend are already ensembles) and only for
+    # seed-sensitive models. ROUNDS<2 disables it.
+    SEED_BAGGING_ENABLED : bool = os.getenv("SEED_BAGGING_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    SEED_BAGGING_ROUNDS : int = int(os.getenv("SEED_BAGGING_ROUNDS", "3"))
+
+    # Extra baseline classifiers (decision_tree, naive_bayes, knn, svm, mlp) merged
+    # into the classification catalog. Adds breadth at some runtime cost.
+    EXTRA_MODELS_ENABLED : bool = os.getenv("EXTRA_MODELS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
     # Deployment environment. When set to "local" (env ENVIRONMENT=local), the
     # default dataset DB points at data/financial.db so the MCP server serves the
     # financial transaction dataset locally without any .env DB overrides.
