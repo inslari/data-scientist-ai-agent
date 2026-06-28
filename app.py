@@ -965,12 +965,18 @@ def render_results(result: AgentState):
                     legend=dict(font=dict(family="JetBrains Mono",size=10),bgcolor="rgba(0,0,0,0)"))
                 st.plotly_chart(fig_ad,use_container_width=True)
             else:
-                section_header("Overfitting Analysis","Train vs Test gap")
-                ts=ovf.get("train_score", ovf.get("train_r2", 0)); tss=ovf.get("test_score", ovf.get("test_r2", 0))
+                section_header("Overfitting Analysis","CV (5-fold) vs Test gap")
+                # Bar+gap TUTARLI kaynak: CV varsa CV-vs-test (gap zaten cv-test), yoksa train.
+                ts=ovf.get("display_score"); ts_lbl=ovf.get("display_label")
+                if ts is None:   # eski rapor fallback (display_score alani yok)
+                    cv=ovf.get("cv_score"); use_cv=cv is not None and cv>0
+                    ts=cv if use_cv else ovf.get("train_score", ovf.get("train_r2", 0))
+                    ts_lbl="CV (5-fold)" if use_cv else "Train"
+                tss=ovf.get("test_score", ovf.get("test_r2", 0))
                 gap=ovf.get("gap",0); stat=ovf.get("status","unknown")
                 sc2={"normal":"#43e97b","mild_overfitting":"#f7971e","overfitting_detected":"#ff6584","underfitting":"#38b2f4"}.get(stat,"#7777aa")
                 fig_ovf = go.Figure()
-                fig_ovf.add_trace(go.Bar(x=["Train","Test"],y=[ts,tss],marker_color=["#6c63ff","#43e97b"],
+                fig_ovf.add_trace(go.Bar(x=[ts_lbl,"Test"],y=[ts,tss],marker_color=["#6c63ff","#43e97b"],
                     marker_line_width=0,text=[f"{ts:.4f}",f"{tss:.4f}"],textposition="outside",
                     textfont=dict(family="JetBrains Mono",size=11,color=CHART_TEXT_COLOR)))
                 fig_ovf.update_layout(**PLOTLY_LAYOUT,height=220,
@@ -982,6 +988,12 @@ def render_results(result: AgentState):
                 st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace;font-size:0.7rem;
                     color:{CHART_LABEL_COLOR};padding:0.5rem 0.7rem;background:{INFO_BG};border-radius:6px;">
                     {ovf.get('description','')}</div>""", unsafe_allow_html=True)
+                _tr=ovf.get("train_score", ovf.get("train_r2"))
+                if ts_lbl=="CV (5-fold)" and _tr is not None:
+                    st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace;font-size:0.62rem;
+                        color:{CHART_LABEL_COLOR};opacity:0.6;padding:0.25rem 0.2rem;">
+                        Train (resubstitution): {_tr:.2f} — ezber skoru, genelleme göstergesi değil</div>""",
+                        unsafe_allow_html=True)
 
         with col_right:
             if task == "clustering":
