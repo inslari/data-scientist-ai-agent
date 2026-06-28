@@ -28,7 +28,8 @@ warnings.filterwarnings("ignore")
 CORRELATION_THRESHOLD = 0.95
 VARIANCE_THRESHOLD    = 0.01
 TEST_SIZE             = 0.2
-ML_SAMPLE_ROWS        = 100_000   
+ML_SAMPLE_ROWS        = 100_000
+RANDOM_STATE          = 42   # projenin genel seed konvansiyonu (settings.RANDOM_SEED / ml_trainer.RANDOM_STATE ile tutarli)
 
 
 # Column metadata
@@ -473,6 +474,23 @@ def _find_best_target_candidate(df: pd.DataFrame, planned_target: str = "") -> t
 # ── Time-series lag features (FAZ A: cekirdek) ───────────────
 _TS_MAX_FEATURE_COLS = 5   # hedef disinda laglenecek en fazla sayisal kolon (feature patlamasi korumasi)
 
+# ── Deterministik sifir/eksik flag motoru (Adim 1) ───────────
+_DERIVED_FLAG_PREFIX = "__wm__"   # was_missing maskesi icin DAHILI tasiyici prefix (slot'ta temizlenir)
+_FLAG_MIN_PREVALENCE = 0.01       # yayginlik kapisi alt sinir (hep-ayni flag uretme)
+_FLAG_MAX_PREVALENCE = 0.99       # yayginlik kapisi ust sinir
+_MAX_DERIVED_FLAGS   = 30         # global cap (_TS_MAX_FEATURE_COLS muadili — feature patlamasi korumasi)
+_FLAG_INTENTS        = {"classification", "regression", "clustering"}  # kapsam (anomaly bu yola girmez)
+# TODO(iyilestirme): scale skip-list — flag'leri 0/1 tutup yorumlanabilirligi koru (su an scale z-skora ceviriyor)
+
+# ── Deterministik oran (ratio) motoru (Adim 2) ───────────────
+_MAX_RATIO_FEATURES   = 20      # global cap (feature patlamasi — _MAX_DERIVED_FLAGS muadili)
+_RATIO_MIN_UNIQUE     = 3       # binary/sabit kolonlari hariç tut (nunique >= 3)
+_RATIO_DENOM_MAX_ZERO = 0.05    # payda kolonunda izinli max sifir orani (sifir-bolme stabilizasyonu)
+_RATIO_WINSOR_Q       = 0.01    # robust clip kuantili (q01..q99) — uc deger nötr
+_RATIO_MAX_CARD_RATIO = 0.95    # ID-benzeri kaynak kapisi: nunique/n_rows > 0.95 → orana sokma
+                                # (oranlar protected_high_card ile kardinaliteden MUAF; bu on-filtre
+                                #  yanlis-etiketli ID'nin orana sizmasini ENGELLER — LLM metadata hatasina dayaniklilik)
+
 
 def _detect_frequency(parsed: pd.Series, group_key: "pd.Series | None" = None) -> tuple[str, list[int]]:
     """Ardisik tarih farklarinin medyanindan veri sikligini ve dinamik lag pencerelerini turet.
@@ -562,7 +580,8 @@ def _build_timeseries_features(
             skip.add(col)
 
     numeric_cols = [c for c in df.select_dtypes(include="number").columns
-                    if c not in skip and c != target_name]
+                    if c not in skip and c != target_name
+                    and not c.startswith(_DERIVED_FLAG_PREFIX)]   # was_missing tasiyicilari laglenmez
 
     # Kolon SECIMI (cok sayisal kolon varsa feature patlamasini onle): deterministik,
     # VERIYE DAYALI kriter = min-max normalize edilmis varyans (olcek-bagimsiz yayilim).
@@ -1106,6 +1125,181 @@ def _target_distribution(y_arr, intent: str) -> "tuple[dict | None, dict | None]
     return {str(k): int(v) for k, v in s.value_counts().items()}, None
 
 
+def _capture_missing_masks(df: pd.DataFrame, meta: "ColumnMetadata") -> list[str]:
+    """DOKUNUS 1: was_missing maskesini _clean_data NaN doldurmadan ONCE yakala.
+    Aday kolon = ColumnMetadata.null_rate 0<x<1 (meta'da yoksa df'teki gercek null
+    oranina dus). Maske df'e rezerve-prefix'li PLAIN INT (0/1) tasiyici kolon olarak
+    eklenir → sonraki tum satir reorder/drop/lag islemlerinde otomatik hizali kalir;
+    slot'ta (DOKUNUS 2) final flag'e cevrilir ya da temizlenir. Donus: tasiyici adlari."""
+    added: list[str] = []
+    for col in list(df.columns):
+        nr = meta.columns.get(col, {}).get("null_rate", None)
+        na = df[col].isna()
+        frac = float(na.mean()) if len(na) else 0.0
+        is_candidate = (0.0 < nr < 1.0) if nr is not None else (0.0 < frac < 1.0)
+        if not is_candidate:
+            continue
+        carrier = f"{_DERIVED_FLAG_PREFIX}{col}"
+        if carrier in df.columns:
+            continue
+        df[carrier] = na.to_numpy().astype(int)   # plain int, bool/nullable DEGIL
+        added.append(carrier)
+    if added:
+        logger.info(f"[feature_eng] was_missing maskesi yakalandi (clean oncesi): {len(added)} kolon")
+    return added
+
+
+def _build_zero_missing_flags(
+    df: pd.DataFrame, original_cols: set, intent: str, aggregated: bool,
+) -> tuple[pd.DataFrame, list[str]]:
+    """DOKUNUS 2: is_zero (orijinal sayisal kolon) + was_missing (DOKUNUS 1 tasiyicisi)
+    flag'lerini PLAIN INT olarak uret. Kapsam disi/aggregation/aday yok → tasiyicilari
+    temizleyip cik. Yayginlik kapisi %1-%99 (dogum-aninda); global cap _MAX_DERIVED_FLAGS,
+    asilirsa deterministik sirala (dengelilik min(p,1-p) desc, esitlikte ad asc). Yalnizca
+    ORIJINAL kolonlar (turetilmis feature'in flag'i olmasin); isim cakisma guard'i.
+    Tasiyicilar burada df'ten kaldirilir (gated-out olanlar encode/scale'e sizmaz)."""
+    carriers = [c for c in df.columns if c.startswith(_DERIVED_FLAG_PREFIX)]
+
+    # Kapsam disi (yalniz classif/reg/clustering) VEYA aggregation yolu → flag uretme
+    if intent.strip().lower() not in _FLAG_INTENTS or aggregated:
+        if carriers:
+            df = df.drop(columns=carriers, errors="ignore")
+        if aggregated:
+            logger.info("[feature_eng] zero/missing flag: aggregation yolu → atlandi (satir-bazli anlamsiz)")
+        return df, []
+
+    candidates: list[tuple[str, np.ndarray, float]] = []
+
+    # was_missing — tasiyicidan
+    for carrier in carriers:
+        name = f"was_missing_{carrier[len(_DERIVED_FLAG_PREFIX):]}"
+        if name in df.columns:
+            continue
+        s = df[carrier].to_numpy().astype(int)
+        p = float(s.mean()) if s.size else 0.0
+        if _FLAG_MIN_PREVALENCE <= p <= _FLAG_MAX_PREVALENCE:
+            candidates.append((name, s, min(p, 1.0 - p)))
+
+    # is_zero — yalnizca ORIJINAL sayisal kolonlar (math/domain/lag/date turevleri haric)
+    for col in df.select_dtypes(include="number").columns:
+        if col.startswith(_DERIVED_FLAG_PREFIX) or col not in original_cols:
+            continue
+        name = f"is_zero_{col}"
+        if name in df.columns:
+            continue
+        s = (pd.to_numeric(df[col], errors="coerce").to_numpy() == 0).astype(int)
+        if not s.any() or s.all():        # sifir hic gorulmemis / hepsi sifir → bilgi yok
+            continue
+        p = float(s.mean())
+        if _FLAG_MIN_PREVALENCE <= p <= _FLAG_MAX_PREVALENCE:
+            candidates.append((name, s, min(p, 1.0 - p)))
+
+    # Tasiyicilari her halukarda dusur (was_missing serileri yukarida numpy'a kopyalandi)
+    if carriers:
+        df = df.drop(columns=carriers, errors="ignore")
+
+    if not candidates:
+        return df, []
+
+    candidates.sort(key=lambda t: (-t[2], t[0]))   # deterministik: dengelilik desc, ad asc
+    if len(candidates) > _MAX_DERIVED_FLAGS:
+        logger.info(f"[feature_eng] zero/missing flag: {len(candidates)} aday > cap "
+                    f"{_MAX_DERIVED_FLAGS} → kirpildi")
+        candidates = candidates[:_MAX_DERIVED_FLAGS]
+
+    added: list[str] = []
+    for name, s, _ in candidates:
+        df[name] = s
+        added.append(name)
+    logger.info(f"[feature_eng] zero/missing flag uretildi ({len(added)}): {added}")
+    return df, added
+
+
+def _build_ratio_features(
+    df: pd.DataFrame, original_cols: set, meta: "ColumnMetadata",
+    intent: str, aggregated: bool, leaky_cols_high: set,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Deterministik oran (a/b) motoru — modelin yapamadigi olcek-carprazi sinyal.
+    Yalniz ORIJINAL sayisal kolonlar; binary/sabit (nunique<3), ID-benzeri (nunique/n_rows>0.95
+    — DTYPE-FARKINDA: yalniz int/object'e uygulanir, float continuous MUAF), leaky kaynak ve
+    cok-sifirli PAYDA haric. TEK YON (ad-sirali a<b → a/b) → resiprokal patlamasi
+    yok. Payda kapisi + winsorize [q01,q99] → sifir-bolme/uc deger nötr. Cap _MAX_RATIO_FEATURES;
+    asilirsa normalize-varyans (yayilim) ile sirala, esitlikte ad. Donen kolonlar _detect_leakage'da
+    protected_high_card'a eklenir (continuous → kardinalite kuralindan MUAF; korelasyon/leakage/
+    select TAM uygulanir — flag'den farki budur). ID on-filtresi, bu kardinalite muafiyetinin
+    yanlis-etiketli ID'yi orana sizdirma acigini kapatir (LLM metadata hatasina dayaniklilik)."""
+    if intent.strip().lower() not in _FLAG_INTENTS or aggregated:
+        if aggregated:
+            logger.info("[feature_eng] ratio feature: aggregation yolu → atlandi (orijinal kolonlar gruplandi)")
+        return df, []
+
+    # Aday: orijinal sayisal, leaky/flag/turetilmis degil
+    n_rows = len(df)
+    num_cols = [c for c in df.select_dtypes(include="number").columns
+                if c in original_cols
+                and not c.startswith(_DERIVED_FLAG_PREFIX)
+                and not c.startswith(("is_zero_", "was_missing_"))
+                and c not in leaky_cols_high]
+    nunique = {c: int(pd.to_numeric(df[c], errors="coerce").nunique()) for c in num_cols}
+
+    def _passes_id_guard(c: str) -> bool:
+        # Kardinalite-tabanli ID-guard DTYPE-FARKINDA: yalniz integer ve object/string
+        # kolonlara uygulanir (customer_id gibi int-unique ID'ler elenir). FLOAT (continuous)
+        # kolonlar bu kuraldan MUAF — estimated_salary/balance gibi yuksek-kardinaliteli
+        # surekli olcumler false-positive olarak elenmesin. Muafiyet SADECE bu guard'a ozeldir:
+        # float oranlar yine winsorize/payda-kapisi/korelasyon/leakage/cap'e TAM tabidir.
+        # Dinamik: isme degil dtype'a bakar (object/string num_cols'a zaten girmez → pratikte int kapisi).
+        if pd.api.types.is_float_dtype(df[c]):
+            return True
+        return not (n_rows > 0 and nunique[c] / n_rows > _RATIO_MAX_CARD_RATIO)
+
+    eligible = sorted(
+        c for c in num_cols
+        if nunique[c] >= _RATIO_MIN_UNIQUE   # binary/sabit haric (dtype-bagimsiz)
+        and _passes_id_guard(c)              # ID-benzeri haric — yalniz int/object (float MUAF)
+    )
+    if len(eligible) < 2:
+        return df, []
+
+    zero_frac = {c: float((pd.to_numeric(df[c], errors="coerce") == 0).mean()) for c in eligible}
+
+    candidates: list[tuple[str, np.ndarray, float]] = []
+    for i in range(len(eligible)):
+        for j in range(i + 1, len(eligible)):
+            a, b = eligible[i], eligible[j]            # ad-sirali: pay=a, payda=b (tek yon)
+            if zero_frac[b] > _RATIO_DENOM_MAX_ZERO:    # cok-sifirli payda → ciftı atla
+                continue
+            name = f"ratio_{a}_{b}"
+            if name in df.columns:                      # isim cakisma guard (math/domain)
+                continue
+            r = pd.to_numeric(df[a], errors="coerce") / pd.to_numeric(df[b], errors="coerce")
+            r = r.replace([np.inf, -np.inf], np.nan)
+            lo, hi = r.quantile(_RATIO_WINSOR_Q), r.quantile(1.0 - _RATIO_WINSOR_Q)
+            r = r.clip(lo, hi).fillna(0.0)
+            arr = r.to_numpy(dtype="float64")
+            vmin, vmax = float(np.nanmin(arr)), float(np.nanmax(arr))
+            if not np.isfinite(vmin) or vmax == vmin:    # sabit oran → bilgi yok
+                continue
+            score = float(np.nanvar((arr - vmin) / (vmax - vmin)))   # olcek-bagimsiz yayilim
+            candidates.append((name, arr, score))
+
+    if not candidates:
+        return df, []
+
+    candidates.sort(key=lambda t: (-t[2], t[0]))   # deterministik: yayilim desc, ad asc
+    if len(candidates) > _MAX_RATIO_FEATURES:
+        logger.info(f"[feature_eng] ratio feature: {len(candidates)} aday > cap "
+                    f"{_MAX_RATIO_FEATURES} → kirpildi")
+        candidates = candidates[:_MAX_RATIO_FEATURES]
+
+    added: list[str] = []
+    for name, arr, _ in candidates:
+        df[name] = arr
+        added.append(name)
+    logger.info(f"[feature_eng] ratio feature uretildi ({len(added)}): {added}")
+    return df, added
+
+
 def build_features(state: dict) -> dict:
     """
     Feature Engineering Service — BigData Edition
@@ -1168,6 +1362,12 @@ def build_features(state: dict) -> dict:
             df = df.drop(columns=existing_drops, errors="ignore")
             logger.info(f"[feature_eng] Critic drop_features: {existing_drops}")
 
+    # ── DOKUNUS 1: was_missing maskesini _clean_data NaN doldurmadan ONCE yakala ──
+    # original_cols: is_zero YALNIZCA orijinal kolonlarda uretilsin (math/domain/date/lag
+    # turevleri haric). Maske df'e tasiyici kolon olarak eklenir → reorder/drop'larda hizali.
+    original_cols = set(df.columns)
+    _capture_missing_masks(df, meta)
+
     # Temizlik
     df = _clean_data(df)
 
@@ -1200,11 +1400,14 @@ def build_features(state: dict) -> dict:
 
     # Aggregation — timeseries'te zaman eksenini korumak icin ATLANIR (kapatinca
     # domain recipe'leri de inert kalir: avg_/std_ kolonlari olusmaz → onlara dokunmuyoruz).
+    aggregated = False
     if modality == "timeseries":
         logger.info("[feature_eng] timeseries: aggregation atlandi (zaman ekseni korunuyor)")
     else:
         entity_resolution = state.get("entity_resolution") or {}
+        n_before_agg = len(df)
         df, y = _aggregate_if_needed(df, y, feature_plan, meta, entity_resolution=entity_resolution)
+        aggregated = (len(df) != n_before_agg)   # satirlar gruplandiysa flag uretme (DOKUNUS 2 atlar)
 
     if df.empty or len(df) < 5:
         return {"error": f"İşlemler sonrası yetersiz veri sayısı ({len(df)} satır). Model kurulamıyor."}
@@ -1314,6 +1517,18 @@ def build_features(state: dict) -> dict:
     except Exception as e:
         logger.error(f"[feature_eng] Domain feature hatasi ({e}); atlaniyor.")
 
+    # ── DOKUNUS 2: deterministik sifir/eksik flag'leri (encode/scale ONCESI) ──
+    # is_zero = orijinal sayisal kolonlar; was_missing = DOKUNUS 1 tasiyicilari. Encode int'e
+    # dokunmaz; scale flag'leri olcekler (kabul — muafiyet yerine yayginlik kapisi); leakage +
+    # select SONRA TAM uygulanir (muafiyet YOK). Tasiyicilar burada temizlenir.
+    df, derived_flag_cols = _build_zero_missing_flags(df, original_cols, intent, aggregated)
+
+    # ── DOKUNUS 2b: deterministik oran (ratio) feature'lari (encode/scale ONCESI) ──
+    # Orijinal sayisal kolon ciftleri (a/b, tek yon). leaky_cols_high + ID-benzeri kaynak
+    # dislanir; continuous oldugu icin _detect_leakage'da protected_high_card'a eklenir (asagida).
+    df, ratio_feature_cols = _build_ratio_features(
+        df, original_cols, meta, intent, aggregated, leaky_cols_high)
+
     # Encoding
     df = _encode_categorical(df, y)
 
@@ -1328,10 +1543,12 @@ def build_features(state: dict) -> dict:
 
     # Leakage detection — time-series lag + rolling kolonlari SADECE kardinalite kuralindan
     # muaf (continuous turevler ID degil); korelasyon/sizinti kontrolu onlara da uygulanir.
-    ts_protected_cols: set = set()
+    # Oranlar continuous (yuksek-kardinaliteli ama ID DEGIL) → SADECE kardinalite kuralindan
+    # muaf (ts lag'leriyle ayni mantik). Identifier/korelasyon/sizinti kontrolu AYNEN uygulanir.
+    ts_protected_cols: set = set(ratio_feature_cols)
     if ts_lag_info:
-        ts_protected_cols = (set(ts_lag_info.get("lag_columns", []))
-                             | set(ts_lag_info.get("rolling_columns", [])))
+        ts_protected_cols |= (set(ts_lag_info.get("lag_columns", []))
+                              | set(ts_lag_info.get("rolling_columns", [])))
     df, leakage_report = _detect_leakage(df, y, meta, protected_high_card=ts_protected_cols)
 
     df, domain_dropped = _apply_domain_leakage_drops(df, domain_leakage_report)
@@ -1417,6 +1634,8 @@ def build_features(state: dict) -> dict:
         "leakage_dropped":          leakage_report["dropped"],
         "leakage_suspected":        leakage_report["suspected"],
         "domain_features":          [c for c in domain_feature_cols if c in X_train.columns],
+        "derived_flags":            [c for c in derived_flag_cols if c in X_train.columns],
+        "ratio_features":           [c for c in ratio_feature_cols if c in X_train.columns],
         "timeseries_lag":           ts_lag_info,
         "split_strategy":           split_strategy,
         "split_imbalanced_entities": split_imbalanced,
