@@ -242,6 +242,60 @@ def _diagnose_class_imbalance(task: str, evaluation_report: dict) -> dict | None
     }
 
 
+def _diagnose_suspicious_performance(task: str, test_metrics: dict, fi_sum: dict) -> dict | None:
+    """'Fazla mükemmel' sonuç = muhtemel LEAKAGE alarmı.
+
+    Diğer teşhisler DÜŞÜK performansı yakalar; bu, TERSİNE near-perfect skoru (gerçek
+    dünyada nadir) leakage işareti sayar. İki sinyal: (1) birincil metrik tavan
+    (classification AUC≥0.99 / regression R²≥0.999), (2) evaluator'ın importance-bazlı
+    ``leakage_suspects``'i (tek feature %70+ importance). İkisi birlikte → güçlü; tek
+    başına dominant feature da aksiyon gerektirir. Aksiyon: şüpheli kolonları düşür,
+    feature_plan'ı yeniden kur. Şüpheli kolon adları ``leakage_suspects``'te döner →
+    critic_node bunları deterministik drop için state'e yazar."""
+    score = _primary_metric(task, test_metrics)
+    is_class = "classification" in task
+    near_perfect = score >= (0.99 if is_class else 0.999)
+
+    suspects = fi_sum.get("leakage_suspects") or []
+    # 'a + b' gibi birleşik şüpheli adlarını tekil kolonlara ayır
+    suspect_cols: list[str] = []
+    for s in suspects:
+        col = s.get("column", "")
+        suspect_cols.extend(p.strip() for p in col.split("+") if p.strip())
+    high_suspect = any(s.get("severity") == "high" for s in suspects)
+
+    if not (near_perfect or high_suspect):
+        return None
+
+    if near_perfect and suspect_cols:
+        sev = 9
+    elif high_suspect:
+        sev = 8
+    else:  # near_perfect ama tek baskın feature yok (çok-feature leak olabilir)
+        sev = 6
+
+    metric_name = "AUC" if is_class else "R²"
+    drop_hint = f" Şüpheli kolon(lar): {', '.join(suspect_cols)}." if suspect_cols else ""
+    feedback = (
+        f"TESHIS: Sonuç fazla mükemmel ({metric_name}={score:.4f}) — büyük olasılıkla LEAKAGE."
+        f"{drop_hint} EYLEM: Bu kolonları VE target ile doğrudan/türev ilişkisi olan tüm "
+        "kolonları drop_features'a ekle, onlardan türetilmiş feature üretme. Gerçekçi bir "
+        "model genelde 0.80-0.95 bandındadır; near-perfect skor neredeyse her zaman sızıntıdır."
+    )
+    return {
+        "type": "suspicious_performance",
+        "severity": sev,
+        "value": round(score, 4),
+        "action": "feature_plan_node",
+        "feedback": feedback,
+        "leakage_suspects": suspect_cols,   # deterministik drop için critic_node'a
+        "secondary_note": (
+            f"Sonuç şüpheli yüksek ({metric_name}={score:.4f}) — leakage olabilir, "
+            "feature/target ilişkisini gözden geçir."
+        ),
+    }
+
+
 # ─────────────────────────────────────────────────────────────
 # Ana fonksiyon
 # ─────────────────────────────────────────────────────────────
@@ -279,6 +333,7 @@ def advise(state: dict) -> dict:
         _diagnose_weak_features(fi_sum),
         _diagnose_low_performance(task, test_metrics, fi_sum),
         _diagnose_class_imbalance(task, evaluation_report),
+        _diagnose_suspicious_performance(task, test_metrics, fi_sum),
     ]
     diagnoses = [d for d in raw if d is not None]
     diagnoses.sort(key=lambda d: d["severity"], reverse=True)
@@ -364,6 +419,13 @@ def advise(state: dict) -> dict:
         if note:
             feedback.append(f"EK UYARI: {note}")
 
+    # Leakage şüphesi olan tüm aksiyonlu teşhislerin kolonları → deterministik drop
+    forced_drops: list[str] = []
+    for d in actionable:
+        for c in (d.get("leakage_suspects") or []):
+            if c and c not in forced_drops:
+                forced_drops.append(c)
+
     return {
         "should_retry": True,
         "next_node": primary["action"],
@@ -373,4 +435,5 @@ def advise(state: dict) -> dict:
         "feedback": feedback,
         "current_score": current_score,
         "primary_type": primary["type"],
+        "forced_drops": forced_drops,
     }

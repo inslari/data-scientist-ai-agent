@@ -24,6 +24,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import (
+    AdaBoostClassifier,
     ExtraTreesClassifier,
     ExtraTreesRegressor,
     GradientBoostingClassifier,
@@ -48,10 +49,12 @@ from sklearn.metrics import (
     davies_bouldin_score,
     calinski_harabasz_score,
 )
-from sklearn.model_selection import StratifiedKFold, KFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold, KFold, cross_val_score, cross_val_predict
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import roc_curve, precision_recall_curve
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin, clone
+from scipy.optimize import minimize
 from src.state import AgentState
 
 from src.core.logging_config import get_logger
@@ -66,7 +69,10 @@ def _get_classification_models() -> dict:
     models = {
         "random_forest": RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
         "extra_trees": ExtraTreesClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
-        "gradient_boosting": GradientBoostingClassifier(n_estimators=200, random_state=RANDOM_STATE),
+        # AdaBoost: hızlı, dengesiz fraud verisinde rekabetçi bir zayıf-öğrenici topluluğu.
+        "adaboost": AdaBoostClassifier(n_estimators=200, learning_rate=0.8, random_state=RANDOM_STATE),
+        # şimdilik devre dışı: çok yavaş (~331s) + ROC-AUC olarak zayıf
+        # "gradient_boosting": GradientBoostingClassifier(n_estimators=200, random_state=RANDOM_STATE),
         "logistic_regression": Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)),
@@ -94,6 +100,8 @@ def _get_classification_models() -> dict:
         )
     except ImportError:
         pass
+    if getattr(settings, "EXTRA_MODELS_ENABLED", False):
+        models.update(_extra_classification_models(balanced=False))
     return models
 
 
@@ -101,7 +109,8 @@ def _get_regression_models() -> dict:
     models = {
         "random_forest": RandomForestRegressor(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
         "extra_trees": ExtraTreesRegressor(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
-        "gradient_boosting": GradientBoostingRegressor(n_estimators=200, random_state=RANDOM_STATE),
+        # şimdilik devre dışı: çok yavaş (~331s) + zayıf
+        # "gradient_boosting": GradientBoostingRegressor(n_estimators=200, random_state=RANDOM_STATE),
         "ridge": Pipeline([("scaler", StandardScaler()), ("reg", Ridge())]),
         "lasso": Pipeline([("scaler", StandardScaler()), ("reg", Lasso(max_iter=5000))]),
     }
@@ -166,6 +175,30 @@ def _importances_from(est: Any, feature_names: list[str]):
 def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
     try:
         base = _unwrap_to_estimator(model)
+        # OOF ağırlıklı blend: fitted base'lerin importance'larını BLEND AĞIRLIĞIYLA ortala.
+        if isinstance(base, (WeightedProbaBlend, WeightedMeanBlend)) and hasattr(base, "fitted_"):
+            arrs = []
+            for w, sub in zip(base.weights_, base.fitted_):
+                a = _importances_from(_unwrap_to_estimator(sub), feature_names)
+                if a is not None:
+                    arrs.append(a * w)
+            if arrs:
+                avg = np.sum(arrs, axis=0)
+                imp = dict(zip(feature_names, avg.tolist()))
+                return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
+            return {}
+        # Seed-bagging: aynı modelin seed-üyelerinin importance'larını eşit ortala.
+        if isinstance(base, (SeedBaggingClassifier, SeedBaggingRegressor)) and hasattr(base, "fitted_"):
+            arrs = []
+            for sub in base.fitted_:
+                a = _importances_from(_unwrap_to_estimator(sub), feature_names)
+                if a is not None:
+                    arrs.append(a)
+            if arrs:
+                avg = np.mean(arrs, axis=0)
+                imp = dict(zip(feature_names, avg.tolist()))
+                return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
+            return {}
         # StackingClassifier/Regressor: fitted base'lerin importance'larını ortala.
         # (RandomForest gibi 'estimators_'ı olan ama final_estimator_ olmayan
         #  modellerle karışmasın diye iki niteliği birlikte kontrol ederiz.)
@@ -231,6 +264,12 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
                 "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2"]) if strong_regularization else "sqrt",
             }
             model = ExtraTreesClassifier(**params, random_state=RANDOM_STATE, n_jobs=-1)
+        elif model_name == "adaboost":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 1.0, log=True),
+            }
+            model = AdaBoostClassifier(**params, random_state=RANDOM_STATE)
         elif model_name == "gradient_boosting":
             params = {
                 "n_estimators": trial.suggest_int("n_estimators", 50, 300),
@@ -274,6 +313,8 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
             return RandomForestClassifier(**best_params, random_state=settings.RANDOM_SEED, n_jobs=-1)
         elif model_name == "extra_trees":
             return ExtraTreesClassifier(**best_params, random_state=settings.RANDOM_SEED, n_jobs=-1)
+        elif model_name == "adaboost":
+            return AdaBoostClassifier(**best_params, random_state=settings.RANDOM_SEED)
         elif model_name == "gradient_boosting":
             return GradientBoostingClassifier(**best_params, random_state=settings.RANDOM_SEED)
         elif model_name == "xgboost":
@@ -412,10 +453,16 @@ def _get_classification_models_balanced(class_weights: dict) -> dict:
             n_estimators=200, random_state=RANDOM_STATE,
             n_jobs=-1, class_weight=cw
         ),
-        "gradient_boosting": GradientBoostingClassifier(
-            n_estimators=200, random_state=RANDOM_STATE
-            # GradientBoosting class_weight desteklemiyor, sample_weight kullanacağız
+        # AdaBoost class_weight parametresini desteklemez; dengesizlikte CV döngüsü
+        # bunu otomatik SMOTE pipeline'ına sarar (fold-içi, leakage-free).
+        "adaboost": AdaBoostClassifier(
+            n_estimators=200, learning_rate=0.8, random_state=RANDOM_STATE
         ),
+        # şimdilik devre dışı: çok yavaş (~331s) + ROC-AUC olarak zayıf
+        # "gradient_boosting": GradientBoostingClassifier(
+        #     n_estimators=200, random_state=RANDOM_STATE
+        #     # GradientBoosting class_weight desteklemiyor, sample_weight kullanacağız
+        # ),
         "logistic_regression": Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(
@@ -454,9 +501,51 @@ def _get_classification_models_balanced(class_weights: dict) -> dict:
     except ImportError:
         pass
 
+    if getattr(settings, "EXTRA_MODELS_ENABLED", False):
+        models.update(_extra_classification_models(balanced=True))
+
     return models
- 
- 
+
+
+def _extra_classification_models(balanced: bool = False) -> dict:
+    """Klasik baseline sınıflandırıcılar (notebook'tan): decision_tree, naive_bayes,
+    knn, svm, mlp. ``settings.EXTRA_MODELS_ENABLED`` ile her iki kataloğa da merge edilir.
+
+    class_weight destekleyenler (decision_tree, svm→LinearSVC) balanced'da 'balanced'
+    alır; desteklemeyenler (naive_bayes, knn, mlp) düz döner ve dengesiz yolda çağıran
+    tarafça ``_wrap_with_smote`` ile dengelenir. LinearSVC predict_proba sunmadığından
+    CalibratedClassifierCV ile sarılır (CV/stacking/OOF-blend olasılık bekler). knn/svm/mlp
+    ölçeğe duyarlı olduğundan StandardScaler pipeline'ı içinde verilir."""
+    from sklearn.tree import DecisionTreeClassifier
+    from sklearn.naive_bayes import GaussianNB
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.svm import LinearSVC
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.neural_network import MLPClassifier
+
+    cw = "balanced" if balanced else None
+    return {
+        "decision_tree": DecisionTreeClassifier(random_state=RANDOM_STATE, class_weight=cw),
+        "naive_bayes": GaussianNB(),
+        "knn": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", KNeighborsClassifier()),
+        ]),
+        "svm": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", CalibratedClassifierCV(
+                LinearSVC(random_state=RANDOM_STATE, class_weight=cw), cv=3,
+            )),
+        ]),
+        "mlp": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", MLPClassifier(
+                random_state=RANDOM_STATE, early_stopping=True, max_iter=300,
+            )),
+        ]),
+    }
+
+
 def _build_stacking_candidate(models, results, X_train, y_train, scoring, is_imbalanced):
     """En iyi 2-3 modeli StackingClassifier ile birleştirip CV skorunu döndürür.
 
@@ -502,6 +591,310 @@ def _build_stacking_candidate(models, results, X_train, y_train, scoring, is_imb
     except Exception as e:
         logger.info(f"[automl] Stacking ensemble değerlendirilemedi: {e}")
         return None, None
+
+
+# ── OOF (out-of-fold) ağırlıklı blend ────────────────────────
+# Grandmaster ensemble'ın özü: stacking gibi bir meta-model OGRENMEK yerine, en iyi
+# K modelin OOF (cross_val_predict ile leakage-free) tahminleri DOGRUDAN optimize
+# edilmis agirliklarla harmanlanir. Agirliklar OOF metrigini (AUC/R²) maksimize eder
+# (scipy, w>=0 & Σw=1). Stacking'den farki: meta-model yok → asiri-uyum riski dusuk,
+# yorumlanabilir (her modelin katki agirligi acik), grandmaster `preds_weights`'in
+# tabular karsiligi. Blend YALNIZCA OOF'ta en iyi tek modeli gecerse secilir.
+_BLEND_TOP_K = 4          # en fazla bu kadar modeli harmanla (maliyet siniri)
+_BLEND_MIN_SAMPLES = 50   # bundan az ornekte OOF agirlik optimizasyonu kararsiz → atla
+
+
+class WeightedProbaBlend(BaseEstimator, ClassifierMixin):
+    """K sinitlandiricinin predict_proba ciktilarinin sabit-agirlikli ortalamasi.
+    Modul-seviyesi sinif → joblib ile picklable. fit her base'i tum train'e fit eder;
+    predict_proba agirlikli olasilik ortalamasi, predict argmax."""
+
+    def __init__(self, estimators=None, weights=None):
+        self.estimators = estimators      # [(name, unfitted_estimator), ...]
+        self.weights = weights
+
+    def fit(self, X, y):
+        self.classes_ = np.unique(y)
+        self.fitted_ = []
+        for _name, est in self.estimators:
+            e = clone(est)
+            e.fit(X, y)
+            self.fitted_.append(e)
+        w = np.asarray(self.weights, dtype=float)
+        self.weights_ = w / w.sum() if w.sum() > 0 else np.ones(len(w)) / len(w)
+        return self
+
+    def predict_proba(self, X):
+        P = None
+        for w, e in zip(self.weights_, self.fitted_):
+            p = e.predict_proba(X)
+            P = w * p if P is None else P + w * p
+        return P
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+
+class WeightedMeanBlend(BaseEstimator, RegressorMixin):
+    """K regresörün predict ciktilarinin sabit-agirlikli ortalamasi (regression blend)."""
+
+    def __init__(self, estimators=None, weights=None):
+        self.estimators = estimators
+        self.weights = weights
+
+    def fit(self, X, y):
+        self.fitted_ = []
+        for _name, est in self.estimators:
+            e = clone(est)
+            e.fit(X, y)
+            self.fitted_.append(e)
+        w = np.asarray(self.weights, dtype=float)
+        self.weights_ = w / w.sum() if w.sum() > 0 else np.ones(len(w)) / len(w)
+        return self
+
+    def predict(self, X):
+        pred = None
+        for w, e in zip(self.weights_, self.fitted_):
+            p = e.predict(X)
+            pred = w * p if pred is None else pred + w * p
+        return pred
+
+
+# ── Multi-seed bagging (final-model variance reduction) ──────────────────────
+# Models whose fit is genuinely seed-sensitive. Bagging a deterministic model
+# (knn / naive_bayes) would just clone identical members → no variance gain, so
+# we skip those. Keyed by the catalog name returned as best_name.
+_SEED_BAGGABLE = {
+    "random_forest", "extra_trees", "gradient_boosting", "adaboost",
+    "xgboost", "lightgbm", "catboost", "decision_tree", "mlp",
+}
+
+# Slow-to-fit models: cap their bagging rounds so a single slow final model
+# (boosting / NN) doesn't multiply runtime under bagging × calibration.
+_SLOW_MODELS = {"catboost", "xgboost", "lightgbm", "gradient_boosting", "mlp", "svm"}
+_SLOW_MODEL_MAX_ROUNDS = 2
+
+
+def _seed_list(rounds: int) -> list[int]:
+    """Consecutive seeds anchored on the global RANDOM_SEED (deterministic)."""
+    base = int(settings.RANDOM_SEED)
+    return [base + i for i in range(max(1, int(rounds)))]
+
+
+def _set_all_random_states(est: Any, seed: int) -> Any:
+    """Set every nested ``random_state`` param (this estimator + any SMOTE/Pipeline
+    step) to ``seed`` so a clone diverges from its siblings. Best-effort, never raises."""
+    try:
+        params = est.get_params(deep=True)
+    except Exception:
+        return est
+    updates = {k: seed for k in params if k == "random_state" or k.endswith("__random_state")}
+    if updates:
+        try:
+            est.set_params(**updates)
+        except Exception:
+            pass
+    return est
+
+
+class SeedBaggingClassifier(ClassifierMixin, BaseEstimator):
+    """Fit the same estimator under several seeds on the FULL train set and average
+    predict_proba — variance reduction for the final single model. Mirrors the
+    WeightedProbaBlend artifact contract (module-level → joblib-picklable; base is
+    cloned per member; predict is argmax of the mean probability).
+
+    Mixin is listed FIRST (sklearn's required MRO order) so ``__sklearn_tags__``
+    reports a classifier — otherwise CalibratedClassifierCV rejects the bag."""
+
+    def __init__(self, base_estimator=None, seeds=None):
+        self.base_estimator = base_estimator
+        self.seeds = seeds
+
+    def fit(self, X, y, sample_weight=None):
+        self.classes_ = np.unique(y)
+        self.fitted_ = []
+        for s in (self.seeds or [None]):
+            e = clone(self.base_estimator)
+            if s is not None:
+                _set_all_random_states(e, s)
+            if sample_weight is not None:
+                e.fit(X, y, sample_weight=sample_weight)
+            else:
+                e.fit(X, y)
+            self.fitted_.append(e)
+        return self
+
+    def predict_proba(self, X):
+        P = None
+        for e in self.fitted_:
+            p = e.predict_proba(X)
+            P = p if P is None else P + p
+        return P / len(self.fitted_)
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+
+class SeedBaggingRegressor(RegressorMixin, BaseEstimator):
+    """Regression counterpart: average the predict outputs of the same regressor
+    fit under several seeds (variance reduction). Mirrors WeightedMeanBlend.
+    Mixin-first MRO keeps ``__sklearn_tags__`` reporting a regressor."""
+
+    def __init__(self, base_estimator=None, seeds=None):
+        self.base_estimator = base_estimator
+        self.seeds = seeds
+
+    def fit(self, X, y, sample_weight=None):
+        self.fitted_ = []
+        for s in (self.seeds or [None]):
+            e = clone(self.base_estimator)
+            if s is not None:
+                _set_all_random_states(e, s)
+            if sample_weight is not None:
+                e.fit(X, y, sample_weight=sample_weight)
+            else:
+                e.fit(X, y)
+            self.fitted_.append(e)
+        return self
+
+    def predict(self, X):
+        pred = None
+        for e in self.fitted_:
+            p = e.predict(X)
+            pred = p if pred is None else pred + p
+        return pred / len(self.fitted_)
+
+
+def _maybe_seed_bag(model: Any, best_name: str, task: str) -> tuple[Any, int]:
+    """Wrap the selected single model in a seed-bagging ensemble when enabled and
+    the model is seed-sensitive. Returns ``(model_or_bag, rounds_used)`` where
+    rounds_used is 0 when bagging is skipped (so callers can record it)."""
+    if not getattr(settings, "SEED_BAGGING_ENABLED", False):
+        return model, 0
+    rounds = int(getattr(settings, "SEED_BAGGING_ROUNDS", 0) or 0)
+    if best_name in _SLOW_MODELS:                       # yavaş modelde maliyeti sınırla
+        rounds = min(rounds, _SLOW_MODEL_MAX_ROUNDS)
+    if rounds < 2 or best_name not in _SEED_BAGGABLE:
+        return model, 0
+    seeds = _seed_list(rounds)
+    bag = (SeedBaggingClassifier if task == "classification" else SeedBaggingRegressor)(
+        base_estimator=model, seeds=seeds
+    )
+    logger.info(f"[automl] Multi-seed bagging: '{best_name}' × {rounds} seed {seeds}")
+    return bag, rounds
+
+
+def _optimize_blend_weights(oof_list: list, y_true: np.ndarray, metric_fn) -> tuple[np.ndarray, float]:
+    """OOF tahmin listesini metrigi maksimize edecek agirliklarla harmanla.
+    Nelder-Mead kullanilir (AUC gibi parcali-sabit/turevsiz metrikte SLSQP'den saglam);
+    her adimda agirliklar clip(>=0)+normalize edilir (basit simpleks projeksiyonu).
+    oof_list elemanlari binary'de 1D (pozitif olasilik / tahmin), multiclass'ta 2D (n,c).
+    Donus: (normalize agirliklar, en iyi metrik skoru)."""
+    P = np.stack(oof_list, axis=0)   # (K, n) | (K, n, c)
+    K = P.shape[0]
+
+    def _blend(w):
+        w = np.clip(w, 0, None)
+        s = w.sum()
+        w = w / s if s > 0 else np.ones(K) / K
+        return np.tensordot(w, P, axes=1)
+
+    def _neg(w):
+        try:
+            return -float(metric_fn(y_true, _blend(w)))
+        except Exception:
+            return 1e9
+
+    x0 = np.ones(K) / K
+    best_w, best_score = x0, -_neg(x0)
+    # Birkac baslangic (esit + her modele tam agirlik) ile yerel-minimum riskini azalt
+    starts = [x0] + [np.eye(K)[i] for i in range(K)]
+    for s0 in starts:
+        res = minimize(_neg, s0, method="Nelder-Mead",
+                       options={"maxiter": 1000, "xatol": 1e-4, "fatol": 1e-6})
+        w = np.clip(res.x, 0, None)
+        w = w / w.sum() if w.sum() > 0 else np.ones(K) / K
+        score = -_neg(w)
+        if score > best_score:
+            best_w, best_score = w, score
+    return best_w, float(best_score)
+
+
+def _build_oof_blend_candidate(
+    models, results, X_train, y_train, cv, is_binary, is_imbalanced,
+) -> tuple[Any, float | None, np.ndarray | None]:
+    """Top-K modelin OOF olasiliklarini optimize agirliklarla harmanlayan UNFITTED
+    WeightedProbaBlend + OOF skoru dondurur. Imbalanced'da her base SMOTE pipeline'ina
+    sarilir (fold-ici, leakage-free). Yetersiz veri/aday → (None, None, None)."""
+    if len(X_train) < _BLEND_MIN_SAMPLES:
+        return None, None, None
+    ranked = [n for n in sorted(results, key=lambda k: results[k]["score"], reverse=True)
+              if n in models]
+    base_names = ranked[:_BLEND_TOP_K]
+    if len(base_names) < 2:
+        return None, None, None
+
+    oof_list, used = [], []
+    for n in base_names:
+        m = _wrap_with_smote(clone(models[n]), y_train) if is_imbalanced else clone(models[n])
+        try:
+            oof = cross_val_predict(m, X_train, y_train, cv=cv, method="predict_proba", n_jobs=-1)
+        except Exception as e:
+            logger.info(f"[automl] OOF blend: '{n}' atlandi ({e})")
+            continue
+        oof_list.append(oof[:, 1] if is_binary else oof)
+        used.append(n)
+    if len(used) < 2:
+        return None, None, None
+
+    if is_binary:
+        metric = lambda y, p: roc_auc_score(y, p)
+    else:
+        metric = lambda y, p: roc_auc_score(y, p, multi_class="ovr", average="weighted")
+    w, blend_score = _optimize_blend_weights(oof_list, y_train, metric)
+
+    estimators = [
+        (n, _wrap_with_smote(clone(models[n]), y_train) if is_imbalanced else clone(models[n]))
+        for n in used
+    ]
+    blend = WeightedProbaBlend(estimators=estimators, weights=w)
+    logger.info(f"[automl] {'oof_blend':25s} ROC-AUC: {blend_score:.4f} "
+          f"(agirliklar={dict(zip(used, np.round(w, 3).tolist()))})")
+    return blend, float(blend_score), w
+
+
+def _build_oof_blend_candidate_reg(
+    models, results, X_train, y_train, cv,
+) -> tuple[Any, float | None, np.ndarray | None]:
+    """Regression OOF blend: top-K regresörün OOF tahminlerini R²'yi maksimize eden
+    agirliklarla harmanlar. UNFITTED WeightedMeanBlend + OOF R² dondurur."""
+    if len(X_train) < _BLEND_MIN_SAMPLES:
+        return None, None, None
+    ranked = [n for n in sorted(results, key=lambda k: results[k]["score"], reverse=True)
+              if n in models]
+    base_names = ranked[:_BLEND_TOP_K]
+    if len(base_names) < 2:
+        return None, None, None
+
+    oof_list, used = [], []
+    for n in base_names:
+        try:
+            oof = cross_val_predict(clone(models[n]), X_train, y_train, cv=cv, n_jobs=-1)
+        except Exception as e:
+            logger.info(f"[automl] OOF blend (reg): '{n}' atlandi ({e})")
+            continue
+        oof_list.append(oof)
+        used.append(n)
+    if len(used) < 2:
+        return None, None, None
+
+    metric = lambda y, p: r2_score(y, p)
+    w, blend_score = _optimize_blend_weights(oof_list, y_train, metric)
+    estimators = [(n, clone(models[n])) for n in used]
+    blend = WeightedMeanBlend(estimators=estimators, weights=w)
+    logger.info(f"[automl] {'oof_blend':25s} R²: {blend_score:.4f} "
+          f"(agirliklar={dict(zip(used, np.round(w, 3).tolist()))})")
+    return blend, float(blend_score), w
 
 
 def _calibrated_fit(model, X_train, y_train, sample_weight, n_samples):
@@ -621,19 +1014,33 @@ def _run_classification(
     logger.info(f"\n[automl] Baseline en iyi (tek model): {best_name_single} "
           f"(ROC-AUC: {results[best_name_single]['score']:.4f})")
 
-    # ── Stacking ensemble adayı (top 2-3 model) ──
+    # ── Ensemble adayları: (1) stacking (meta-model), (2) OOF ağırlıklı blend ──
     ensemble_model, ensemble_score = _build_stacking_candidate(
         models, results, X_train, y_train, scoring, is_imbalanced
     )
     if ensemble_score is not None:
         results["stacking_ensemble"] = {"score": ensemble_score, "std": 0.0, "time": 0.0}
 
-    # ── Seçim: ensemble tek modeli geçti mi? ──
-    best_name = max(results, key=lambda k: results[k]["score"])
-    use_ensemble = best_name == "stacking_ensemble" and ensemble_model is not None
+    blend_model, blend_score, blend_weights = _build_oof_blend_candidate(
+        models, results, X_train, y_train, cv, is_binary, is_imbalanced
+    )
+    if blend_score is not None:
+        results["oof_blend"] = {"score": blend_score, "std": 0.0, "time": 0.0}
 
-    if use_ensemble:
-        logger.info(f"[automl] Ensemble seçildi (ROC-AUC: {ensemble_score:.4f} > "
+    # ── Seçim: en yüksek OOF/CV skorlu aday (tek model / stacking / blend) ──
+    best_name = max(results, key=lambda k: results[k]["score"])
+    use_blend    = best_name == "oof_blend" and blend_model is not None
+    use_stacking = best_name == "stacking_ensemble" and ensemble_model is not None
+    use_ensemble = use_blend or use_stacking   # metrik bayrağı (ikisi de "ensemble")
+    seed_bagging_rounds = 0   # yalnızca tek-model yolunda set edilir
+
+    if use_blend:
+        logger.info(f"[automl] OOF blend seçildi (ROC-AUC: {blend_score:.4f} > "
+              f"tek model {results[best_name_single]['score']:.4f})")
+        selected_model = blend_model             # unfitted; base'ler SMOTE'la sarılı
+        gb_imbalanced_path = False
+    elif use_stacking:
+        logger.info(f"[automl] Stacking seçildi (ROC-AUC: {ensemble_score:.4f} > "
               f"tek model {results[best_name_single]['score']:.4f})")
         selected_model = ensemble_model          # unfitted; SMOTE base'lerin içinde
         gb_imbalanced_path = False
@@ -646,13 +1053,18 @@ def _run_classification(
         if is_imbalanced and best_name != "gradient_boosting":
             selected_model = _wrap_with_smote(selected_model, y_train)
         gb_imbalanced_path = best_name == "gradient_boosting" and is_imbalanced
+        # Multi-seed bagging: seçilen tek modeli birkaç seed'le eğitip ortala
+        # (varyans düşürme). SMOTE/Optuna sarmalı modeli olduğu gibi base alır.
+        selected_model, seed_bagging_rounds = _maybe_seed_bag(selected_model, best_name, "classification")
 
     # ── Final training (+ opsiyonel olasılık kalibrasyonu) ──
     # GradientBoosting+imbalanced sample_weight ile eğitilir; diğerlerinde SMOTE
     # pipeline veya class_weight zaten dengeyi sağlar.
     sample_weight = compute_sample_weight("balanced", y_train) if gb_imbalanced_path else None
-    # cv=3 kalibrasyon için her sınıfta yeterli örnek olmalı.
-    can_calibrate = is_binary and int(counts.min()) >= 6
+    # cv=3 kalibrasyon için her sınıfta yeterli örnek olmalı. Blend için kalibrasyon
+    # atlanır: AUC-optimize harman zaten sıralama-temelli, kalibrasyon ek maliyet +
+    # WeightedProbaBlend'i CV ile sarmak gereksiz pahalı.
+    can_calibrate = is_binary and int(counts.min()) >= 6 and not use_blend
     if can_calibrate:
         best_model, calibration_applied = _calibrated_fit(
             selected_model, X_train, y_train, sample_weight, n_samples=len(y_train)
@@ -702,8 +1114,13 @@ def _run_classification(
         "optimal_threshold":   round(optimal_threshold, 4),
         "calibration_applied": calibration_applied,
         "ensemble_used":       use_ensemble,
+        "ensemble_type":       "oof_blend" if use_blend else ("stacking" if use_stacking else None),
+        "seed_bagging_rounds": seed_bagging_rounds,
     }
- 
+    if use_blend and blend_weights is not None:
+        _blend_bases = [name for name, _ in blend_model.estimators]
+        metrics["blend_weights"] = dict(zip(_blend_bases, np.round(blend_weights, 4).tolist()))
+
     if y_prob is not None:
         try:
             if is_binary:
@@ -787,13 +1204,32 @@ def _run_regression(
     if not results:
         raise ValueError("Hiçbir regression modeli çalışmadı.")
  
+    best_name_single = max(results, key=lambda k: results[k]["score"])
+    logger.info(f"\n[automl] Baseline en iyi: {best_name_single} (R²: {results[best_name_single]['score']:.4f})")
+
+    # ── OOF ağırlıklı blend adayı (top-K regresör, R² optimize ağırlık) ──
+    blend_model, blend_score, blend_weights = _build_oof_blend_candidate_reg(
+        models, results, X_train, y_train_transformed, cv
+    )
+    if blend_score is not None:
+        results["oof_blend"] = {"score": blend_score, "std": 0.0, "time": 0.0}
+
     best_name = max(results, key=lambda k: results[k]["score"])
-    logger.info(f"\n[automl] Baseline en iyi: {best_name} (R²: {results[best_name]['score']:.4f})")
- 
-    # Optuna tuning
-    tuned_model = _tune_model_regression(best_name, X_train, y_train_transformed, strong_regularization)
-    best_model  = tuned_model if tuned_model is not None else models[best_name]
- 
+    use_blend = best_name == "oof_blend" and blend_model is not None
+    seed_bagging_rounds = 0   # yalnızca tek-model yolunda set edilir
+
+    if use_blend:
+        logger.info(f"[automl] OOF blend seçildi (R²: {blend_score:.4f} > "
+              f"tek model {results[best_name_single]['score']:.4f})")
+        best_model = blend_model          # unfitted; aşağıda fit edilir
+    else:
+        best_name = best_name_single
+        # Optuna tuning
+        tuned_model = _tune_model_regression(best_name, X_train, y_train_transformed, strong_regularization)
+        best_model  = tuned_model if tuned_model is not None else models[best_name]
+        # Multi-seed bagging: seçilen tek regresörü birkaç seed'le eğitip ortala
+        best_model, seed_bagging_rounds = _maybe_seed_bag(best_model, best_name, "regression")
+
     # Final training
     best_model.fit(X_train, y_train_transformed)
  
@@ -808,8 +1244,11 @@ def _run_regression(
         y_pred      = y_pred_transformed
         y_test_orig = y_test
  
-    # Negative predictions reset to 0 (safety after log transform)
-    y_pred = np.maximum(y_pred, 0)
+    # Negatif tahminleri 0'a kırp — YALNIZCA log1p uygulandıysa (orijinal hedef ≥0
+    # idi, expm1 sonrası negatif anlamsız). log YOKSA hedef meşru negatif alabilir
+    # (örn. kâr/zarar, sıcaklık farkı); koşulsuz kırpma o tahminleri bozar.
+    if log_applied:
+        y_pred = np.maximum(y_pred, 0)
  
     mse = mean_squared_error(y_test_orig, y_pred)
     r2  = r2_score(y_test_orig, y_pred)
@@ -824,11 +1263,42 @@ def _run_regression(
         "all_model_scores": {k: round(v["score"], 4) for k, v in results.items()},
         "cv_r2":        round(float(results[best_name]["score"]), 4),
         "cv_r2_std":    round(float(results[best_name]["std"]), 4),
+        "ensemble_used": use_blend,
+        "ensemble_type": "oof_blend" if use_blend else None,
+        "seed_bagging_rounds": seed_bagging_rounds,
     }
- 
+    if use_blend and blend_weights is not None:
+        _blend_bases = [name for name, _ in blend_model.estimators]
+        metrics["blend_weights"] = dict(zip(_blend_bases, np.round(blend_weights, 4).tolist()))
+
     metrics["feature_importance"] = _extract_feature_importance(best_model, feature_names)
     return best_name, best_model, metrics
 
+
+
+def _safe_silhouette(X, labels, cap: int = 5000) -> float:
+    """silhouette_score with a row cap to stay O(cap²), not O(n²).
+
+    silhouette builds a full pairwise-distance matrix, so on large datasets it
+    is the single most expensive (and memory-hungry) call in the AutoML path —
+    on a 100k+ row set it can stall the worker for minutes or OOM it. A long
+    stall here is also what lets the idle LangGraph **checkpoint** connection get
+    dropped by the server/pooler, surfacing later as a confusing
+    ``aput_writes`` connection error. We therefore evaluate the score on a
+    deterministic random subsample (seed-fixed) when ``n`` exceeds ``cap`` — a
+    standard, unbiased estimate of the full-data silhouette.
+    """
+    X = np.asarray(X)
+    labels = np.asarray(labels)
+    n = X.shape[0]
+    if n > cap:
+        rng = np.random.RandomState(RANDOM_STATE)
+        idx = rng.choice(n, size=cap, replace=False)
+        X, labels = X[idx], labels[idx]
+    # Need >=2 distinct labels among the (sub)sample, else silhouette is undefined.
+    if len(np.unique(labels)) < 2:
+        return -1.0
+    return float(silhouette_score(X, labels))
 
 
 # Clustering
@@ -855,7 +1325,7 @@ def _run_clustering(
             labels = km.fit_predict(X_all)
             if len(np.unique(labels)) < 2:
                 continue
-            sil = silhouette_score(X_all, labels)
+            sil = _safe_silhouette(X_all, labels)
             if sil > best_kmeans_score:
                 best_kmeans_score = sil
                 best_k = k
@@ -884,7 +1354,7 @@ def _run_clustering(
 
         if n_clusters_db >= 2:
             mask = db_labels != -1
-            db_sil = silhouette_score(X_all[mask], db_labels[mask]) if mask.sum() > 1 else -1
+            db_sil = _safe_silhouette(X_all[mask], db_labels[mask]) if mask.sum() > 1 else -1
         else:
             db_sil = -1
 
@@ -956,66 +1426,140 @@ def _run_clustering(
 
 
 # Anomaly Detection
+
+class GaussianDensityAnomalyDetector(BaseEstimator):
+    """Multivariate-normal (independent-Gaussian product) anomaly detector.
+
+    A from-scratch port of the credit-card anomaly notebook's density model:
+    fit a univariate normal per feature, score a row by the *product* of those
+    densities, and flag rows whose density falls below a threshold. We work in
+    **log space** (sum of per-feature log-pdfs) instead of multiplying raw
+    densities — mathematically identical for thresholding, but immune to the
+    floating-point underflow that makes the raw product collapse to 0 once you
+    have more than a handful of features (the notebook's threshold was already
+    ~1e-19 at 9 features).
+
+    The independence assumption is the same one the notebook leans on, and it is
+    reasonable here because the upstream feature builder's columns are largely
+    decorrelated aggregates. ``contamination`` sets the quantile of the training
+    score distribution used as the decision threshold, matching the
+    IsolationForest convention so both algorithms are directly comparable.
+
+    sklearn-compatible surface (``fit`` / ``predict`` / ``score_samples`` /
+    ``decision_function``) so it slots into the existing selection + persistence
+    path with no special-casing.
+    """
+
+    def __init__(self, contamination: float = 0.10):
+        self.contamination = contamination
+
+    def fit(self, X, y=None):  # noqa: ANN001
+        X = np.asarray(X, dtype=float)
+        self.n_features_in_ = X.shape[1]
+        self.mu_ = np.nanmean(X, axis=0)
+        sigma = np.nanstd(X, axis=0)
+        # Floor sigma so a constant feature can't divide by zero / dominate.
+        floor = np.maximum(1e-6, 1e-6 * np.abs(self.mu_))
+        self.sigma_ = np.where(sigma > floor, sigma, floor)
+        scores = self.score_samples(X)
+        # Low density = anomalous → threshold is the lower-tail quantile.
+        self.offset_ = float(np.quantile(scores, self.contamination))
+        return self
+
+    def score_samples(self, X):  # noqa: ANN001
+        """Log joint density (higher = more normal). NaNs treated as neutral."""
+        X = np.asarray(X, dtype=float)
+        z = (X - self.mu_) / self.sigma_
+        log_pdf = -0.5 * z**2 - np.log(self.sigma_) - 0.5 * np.log(2 * np.pi)
+        log_pdf = np.where(np.isfinite(log_pdf), log_pdf, 0.0)
+        return log_pdf.sum(axis=1)
+
+    def decision_function(self, X):  # noqa: ANN001
+        """>= 0 → normal, < 0 → anomaly (sklearn outlier convention)."""
+        return self.score_samples(X) - self.offset_
+
+    def predict(self, X):  # noqa: ANN001
+        return np.where(self.decision_function(X) >= 0, 1, -1)
+
+    def fit_predict(self, X, y=None):  # noqa: ANN001
+        return self.fit(X, y).predict(X)
+
+
+def _build_anomaly_candidates(cont: float) -> dict[str, Any]:
+    """Candidate unsupervised detectors evaluated at a given contamination."""
+    return {
+        "isolation_forest": IsolationForest(
+            contamination=cont, random_state=RANDOM_STATE, n_estimators=200, n_jobs=-1,
+        ),
+        "gaussian_density": GaussianDensityAnomalyDetector(contamination=cont),
+    }
+
+
 def _run_anomaly_detection(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     feature_names: list[str],
 ) -> tuple[str, Any, dict]:
     """
-    IsolationForest ile anomaly detection.
-    Contamination otomatik tahmin edilir (veri setinin %5-15'i anomali varsayılır).
+    Anomaly detection with two complementary unsupervised detectors:
+      - IsolationForest (tree-isolation depth)
+      - GaussianDensityAnomalyDetector (multivariate-normal density — port of the
+        credit-card anomaly notebook)
+    Both are scanned over candidate contamination rates (%5–15 anomaly varsayımı)
+    and the (algorithm, contamination) pair with the best silhouette wins.
     """
     X_all = pd.concat([X_train, X_test], ignore_index=True).values
 
-    # Test different contamination rates
+    # Test different contamination rates × both algorithms
     contaminations = [0.05, 0.10, 0.15]
-    best_contamination = 0.10
+    best_key: tuple[str, float] | None = None
     best_score = -np.inf
-    results: dict[float, dict[str, Any]] = {}
+    results: dict[tuple[str, float], dict[str, Any]] = {}
 
-    logger.info("[automl] IsolationForest — contamination taraması...")
+    logger.info("[automl] Anomaly detection — IsolationForest + GaussianDensity taraması...")
     for cont in contaminations:
-        try:
-            iso = IsolationForest(
-                contamination=cont,
-                random_state=RANDOM_STATE,
-                n_estimators=200,
-                n_jobs=-1,
-            )
-            labels = iso.fit_predict(X_all)
-            # -1 anomaly, 1 normal → convert for silhouette
-            labels_bin = (labels == -1).astype(int)
-            n_anomalies = (labels == -1).sum()
+        for algo, model in _build_anomaly_candidates(cont).items():
+            try:
+                labels = model.fit_predict(X_all)
+                # -1 anomaly, 1 normal → convert for silhouette
+                labels_bin = (labels == -1).astype(int)
+                n_anomalies = int((labels == -1).sum())
 
-            if n_anomalies > 1 and n_anomalies < len(labels) - 1:
-                try:
-                    sil = silhouette_score(X_all, labels_bin)
-                except Exception:
+                if 1 < n_anomalies < len(labels) - 1:
+                    try:
+                        sil = _safe_silhouette(X_all, labels_bin)
+                    except Exception:
+                        sil = -1
+                else:
                     sil = -1
-            else:
-                sil = -1
 
-            results[cont] = {
-                "model": iso,
-                "labels": labels,
-                "n_anomalies": int(n_anomalies),
-                "anomaly_pct": round(float(n_anomalies / len(labels) * 100), 2),
-                "silhouette": sil,
-            }
-            logger.info(f"[automl]   contamination={cont}: anomalies={n_anomalies} (%{results[cont]['anomaly_pct']})")
+                results[(algo, cont)] = {
+                    "algo": algo,
+                    "model": model,
+                    "labels": labels,
+                    "n_anomalies": n_anomalies,
+                    "anomaly_pct": round(float(n_anomalies / len(labels) * 100), 2),
+                    "silhouette": sil,
+                }
+                logger.info(f"[automl]   {algo} contamination={cont}: "
+                            f"anomalies={n_anomalies} (%{results[(algo, cont)]['anomaly_pct']}), "
+                            f"silhouette={sil if sil == -1 else round(float(sil), 4)}")
 
-            if sil > best_score:
-                best_score = sil
-                best_contamination = cont
-        except Exception as e:
-            logger.error(f"[automl]   contamination={cont}: HATA {e}")
+                if sil > best_score:
+                    best_score = sil
+                    best_key = (algo, cont)
+            except Exception as e:
+                logger.error(f"[automl]   {algo} contamination={cont}: HATA {e}")
 
-    best = results.get(best_contamination, list(results.values())[0])
+    if best_key is None:
+        best_key = next(iter(results))
+    best = results[best_key]
+    best_algo, best_contamination = best_key
     best_model = best["model"]
     best_labels = best["labels"]
 
-    logger.info(f"\n[automl] En iyi contamination: {best_contamination} "
-          f"({best['n_anomalies']} anomalies, %{best['anomaly_pct']})")
+    logger.info(f"\n[automl] En iyi: {best_algo} (contamination={best_contamination}) "
+          f"— {best['n_anomalies']} anomalies, %{best['anomaly_pct']}")
 
     # Anomaly scores (decision function)
     anomaly_scores = best_model.decision_function(X_all)
@@ -1024,7 +1568,7 @@ def _run_anomaly_detection(
     n_train = len(X_train)
     metrics: dict[str, Any] = {
         "task": "anomaly_detection",
-        "algorithm": "isolation_forest",
+        "algorithm": best_algo,
         "best_contamination": best_contamination,
         "n_anomalies": best["n_anomalies"],
         "anomaly_pct": best["anomaly_pct"],
@@ -1032,25 +1576,31 @@ def _run_anomaly_detection(
         "score_threshold": round(score_threshold, 4),
         "silhouette_score": round(float(best_score), 4) if best_score > -np.inf else None,
         "contamination_scan": {
-            str(c): {
+            f"{algo}@{c}": {
                 "n_anomalies": r["n_anomalies"],
                 "anomaly_pct": r["anomaly_pct"],
+                "silhouette": r["silhouette"] if r["silhouette"] == -1 else round(float(r["silhouette"]), 4),
             }
-            for c, r in results.items()
+            for (algo, c), r in results.items()
         },
         "train_labels": best_labels[:n_train].tolist(),
         "test_labels": best_labels[n_train:].tolist(),
     }
 
-    # Feature importance - IsolationForest using mean depth
+    # Feature importance — IsolationForest exposes mean-depth importances;
+    # the Gaussian model ranks features by mean standardized deviation |z|.
     try:
-        fi_raw = best_model.feature_importances_
-        fi = dict(zip(feature_names, fi_raw.tolist()))
+        if best_algo == "isolation_forest":
+            fi_raw = best_model.feature_importances_
+            fi = dict(zip(feature_names, fi_raw.tolist()))
+        else:
+            z = np.abs((X_all - best_model.mu_) / best_model.sigma_)
+            fi = dict(zip(feature_names, np.nanmean(z, axis=0).tolist()))
         metrics["feature_importance"] = dict(sorted(fi.items(), key=lambda x: x[1], reverse=True))
     except Exception:
         metrics["feature_importance"] = {}
 
-    return "isolation_forest", best_model, metrics
+    return best_algo, best_model, metrics
 
 # Main node
 def train_model(state: AgentState) -> dict:
@@ -1073,10 +1623,8 @@ def train_model(state: AgentState) -> dict:
         model_artifact : Trained model object
         metrics        : Task-specific metrics
     """
-    X_train_raw = state.get("X_train", [])
-    X_test_raw = state.get("X_test", [])
-    y_train_raw = state.get("y_train", [])
-    y_test_raw = state.get("y_test", [])
+    from src.utils.dataset_store import load_raw, dump_y
+    X_train_raw, X_test_raw, y_train_raw, y_test_raw = load_raw(state)
     intent = state.get("intent", "classification")
     intent_norm = intent.strip().lower() if isinstance(intent, str) else "classification"
 
@@ -1156,7 +1704,10 @@ def train_model(state: AgentState) -> dict:
 
     # Update top_models if first run
     if intent in ("classification", "regression") and not top_models:
-        all_scores = metrics.get("all_model_scores", {})
+        # Pseudo-ensemble anahtarlarini (oof_blend/stacking_ensemble) DISLA: bunlar
+        # gercek model degil → top_models'a girerse retry'da model filtresini bozar.
+        _pseudo = {"oof_blend", "stacking_ensemble"}
+        all_scores = {k: v for k, v in metrics.get("all_model_scores", {}).items() if k not in _pseudo}
         if all_scores:
             # Sort models by score descending and take top 2
             sorted_models = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
@@ -1175,11 +1726,14 @@ def train_model(state: AgentState) -> dict:
         logger.warning(f"[automl] UYARI: Model diske kaydedilemedi: {e}")
         model_path = None
 
+    # Label-encode SONRASI y'yi diske yaz (downstream evaluator encoded y bekler);
+    # inline yerine yol taşı (checkpoint payload şişmesini önler).
+    y_paths = dump_y(y_train, y_test)
+
     return {
         **state,
         "intent": intent,
-        "y_train": y_train.tolist() if isinstance(y_train, np.ndarray) else y_train,
-        "y_test": y_test.tolist() if isinstance(y_test, np.ndarray) else y_test,
+        **y_paths,
         "model_name": model_name,
         "model_params": {"intent": intent},
         "model_artifact": model_path,

@@ -27,6 +27,12 @@ def feature_engineering_node(state: AgentState) -> AgentState:
 
     logger.info(f"[DEBUG FE OUT] domain_leakage_report var mi: {state.get('domain_leakage_report') is not None}")
     return clean_np({
+        # Ağır diziler diske yazıldı; state'te yol taşınır (inline anahtarlar yalnızca
+        # disk yazımı başarısızsa dolar — geri-uyum/fallback).
+        "X_train_path": result.get("X_train_path"),
+        "X_test_path": result.get("X_test_path"),
+        "y_train_path": result.get("y_train_path"),
+        "y_test_path": result.get("y_test_path"),
         "X_train": result.get("X_train"),
         "X_test": result.get("X_test"),
         "y_train": result.get("y_train"),

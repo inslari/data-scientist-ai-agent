@@ -44,7 +44,15 @@ def get_llm(
     elif actual_provider == "ollama":
         from langchain_ollama import ChatOllama
 
-        return ChatOllama(model=actual_model_name, temperature=actual_temperature)
+        # num_ctx must hold the (large schema) prompt AND leave room for the JSON
+        # output; num_predict caps generation. Ollama's defaults are too small and
+        # truncate the structured response — see settings for details.
+        return ChatOllama(
+            model=actual_model_name,
+            temperature=actual_temperature,
+            num_ctx=settings.OLLAMA_NUM_CTX,
+            num_predict=settings.OLLAMA_NUM_PREDICT,
+        )
         
     else:
         raise ValueError(f"Unsupported LLM provider: {actual_provider}. Supported providers: openai, anthropic, google, ollama")

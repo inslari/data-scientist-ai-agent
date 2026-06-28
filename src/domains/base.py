@@ -104,7 +104,7 @@ class FeatureRecipe:
     Unlike the text hooks (which only *nudge* the LLM via prompt text), a recipe
     **guarantees** the feature is materialized whenever its inputs are present —
     no LLM in the loop. Recipes run at model grain inside the feature builder,
-    at the same point as the plan's ``math_interactions``.
+    at the same point as the plan's ``derived_features``.
 
     Contract (duck-typed; ``df`` is a pandas DataFrame, ``meta`` is optional and
     pack-defined — kept untyped here so ``base`` stays import-light):

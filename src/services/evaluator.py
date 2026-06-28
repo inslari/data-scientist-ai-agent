@@ -66,6 +66,7 @@ def _evaluate_classification(
     X_test: pd.DataFrame,
     y_test: np.ndarray,
     feature_names: list[str],
+    cv_score: float | None = None,
 ) -> dict:
     """Comprehensive evaluation for binary and multiclass classification."""
     is_binary = len(np.unique(y_test)) == 2
@@ -91,18 +92,18 @@ def _evaluate_classification(
             # j_scores = tpr - fpr
             # optimal_idx = int(np.argmax(j_scores))
             # optimal_threshold = round(float(thresholds[optimal_idx]), 4)
-            
+
             # Optimal threshold: F1 Skorunu maksimize ederek secelim (Dengesiz veriler icin daha iyi)
             from sklearn.metrics import precision_recall_curve
             precision, recall, pr_thresholds = precision_recall_curve(y_test, y_prob_test[:, 1])
-            
+
             num = 2 * recall * precision
             den = recall + precision
             f1_scores = np.divide(num, den, out=np.zeros_like(num), where=(den!=0))
-            
+
             best_pr_idx = int(np.argmax(f1_scores[:-1]))
             optimal_threshold = round(float(pr_thresholds[best_pr_idx]), 4)
-            
+
             # ROC curve uzerindeki karsilik gelen index'i bulalim (UI grafiklerinde gostermek icin)
             optimal_idx = int(np.argmin(np.abs(thresholds - optimal_threshold)))
             # Update predictions based on optimal threshold for better recall
@@ -178,8 +179,8 @@ def _evaluate_classification(
 
     evaluation["train_metrics"] = train_metrics
 
-    # Overfitting analysis
-    overfitting = _analyze_overfitting(train_metrics, test_metrics)
+    # Overfitting analysis — CV (dürüst) varsa CV−test bazlı
+    overfitting = _analyze_overfitting(train_metrics, test_metrics, cv_score=cv_score)
     evaluation["overfitting"] = overfitting
 
     # Confusion matrix
@@ -294,6 +295,7 @@ def _evaluate_regression(
     X_test: pd.DataFrame,
     y_test: np.ndarray,
     feature_names: list[str],
+    cv_score: float | None = None,
 ) -> dict:
     """Regression modelleri için kapsamlı değerlendirme."""
     y_pred_test = model.predict(X_test)
@@ -323,8 +325,8 @@ def _evaluate_regression(
     }
     evaluation["train_metrics"] = train_metrics
 
-    # Overfitting
-    overfitting = _analyze_overfitting_regression(train_metrics, test_metrics)
+    # Overfitting — CV (dürüst) R² varsa CV−test bazlı
+    overfitting = _analyze_overfitting_regression(train_metrics, test_metrics, cv_score=cv_score)
     evaluation["overfitting"] = overfitting
 
     # Residual analizi
@@ -423,35 +425,59 @@ def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 # Overfitting Analysis
-def _analyze_overfitting(train_metrics: dict, test_metrics: dict) -> dict:
-    """Analyzes overfitting"""
+def _analyze_overfitting(train_metrics: dict, test_metrics: dict, cv_score: float | None = None) -> dict:
+    """Overfitting teşhisi.
+
+    KRİTİK: ağaç toplulukları (RF/XGB/GB/blend) train verisini ~ezberler →
+    resubstitution train skoru ~1.0'dır ve test ile farkı YAPISAL olarak büyüktür;
+    bu TEK BAŞINA gerçek overfitting'i GÖSTERMEZ. Dürüst sinyal: CV (out-of-fold)
+    skoru ile holdout test arasındaki fark — ikisi de örnek-dışı. CV verilmişse onu
+    baz alırız (grandmaster disiplini); yoksa eski resubstitution farkına düşeriz.
+    Resubstitution farkı bilgi olarak korunur (`train_score`, `gap_train_test`)."""
     train_score = train_metrics.get("roc_auc") or train_metrics.get("roc_auc_ovr") or train_metrics.get("accuracy") or 0.0
     test_score = test_metrics.get("roc_auc") or test_metrics.get("roc_auc_ovr") or test_metrics.get("accuracy") or 0.0
+    gap_train_test = round(float(train_score - test_score), 4)
 
-    gap = round(float(train_score - test_score), 4)
+    if cv_score is not None and cv_score > 0:
+        gap = round(float(cv_score - test_score), 4)   # dürüst genelleme farkı
+        basis = "cv_vs_test"
+    else:
+        gap = gap_train_test
+        basis = "train_vs_test"
+
     status = "normal"
     if gap > OVERFITTING_THRESHOLD:
         status = "overfitting_detected"
     elif gap > OVERFITTING_THRESHOLD / 2:
         status = "mild_overfitting"
-    elif gap < -0.02:
-        status = "underfitting"
 
     return {
         "train_score": round(float(train_score), 4),
         "test_score": round(float(test_score), 4),
-        "gap": gap,
+        "cv_score": round(float(cv_score), 4) if cv_score is not None else None,
+        "gap": gap,                       # dürüst gap (CV varsa CV−test)
+        "gap_train_test": gap_train_test, # bilgi: resubstitution farkı (ağaçta doğal yüksek)
+        "basis": basis,
         "status": status,
-        "description": _overfitting_description(status, gap),
+        "description": _overfitting_description(status, gap, basis),
     }
 
 
-def _analyze_overfitting_regression(train_metrics: dict, test_metrics: dict) -> dict:
-    """Regression için overfitting analizi — R² bazlı."""
+def _analyze_overfitting_regression(train_metrics: dict, test_metrics: dict, cv_score: float | None = None) -> dict:
+    """Regression overfitting analizi — R² bazlı. Classification ile aynı disiplin:
+    dürüst sinyal CV(out-of-fold) R² ile holdout test R² arası fark; resubstitution
+    train R² (ağaçta ~1.0) bilgi olarak korunur."""
     train_r2 = train_metrics.get("r2", 0)
     test_r2 = test_metrics.get("r2", 0)
+    gap_train_test = round(float(train_r2 - test_r2), 4)
 
-    gap = round(float(train_r2 - test_r2), 4)
+    if cv_score is not None:
+        gap = round(float(cv_score - test_r2), 4)   # dürüst genelleme farkı
+        basis = "cv_vs_test"
+    else:
+        gap = gap_train_test
+        basis = "train_vs_test"
+
     status = "normal"
     if gap > 0.1:
         status = "overfitting_detected"
@@ -463,19 +489,25 @@ def _analyze_overfitting_regression(train_metrics: dict, test_metrics: dict) -> 
     return {
         "train_r2": round(float(train_r2), 4),
         "test_r2": round(float(test_r2), 4),
+        "cv_r2": round(float(cv_score), 4) if cv_score is not None else None,
         "gap": gap,
+        "gap_train_test": gap_train_test,
+        "basis": basis,
         "status": status,
-        "description": _overfitting_description(status, gap),
+        "description": _overfitting_description(status, gap, basis),
     }
 
 
-def _overfitting_description(status: str, gap: float) -> str:
+def _overfitting_description(status: str, gap: float, basis: str = "cv_vs_test") -> str:
+    # basis="cv_vs_test" → dürüst genelleme farkı (CV−test); "train_vs_test" → CV yoksa
+    # resubstitution farkı (ağaçta doğal yüksek, yanıltıcı olabilir).
+    ref = "CV (out-of-fold) ile test" if basis == "cv_vs_test" else "train (resubstitution) ile test"
     descriptions = {
-        "normal": "Model iyi genelleştiriyor — train ve test performansı dengeli.",
-        "mild_overfitting": f"Hafif overfitting mevcut (fark: {gap:.3f}). "
+        "normal": f"Model iyi genelleştiriyor — {ref} performansı dengeli (fark: {gap:.3f}).",
+        "mild_overfitting": f"Hafif overfitting mevcut ({ref} farkı: {gap:.3f}). "
                             "Regularization artırılabilir veya daha az karmaşık model denenebilir.",
-        "overfitting_detected": f"Ciddi overfitting tespit edildi (fark: {gap:.3f}). "
-                                "Model eğitim verisini ezberliyor. "
+        "overfitting_detected": f"Ciddi overfitting tespit edildi ({ref} farkı: {gap:.3f}). "
+                                "Model genelleştiremiyor. "
                                 "Daha fazla veri, regularization veya model basitleştirmesi önerilir.",
         "underfitting": "Model yeterince öğrenemiyor. "
                         "Daha karmaşık model veya daha fazla feature gerekebilir.",
@@ -485,7 +517,24 @@ def _overfitting_description(status: str, gap: float) -> str:
 
 # Feature Importance
 def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
-    """Model'den feature importance çıkarır — model tipine göre adaptif."""
+    """Model'den feature importance çıkarır — ensemble/calibration/pipeline
+    sarmalayıcılarını çözen ml_trainer implementasyonuna delege eder.
+
+    Bu naif yerel sürüm yalnızca düz ``feature_importances_``/``coef_`` ve basit
+    Pipeline'ı çözüyordu; seçilen model ``oof_blend`` (WeightedProbaBlend),
+    ``stacking_ensemble``, kalibre edilmiş veya seed-bagging'li olduğunda boş dönüp
+    raporda 'Feature Importance' grafiğini boş bırakıyordu. ml_trainer'ın sürümü
+    blend/stacking/seed-bag üyelerini ortalar ve CalibratedClassifierCV/Pipeline'ı
+    soyar (tek doğruluk kaynağı)."""
+    try:
+        from src.services.ml_trainer import _extract_feature_importance as _rich
+        fi = _rich(model, feature_names)
+        if fi:
+            return fi
+    except Exception:
+        pass
+
+    # Fallback: ml_trainer import edilemez/boş dönerse basit çıkarım
     try:
         est = model
         if hasattr(model, "named_steps"):
@@ -1061,10 +1110,8 @@ def evaluate_model(state: AgentState) -> dict:
                 logger.info(f"[evaluator] Model diskten yuklenemedi: {e}")
     else:
         model = model_artifact
-    X_train_raw = state.get("X_train", [])
-    X_test_raw = state.get("X_test", [])
-    y_train_raw = state.get("y_train", [])
-    y_test_raw = state.get("y_test", [])
+    from src.utils.dataset_store import load_raw
+    X_train_raw, X_test_raw, y_train_raw, y_test_raw = load_raw(state)
     intent = state.get("intent", "classification")
     feature_report = state.get("feature_report", {})
 
@@ -1097,6 +1144,12 @@ def evaluate_model(state: AgentState) -> dict:
     logger.info(f"  X_test   : {X_test.shape}")
     logger.info(f"  Intent   : {intent}")
 
+    # CV (out-of-fold) skoru — overfitting teşhisini resubstitution yerine dürüst
+    # CV−test farkına dayandırmak için ml_trainer metrics'inden alınır.
+    _m = state.get("metrics", {}) or {}
+    cv_score_cls = _m.get("cv_roc_auc")
+    cv_score_reg = _m.get("cv_r2")
+
     # Evaluation regarding task type
     if intent == "regression":
         # NOT (Faz 4): _evaluate_regression artık target-lock sızıntı kontrolünü
@@ -1104,7 +1157,7 @@ def evaluate_model(state: AgentState) -> dict:
         # bu 4. savunma sessizce devre dışıydı; artık classification ile aynı
         # "target_lock_leakage" anahtarını dolduruyor. Bilinçli bir karardır.
         evaluation_report = _evaluate_regression(
-            model, X_train, y_train, X_test, y_test, feature_names
+            model, X_train, y_train, X_test, y_test, feature_names, cv_score=cv_score_reg
         )
     elif intent == "clustering":
         evaluation_report = _pass_clustering_metrics(state)
@@ -1112,7 +1165,7 @@ def evaluate_model(state: AgentState) -> dict:
         evaluation_report = _pass_anomaly_metrics(state)
     else:
         evaluation_report = _evaluate_classification(
-            model, X_train, y_train, X_test, y_test, feature_names
+            model, X_train, y_train, X_test, y_test, feature_names, cv_score=cv_score_cls
         )
 
     # Model name and feature plan

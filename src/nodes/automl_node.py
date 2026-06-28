@@ -30,8 +30,9 @@ def automl_node(state: AgentState) -> AgentState:
     logger.info(f"[DEBUG FE OUT] domain_leakage_report var mi: {state.get('domain_leakage_report') is not None}")
     return clean_np({
         "intent": result.get("intent", state.get("intent")),
-        "y_train": result.get("y_train", state.get("y_train")),
-        "y_test": result.get("y_test", state.get("y_test")),
+        # AutoML label-encode SONRASI y'yi yeniden diske yazar → güncel yolları ilet
+        "y_train_path": result.get("y_train_path", state.get("y_train_path")),
+        "y_test_path": result.get("y_test_path", state.get("y_test_path")),
         "model_name": result.get("model_name", ""),
         "model_params": result.get("model_params", {}),
         "model_artifact": result.get("model_artifact"),

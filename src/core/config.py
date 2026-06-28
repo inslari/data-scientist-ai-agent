@@ -16,6 +16,17 @@ class Settings:
     RANDOM_SEED : int = 42
     ENABLE_DETERMINISM : bool = True
 
+    # Multi-seed bagging: retrain the final single model under several seeds and
+    # average their predictions (pure variance reduction). Only fires on the
+    # single-model path (stacking / OOF-blend are already ensembles) and only for
+    # seed-sensitive models. ROUNDS<2 disables it.
+    SEED_BAGGING_ENABLED : bool = os.getenv("SEED_BAGGING_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    SEED_BAGGING_ROUNDS : int = int(os.getenv("SEED_BAGGING_ROUNDS", "3"))
+
+    # Extra baseline classifiers (decision_tree, naive_bayes, knn, svm, mlp) merged
+    # into the classification catalog. Adds breadth at some runtime cost.
+    EXTRA_MODELS_ENABLED : bool = os.getenv("EXTRA_MODELS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
     # Deployment environment. When set to "local" (env ENVIRONMENT=local), the
     # default dataset DB points at data/financial.db so the MCP server serves the
     # financial transaction dataset locally without any .env DB overrides.
@@ -57,6 +68,13 @@ class Settings:
     INTELLIGENCE_ENGINE_PROVIDER: str = os.getenv("INTELLIGENCE_ENGINE_PROVIDER", os.getenv("LLM_PROVIDER", "openai"))
     INTELLIGENCE_ENGINE_MODEL: str = os.getenv("INTELLIGENCE_ENGINE_MODEL", "gpt-4o")
     DEFAULT_TEMPERATURE: float = 0.0
+
+    # Ollama generation limits. The defaults (num_ctx=2048, capped num_predict)
+    # are far too small for schema-analysis prompts + their large JSON output:
+    # the prompt overflows the context window (→ empty response) or the JSON is
+    # truncated mid-object (→ JSONDecodeError). Bump both generously.
+    OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
+    OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "8192"))
 
     # Intelligence Engine schema-analysis cache (project bazlı, application DB'de).
     # analyze_schema çıktısı aynı şema için deterministik (temperature=0); cache
