@@ -54,13 +54,17 @@ def _get_llm():
 # Context Builder
 
 def _overfitting_scores(ovf: dict) -> tuple[Any, Any, str]:
-    """Overfitting train/test skorunu şemadan bağımsız okur.
-    Classification → train_score/test_score (AUC/accuracy),
-    Regression     → train_r2/test_r2 (R²). Etiket de döner."""
+    """Overfitting 1. skor/test skorunu şemadan bağımsız okur.
+    CV varsa display_score (CV 5-fold) + display_label döner → grafikle TUTARLI metin
+    (banka raporu hem grafiği hem metni okur; ikisi de CV-bazlı kalmalı). Eski raporlarda
+    display_score yoksa train_score/train_r2'ye düşer (fallback — çökmesin)."""
+    if ovf.get("display_score") is not None:
+        test_s = ovf.get("test_score", ovf.get("test_r2"))
+        return ovf.get("display_score"), test_s, ovf.get("display_label", "skor")
     if ovf.get("train_score") is not None:
-        return ovf.get("train_score"), ovf.get("test_score"), "skor"
+        return ovf.get("train_score"), ovf.get("test_score"), "Train"
     if ovf.get("train_r2") is not None:
-        return ovf.get("train_r2"), ovf.get("test_r2"), "R²"
+        return ovf.get("train_r2"), ovf.get("test_r2"), "Train"
     return None, None, ""
 
 
@@ -305,14 +309,19 @@ def _build_context(state: AgentState) -> str:
             else:
                 lines.append("\n*Bootstrap güven aralığı bu çalışmada hesaplanmadı (yetersiz veri veya zaman aşımı).*")
 
-            train_s, test_s, ovf_label = _overfitting_scores(ovf)
-            if ovf and train_s is not None:
-                lines.append(
+            disp_s, test_s, ovf_label = _overfitting_scores(ovf)
+            if ovf and disp_s is not None:
+                ovf_lines = (
                     f"\n### Overfitting\n"
-                    f"  - Train ({ovf_label}): {train_s} | Test ({ovf_label}): {test_s}\n"
-                    f"  - Fark: {ovf.get('gap')} | Durum: {ovf.get('status')}\n"
+                    f"  - {ovf_label}: {disp_s} | Test: {test_s}\n"
+                    f"  - Fark ({ovf_label}−Test): {ovf.get('gap')} | Durum: {ovf.get('status')}\n"
                     f"  - {ovf.get('description')}"
                 )
+                # CV gösteriliyorsa train (resubstitution) bilgi notu — ezber skoru, genelleme değil
+                _tr = ovf.get("train_score", ovf.get("train_r2"))
+                if ovf_label == "CV (5-fold)" and _tr is not None:
+                    ovf_lines += f"\n  - Not: Train (resubstitution) {_tr} — ezber skoru, genelleme göstergesi değil."
+                lines.append(ovf_lines)
             else:
                 lines.append("\n*Overfitting analizi bu çalışmada uygulanmadı.*")
 
@@ -690,15 +699,18 @@ def _generate_fallback_report(state: AgentState) -> str:
     else:
         lines.append("\n*Bootstrap güven aralığı bu çalışmada hesaplanmadı.*")
 
-    train_s, test_s, ovf_label = _overfitting_scores(ovf)
-    if ovf and train_s is not None:
+    disp_s, test_s, ovf_label = _overfitting_scores(ovf)
+    if ovf and disp_s is not None:
         lines += [
             "",
             "## 3. Overfitting Analizi",
-            f"- Train ({ovf_label}): {train_s} | Test ({ovf_label}): {test_s}",
-            f"- Fark: {ovf.get('gap')} | Durum: **{ovf.get('status')}**",
+            f"- {ovf_label}: {disp_s} | Test: {test_s}",
+            f"- Fark ({ovf_label}−Test): {ovf.get('gap')} | Durum: **{ovf.get('status')}**",
             f"- {ovf.get('description', '')}",
         ]
+        _tr = ovf.get("train_score", ovf.get("train_r2"))
+        if ovf_label == "CV (5-fold)" and _tr is not None:
+            lines.append(f"- Not: Train (resubstitution) {_tr} — ezber skoru, genelleme göstergesi değil.")
     else:
         lines.append("\n*Overfitting analizi bu çalışmada uygulanmadı.*")
 

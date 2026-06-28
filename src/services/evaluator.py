@@ -451,10 +451,18 @@ def _analyze_overfitting(train_metrics: dict, test_metrics: dict, cv_score: floa
     elif gap > OVERFITTING_THRESHOLD / 2:
         status = "mild_overfitting"
 
+    # Grafik/metin için TUTARLI kaynak: CV varsa bar+gap CV−test bazlı (gap zaten öyle),
+    # yoksa train−test. train_score (resubstitution) bilgi/not amaçlı korunur.
+    use_cv = cv_score is not None and cv_score > 0
+    display_score = round(float(cv_score if use_cv else train_score), 4)
+    display_label = "CV (5-fold)" if use_cv else "Train"
+
     return {
         "train_score": round(float(train_score), 4),
         "test_score": round(float(test_score), 4),
         "cv_score": round(float(cv_score), 4) if cv_score is not None else None,
+        "display_score": display_score,   # grafiğin 1. barı (CV varsa CV, yoksa train)
+        "display_label": display_label,   # "CV (5-fold)" | "Train"
         "gap": gap,                       # dürüst gap (CV varsa CV−test)
         "gap_train_test": gap_train_test, # bilgi: resubstitution farkı (ağaçta doğal yüksek)
         "basis": basis,
@@ -486,10 +494,17 @@ def _analyze_overfitting_regression(train_metrics: dict, test_metrics: dict, cv_
     elif test_r2 < 0.3:
         status = "underfitting"
 
+    # Grafik/metin için TUTARLI kaynak (classification ile aynı disiplin): CV varsa CV−test.
+    use_cv = cv_score is not None and cv_score > 0
+    display_score = round(float(cv_score if use_cv else train_r2), 4)
+    display_label = "CV (5-fold)" if use_cv else "Train"
+
     return {
         "train_r2": round(float(train_r2), 4),
         "test_r2": round(float(test_r2), 4),
         "cv_r2": round(float(cv_score), 4) if cv_score is not None else None,
+        "display_score": display_score,   # grafiğin 1. barı (CV varsa CV-R², yoksa train-R²)
+        "display_label": display_label,   # "CV (5-fold)" | "Train"
         "gap": gap,
         "gap_train_test": gap_train_test,
         "basis": basis,

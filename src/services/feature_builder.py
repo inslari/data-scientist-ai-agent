@@ -29,6 +29,7 @@ CORRELATION_THRESHOLD = 0.95
 VARIANCE_THRESHOLD    = 0.01
 TEST_SIZE             = 0.2
 ML_SAMPLE_ROWS        = 100_000
+RANDOM_STATE          = 42   # projenin genel seed konvansiyonu (settings.RANDOM_SEED / ml_trainer.RANDOM_STATE ile tutarli)
 
 # Denetimli univariate seçim (ANOVA / f_regression): hedefle istatistiksel ilişkisi
 # anlamsız feature'ları eler. p-value eşiği keyfi skor eşiğinden (örn. "score<50")
@@ -489,6 +490,23 @@ def _find_best_target_candidate(df: pd.DataFrame, planned_target: str = "") -> t
 # ── Time-series lag features (FAZ A: cekirdek) ───────────────
 _TS_MAX_FEATURE_COLS = 5   # hedef disinda laglenecek en fazla sayisal kolon (feature patlamasi korumasi)
 
+# ── Deterministik sifir/eksik flag motoru (Adim 1) ───────────
+_DERIVED_FLAG_PREFIX = "__wm__"   # was_missing maskesi icin DAHILI tasiyici prefix (slot'ta temizlenir)
+_FLAG_MIN_PREVALENCE = 0.01       # yayginlik kapisi alt sinir (hep-ayni flag uretme)
+_FLAG_MAX_PREVALENCE = 0.99       # yayginlik kapisi ust sinir
+_MAX_DERIVED_FLAGS   = 30         # global cap (_TS_MAX_FEATURE_COLS muadili — feature patlamasi korumasi)
+_FLAG_INTENTS        = {"classification", "regression", "clustering"}  # kapsam (anomaly bu yola girmez)
+# TODO(iyilestirme): scale skip-list — flag'leri 0/1 tutup yorumlanabilirligi koru (su an scale z-skora ceviriyor)
+
+# ── Deterministik oran (ratio) motoru (Adim 2) ───────────────
+_MAX_RATIO_FEATURES   = 20      # global cap (feature patlamasi — _MAX_DERIVED_FLAGS muadili)
+_RATIO_MIN_UNIQUE     = 3       # binary/sabit kolonlari hariç tut (nunique >= 3)
+_RATIO_DENOM_MAX_ZERO = 0.05    # payda kolonunda izinli max sifir orani (sifir-bolme stabilizasyonu)
+_RATIO_WINSOR_Q       = 0.01    # robust clip kuantili (q01..q99) — uc deger nötr
+_RATIO_MAX_CARD_RATIO = 0.95    # ID-benzeri kaynak kapisi: nunique/n_rows > 0.95 → orana sokma
+                                # (oranlar protected_high_card ile kardinaliteden MUAF; bu on-filtre
+                                #  yanlis-etiketli ID'nin orana sizmasini ENGELLER — LLM metadata hatasina dayaniklilik)
+
 
 def _detect_frequency(parsed: pd.Series, group_key: "pd.Series | None" = None) -> tuple[str, list[int]]:
     """Ardisik tarih farklarinin medyanindan veri sikligini ve dinamik lag pencerelerini turet.
@@ -578,7 +596,8 @@ def _build_timeseries_features(
             skip.add(col)
 
     numeric_cols = [c for c in df.select_dtypes(include="number").columns
-                    if c not in skip and c != target_name]
+                    if c not in skip and c != target_name
+                    and not c.startswith(_DERIVED_FLAG_PREFIX)]   # was_missing tasiyicilari laglenmez
 
     # Kolon SECIMI (cok sayisal kolon varsa feature patlamasini onle): deterministik,
     # VERIYE DAYALI kriter = min-max normalize edilmis varyans (olcek-bagimsiz yayilim).
@@ -1371,10 +1390,12 @@ def _groupby_deviation_tt(
     cat_cols = [c for c in X_train.select_dtypes(include="object").columns
                 if c not in exclude and _GROUPBY_MAX_CARD >= X_train[c].nunique() >= 2]
     num_cols = X_train.select_dtypes(include="number").columns.tolist()
-    # Turetilmis kolonlari (count_/dev_/isna) grup-deviation GIRDISI yapma → gurultu/dongu onle
+    # Turetilmis kolonlari (count_/dev_/is_zero_/ratio_/isna) grup-deviation GIRDISI yapma
+    # → gurultu/dongu onle (is_zero_/ratio_ = pre-split flag/oran motorlarinin ciktilari)
     num_cols = [c for c in num_cols
                 if c not in exclude
-                and not c.startswith(("count_", "dev_")) and not c.endswith("_isna")]
+                and not c.startswith(("count_", "dev_", "is_zero_", "ratio_"))
+                and not c.endswith("_isna")]
     if not cat_cols or not num_cols:
         return X_train, X_test, []
 
@@ -1581,6 +1602,193 @@ def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata")
     return added
 
 
+def _target_distribution(y_arr, intent: str) -> "tuple[dict | None, dict | None]":
+    """Hedef dağılımını uygun temsile dönüştürür.
+
+    Dönüş: ``(counts, histogram)`` — ikisinden biri her zaman ``None``, böylece
+    frontend hangisini çizeceğini tek bakışta seçer:
+      - ``counts``    : ``{deger: adet}`` value_counts — sınıflandırma / düşük
+        kardinalite (mevcut donut davranışı AYNEN korunur).
+      - ``histogram`` : ``{"bin_edges":[...], "counts":[...]}`` — regresyon /
+        sürekli hedef; her benzersiz değeri ayrı "sınıf" yapan çorbayı önler.
+
+    Regresyon kararı: ``intent == "regression"`` VEYA (sayısal hedef ve
+    ``nunique > 20``). Anti-fabrication: tüm sayılar gerçek ``y_arr``'dan numpy
+    ile hesaplanır; hiçbir değer uydurulmaz.
+    """
+    s = pd.Series(y_arr)
+    is_numeric = pd.api.types.is_numeric_dtype(s)
+    nunique = int(s.nunique(dropna=True))
+    is_regression = (str(intent).strip().lower() == "regression") or (is_numeric and nunique > 20)
+
+    if is_regression and is_numeric:
+        data = s.dropna().to_numpy()
+        if data.size > 0 and nunique > 1:
+            n_bins = int(min(30, max(20, nunique)))  # ~20-30 bin
+            counts_arr, edges = np.histogram(data, bins=n_bins)
+            histogram = {
+                "bin_edges": [float(e) for e in edges],    # n_bins + 1 kenar
+                "counts":    [int(c) for c in counts_arr],  # n_bins adet
+            }
+            return None, histogram
+        # tek-değerli / boş sürekli hedef: histogram anlamsız → value_counts'a düş
+
+    # sınıflandırma / düşük kardinalite: mevcut value_counts davranışı
+    # (native int/str'e cast → JSON güvenliği; frontend için anlamı değişmez)
+    return {str(k): int(v) for k, v in s.value_counts().items()}, None
+
+
+def _build_zero_missing_flags(
+    df: pd.DataFrame, original_cols: set, intent: str, aggregated: bool,
+) -> tuple[pd.DataFrame, list[str]]:
+    """DOKUNUS 2: is_zero (orijinal sayisal kolon) + was_missing (DOKUNUS 1 tasiyicisi)
+    flag'lerini PLAIN INT olarak uret. Kapsam disi/aggregation/aday yok → tasiyicilari
+    temizleyip cik. Yayginlik kapisi %1-%99 (dogum-aninda); global cap _MAX_DERIVED_FLAGS,
+    asilirsa deterministik sirala (dengelilik min(p,1-p) desc, esitlikte ad asc). Yalnizca
+    ORIJINAL kolonlar (turetilmis feature'in flag'i olmasin); isim cakisma guard'i.
+    Tasiyicilar burada df'ten kaldirilir (gated-out olanlar encode/scale'e sizmaz)."""
+    carriers = [c for c in df.columns if c.startswith(_DERIVED_FLAG_PREFIX)]
+
+    # Kapsam disi (yalniz classif/reg/clustering) VEYA aggregation yolu → flag uretme
+    if intent.strip().lower() not in _FLAG_INTENTS or aggregated:
+        if carriers:
+            df = df.drop(columns=carriers, errors="ignore")
+        if aggregated:
+            logger.info("[feature_eng] zero/missing flag: aggregation yolu → atlandi (satir-bazli anlamsiz)")
+        return df, []
+
+    candidates: list[tuple[str, np.ndarray, float]] = []
+
+    # was_missing — tasiyicidan
+    for carrier in carriers:
+        name = f"was_missing_{carrier[len(_DERIVED_FLAG_PREFIX):]}"
+        if name in df.columns:
+            continue
+        s = df[carrier].to_numpy().astype(int)
+        p = float(s.mean()) if s.size else 0.0
+        if _FLAG_MIN_PREVALENCE <= p <= _FLAG_MAX_PREVALENCE:
+            candidates.append((name, s, min(p, 1.0 - p)))
+
+    # is_zero — yalnizca ORIJINAL sayisal kolonlar (math/domain/lag/date turevleri haric)
+    for col in df.select_dtypes(include="number").columns:
+        if col.startswith(_DERIVED_FLAG_PREFIX) or col not in original_cols:
+            continue
+        name = f"is_zero_{col}"
+        if name in df.columns:
+            continue
+        s = (pd.to_numeric(df[col], errors="coerce").to_numpy() == 0).astype(int)
+        if not s.any() or s.all():        # sifir hic gorulmemis / hepsi sifir → bilgi yok
+            continue
+        p = float(s.mean())
+        if _FLAG_MIN_PREVALENCE <= p <= _FLAG_MAX_PREVALENCE:
+            candidates.append((name, s, min(p, 1.0 - p)))
+
+    # Tasiyicilari her halukarda dusur (was_missing serileri yukarida numpy'a kopyalandi)
+    if carriers:
+        df = df.drop(columns=carriers, errors="ignore")
+
+    if not candidates:
+        return df, []
+
+    candidates.sort(key=lambda t: (-t[2], t[0]))   # deterministik: dengelilik desc, ad asc
+    if len(candidates) > _MAX_DERIVED_FLAGS:
+        logger.info(f"[feature_eng] zero/missing flag: {len(candidates)} aday > cap "
+                    f"{_MAX_DERIVED_FLAGS} → kirpildi")
+        candidates = candidates[:_MAX_DERIVED_FLAGS]
+
+    added: list[str] = []
+    for name, s, _ in candidates:
+        df[name] = s
+        added.append(name)
+    logger.info(f"[feature_eng] zero/missing flag uretildi ({len(added)}): {added}")
+    return df, added
+
+
+def _build_ratio_features(
+    df: pd.DataFrame, original_cols: set, meta: "ColumnMetadata",
+    intent: str, aggregated: bool, leaky_cols_high: set,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Deterministik oran (a/b) motoru — modelin yapamadigi olcek-carprazi sinyal.
+    Yalniz ORIJINAL sayisal kolonlar; binary/sabit (nunique<3), ID-benzeri (nunique/n_rows>0.95
+    — DTYPE-FARKINDA: yalniz int/object'e uygulanir, float continuous MUAF), leaky kaynak ve
+    cok-sifirli PAYDA haric. TEK YON (ad-sirali a<b → a/b) → resiprokal patlamasi
+    yok. Payda kapisi + winsorize [q01,q99] → sifir-bolme/uc deger nötr. Cap _MAX_RATIO_FEATURES;
+    asilirsa normalize-varyans (yayilim) ile sirala, esitlikte ad. Donen kolonlar _detect_leakage'da
+    protected_high_card'a eklenir (continuous → kardinalite kuralindan MUAF; korelasyon/leakage/
+    select TAM uygulanir — flag'den farki budur). ID on-filtresi, bu kardinalite muafiyetinin
+    yanlis-etiketli ID'yi orana sizdirma acigini kapatir (LLM metadata hatasina dayaniklilik)."""
+    if intent.strip().lower() not in _FLAG_INTENTS or aggregated:
+        if aggregated:
+            logger.info("[feature_eng] ratio feature: aggregation yolu → atlandi (orijinal kolonlar gruplandi)")
+        return df, []
+
+    # Aday: orijinal sayisal, leaky/flag/turetilmis degil
+    n_rows = len(df)
+    num_cols = [c for c in df.select_dtypes(include="number").columns
+                if c in original_cols
+                and not c.startswith(_DERIVED_FLAG_PREFIX)
+                and not c.startswith(("is_zero_", "was_missing_"))
+                and c not in leaky_cols_high]
+    nunique = {c: int(pd.to_numeric(df[c], errors="coerce").nunique()) for c in num_cols}
+
+    def _passes_id_guard(c: str) -> bool:
+        # Kardinalite-tabanli ID-guard DTYPE-FARKINDA: yalniz integer ve object/string
+        # kolonlara uygulanir (customer_id gibi int-unique ID'ler elenir). FLOAT (continuous)
+        # kolonlar bu kuraldan MUAF — estimated_salary/balance gibi yuksek-kardinaliteli
+        # surekli olcumler false-positive olarak elenmesin. Muafiyet SADECE bu guard'a ozeldir:
+        # float oranlar yine winsorize/payda-kapisi/korelasyon/leakage/cap'e TAM tabidir.
+        # Dinamik: isme degil dtype'a bakar (object/string num_cols'a zaten girmez → pratikte int kapisi).
+        if pd.api.types.is_float_dtype(df[c]):
+            return True
+        return not (n_rows > 0 and nunique[c] / n_rows > _RATIO_MAX_CARD_RATIO)
+
+    eligible = sorted(
+        c for c in num_cols
+        if nunique[c] >= _RATIO_MIN_UNIQUE   # binary/sabit haric (dtype-bagimsiz)
+        and _passes_id_guard(c)              # ID-benzeri haric — yalniz int/object (float MUAF)
+    )
+    if len(eligible) < 2:
+        return df, []
+
+    zero_frac = {c: float((pd.to_numeric(df[c], errors="coerce") == 0).mean()) for c in eligible}
+
+    candidates: list[tuple[str, np.ndarray, float]] = []
+    for i in range(len(eligible)):
+        for j in range(i + 1, len(eligible)):
+            a, b = eligible[i], eligible[j]            # ad-sirali: pay=a, payda=b (tek yon)
+            if zero_frac[b] > _RATIO_DENOM_MAX_ZERO:    # cok-sifirli payda → ciftı atla
+                continue
+            name = f"ratio_{a}_{b}"
+            if name in df.columns:                      # isim cakisma guard (math/domain)
+                continue
+            r = pd.to_numeric(df[a], errors="coerce") / pd.to_numeric(df[b], errors="coerce")
+            r = r.replace([np.inf, -np.inf], np.nan)
+            lo, hi = r.quantile(_RATIO_WINSOR_Q), r.quantile(1.0 - _RATIO_WINSOR_Q)
+            r = r.clip(lo, hi).fillna(0.0)
+            arr = r.to_numpy(dtype="float64")
+            vmin, vmax = float(np.nanmin(arr)), float(np.nanmax(arr))
+            if not np.isfinite(vmin) or vmax == vmin:    # sabit oran → bilgi yok
+                continue
+            score = float(np.nanvar((arr - vmin) / (vmax - vmin)))   # olcek-bagimsiz yayilim
+            candidates.append((name, arr, score))
+
+    if not candidates:
+        return df, []
+
+    candidates.sort(key=lambda t: (-t[2], t[0]))   # deterministik: yayilim desc, ad asc
+    if len(candidates) > _MAX_RATIO_FEATURES:
+        logger.info(f"[feature_eng] ratio feature: {len(candidates)} aday > cap "
+                    f"{_MAX_RATIO_FEATURES} → kirpildi")
+        candidates = candidates[:_MAX_RATIO_FEATURES]
+
+    added: list[str] = []
+    for name, arr, _ in candidates:
+        df[name] = arr
+        added.append(name)
+    logger.info(f"[feature_eng] ratio feature uretildi ({len(added)}): {added}")
+    return df, added
+
+
 def build_features(state: dict) -> dict:
     """
     Feature Engineering Service — BigData Edition
@@ -1643,6 +1851,11 @@ def build_features(state: dict) -> dict:
             df = df.drop(columns=existing_drops, errors="ignore")
             logger.info(f"[feature_eng] Critic drop_features: {existing_drops}")
 
+    # original_cols: is_zero/ratio motorlari YALNIZCA orijinal kolonlarda calissin
+    # (math/domain/date/lag/_isna turevleri haric). _add_missing_indicators _isna
+    # kolonlari EKLEMEDEN ONCE yakalanmali → turetilmis kolonlar original_cols'a sizmaz.
+    original_cols = set(df.columns)
+
     # Critic 'too-good/leakage' teşhisinden gelen DETERMINISTIK drop (retry).
     # LLM'in drop_features'ına bağlı kalmadan, importance-bazlı leakage_suspect'leri
     # doğrudan düşürür — schema'da drop_features alanı olmadığı için bu yol garanti.
@@ -1699,11 +1912,14 @@ def build_features(state: dict) -> dict:
 
     # Aggregation — timeseries'te zaman eksenini korumak icin ATLANIR (kapatinca
     # domain recipe'leri de inert kalir: avg_/std_ kolonlari olusmaz → onlara dokunmuyoruz).
+    aggregated = False
     if modality == "timeseries":
         logger.info("[feature_eng] timeseries: aggregation atlandi (zaman ekseni korunuyor)")
     else:
         entity_resolution = state.get("entity_resolution") or {}
+        n_before_agg = len(df)
         df, y = _aggregate_if_needed(df, y, feature_plan, meta, entity_resolution=entity_resolution)
+        aggregated = (len(df) != n_before_agg)   # satirlar gruplandiysa flag uretme (DOKUNUS 2 atlar)
 
     if df.empty or len(df) < 5:
         return {"error": f"İşlemler sonrası yetersiz veri sayısı ({len(df)} satır). Model kurulamıyor."}
@@ -1811,16 +2027,29 @@ def build_features(state: dict) -> dict:
     except Exception as e:
         logger.error(f"[feature_eng] Domain feature hatasi ({e}); atlaniyor.")
 
+    # ── DOKUNUS 2: deterministik sifir/oran motorlari (SPLIT ONCESI, row-wise) ──
+    # is_zero = orijinal sayisal kolonlar (row-wise, deterministik → leakage-safe).
+    # was_missing artik uretilmiyor: arkadasin _add_missing_indicators (_isna) ayni
+    # sinyali own-goal korumasiyla uretiyor (carrier yok → _build_zero_missing_flags
+    # yalniz is_zero dondurur). Ratio = orijinal sayisal cift (a/b, tek yon); leaky_cols_high
+    # + ID-benzeri kaynak dislanir. Ikisi de split-oncesi feature-construction (arkadasin
+    # _count_encode/_groupby_deviation'i da bu altitude'da) → split sonrasi _tt zinciri isler.
+    df, derived_flag_cols = _build_zero_missing_flags(df, original_cols, intent, aggregated)
+    df, ratio_feature_cols = _build_ratio_features(
+        df, original_cols, meta, intent, aggregated, leaky_cols_high)
+
     # ── LEAKAGE-SAFE SIRA (GRANDMASTER DİSİPLİNİ) ────────────────
     # Encoder/scaler/feature-selection/sizinti tespiti İSTATİSTİK öğrenir (target
     # ortalaması, kolon mean/std, varyans, korelasyon). Bunlar SADECE train'e fit
     # edilmeli; aksi halde test dağılımı/target'ı eğitime sızar → holdout skoru
     # yapay şişer. Bu yüzden artık önce SPLIT, sonra fit-on-train → transform-test.
     # (Eski sıra hepsini tüm df'ye fit edip sonra böldüğü için sızıntılıydı.)
-    ts_protected_cols: set = set()
+    # Oranlar continuous (yuksek-kardinaliteli ama ID DEGIL) → SADECE kardinalite
+    # kuralindan muaf (ts lag'leriyle ayni mantik); _detect_leakage_tt'de korunur.
+    ts_protected_cols: set = set(ratio_feature_cols)
     if ts_lag_info:
-        ts_protected_cols = (set(ts_lag_info.get("lag_columns", []))
-                             | set(ts_lag_info.get("rolling_columns", [])))
+        ts_protected_cols |= (set(ts_lag_info.get("lag_columns", []))
+                              | set(ts_lag_info.get("rolling_columns", [])))
 
     # 14. Train/test split
     split_imbalanced = 0
@@ -1914,6 +2143,12 @@ def build_features(state: dict) -> dict:
     y_train_arr = np.array(y_train)
     y_test_arr  = np.array(y_test)
 
+    # Hedef dağılımı: sınıflandırmada value_counts (donut), regresyon/sürekli
+    # hedefte histogram bin'leri. İkisinden biri None → frontend hangisini
+    # çizeceğini bilir. Gerçek y_train/y_test'ten hesaplanır (anti-fabrication).
+    dist_train_counts, hist_train = _target_distribution(y_train_arr, intent)
+    dist_test_counts,  hist_test  = _target_distribution(y_test_arr, intent)
+
     logger.info(f"\n[feature_eng] TAMAMLANDI:")
     logger.info(f"  Hedef   : {target_name}")
     logger.info(f"  X_train : {X_train.shape}")
@@ -1928,8 +2163,10 @@ def build_features(state: dict) -> dict:
         "n_features":               len(X_train.columns),
         "n_train":                  len(X_train),
         "n_test":                   len(X_test),
-        "target_distribution_train": pd.Series(y_train_arr).value_counts().to_dict(),  # type: ignore
-        "target_distribution_test": pd.Series(y_test_arr).value_counts().to_dict(),  # type: ignore
+        "target_distribution_train": dist_train_counts,   # sınıflandırma → value_counts, regresyon → None
+        "target_distribution_test":  dist_test_counts,
+        "target_histogram_train":    hist_train,           # regresyon → {bin_edges, counts}, sınıflandırma → None
+        "target_histogram_test":     hist_test,
         "intelligence_metadata":    meta.summary(),
         "data_source":              "parquet" if state.get("data_path") else "sql_results_preview",
         "total_rows_available":     None,  # execution_node profiling'den alınabilir
@@ -1938,6 +2175,8 @@ def build_features(state: dict) -> dict:
         "univariate_dropped":       univariate_dropped,
         "derived_features":         [c for c in derived_feature_cols if c in X_train.columns],
         "domain_features":          [c for c in domain_feature_cols if c in X_train.columns],
+        "derived_flags":            [c for c in derived_flag_cols if c in X_train.columns],
+        "ratio_features":           [c for c in ratio_feature_cols if c in X_train.columns],
         "auto_features":            [c for c in auto_feature_cols if c in X_train.columns],
         "timeseries_lag":           ts_lag_info,
         "split_strategy":           split_strategy,
