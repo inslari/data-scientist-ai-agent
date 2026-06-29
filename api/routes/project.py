@@ -17,6 +17,7 @@ router = APIRouter(prefix="/projects", tags=["Projects"])
 def run_project(
     project_id: int,
     force_restart: bool = False,
+    language: str | None = None,
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user),
 ):
@@ -54,6 +55,7 @@ def run_project(
         data_group_id=project.data_group_id,
         is_resume=int(is_resume),
         force_restart=int(force_restart),
+        language=language,
         status="pending",
     )
     db.add(job)

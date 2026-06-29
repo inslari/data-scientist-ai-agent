@@ -169,6 +169,7 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
     data_group_id = job.data_group_id
     is_resume = bool(job.is_resume)
     force_restart = bool(job.force_restart)
+    job_language = job.language
 
     # Bu işin tüm logları (node decorator'ları dahil) bu project_id ile etiketlenir.
     set_project(project_id)
@@ -234,6 +235,8 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             domain_pack = resolved_domain_pack
             # domain_doc resolved above from the data group (dataset description)
             initial_state: dict | None = {"user_query": query, "domain_pack": domain_pack, "domain_doc": domain_doc}
+            # Rapor dili: UI'dan job ile geldi; yoksa "tr" (mevcut müşteri varsayılanı).
+            initial_state["report_language"] = job_language or "tr"
             if project_intent:
                 initial_state["intent"] = project_intent
             if project_target_col:
