@@ -1062,18 +1062,25 @@ def _detect_leakage(
         # KRİTİK: Sürekli ÖLÇÜMLER (PCA bileşenleri V1..V28, float metrikler, tutar) doğal
         # olarak yüksek-kardinalitelidir ama ID DEĞİLdir → onları ID sanıp atma. Gerçek
         # identifier'lar integer/string'dir. Aksi halde bütün ayırt edici sürekli feature'lar
-        # silinir (creditcard V1-V28 vakası). Muaf: semantic_type metric/numeric VEYA float dtype
-        # VEYA protected_high_card (time-series lag). Korelasyon/sızıntı kontrolü onlara yine uygulanır.
-        is_continuous = (
-            sem in ("metric", "numeric")
-            or pd.api.types.is_float_dtype(df[col])
-        )
+        # silinir (creditcard V1-V28 vakası). Muaf: float dtype VEYA protected_high_card
+        # (time-series lag). Korelasyon/sızıntı kontrolü onlara yine uygulanır.
+        #
+        # ÖNEMLİ: semantic_type 'metric'/'numeric' muafiyeti YALNIZCA ~%100 benzersiz
+        # OLMAYAN kolonlar için geçerli. Intelligence engine bir tamsayı kimliği (örn.
+        # customer_id) çoğu zaman "metric/numeric" etiketler; ama satır-başına benzersiz
+        # bir integer/string kolon — etiketi ne olursa olsun — tanımlayıcıdır (gerçek bir
+        # tamsayı ölçüm neredeyse hiç %100 benzersiz olmaz). Bu yüzden near-unique
+        # kolonlarda semantic muafiyetini uygulama; sadece float ölçümleri koru.
         nunique = df[col].nunique()
-        if (col not in protected_high_card and not is_continuous
-                and n_rows > 0 and nunique / n_rows > 0.95):
+        near_unique = n_rows > 0 and nunique / n_rows > 0.95
+        is_continuous = (
+            pd.api.types.is_float_dtype(df[col])
+            or (sem in ("metric", "numeric") and not near_unique)
+        )
+        if col not in protected_high_card and not is_continuous and near_unique:
             df = df.drop(columns=[col], errors="ignore")
-            dropped.append({"column": col, "reason": f"asiri kardinalite ({nunique}/{n_rows})"})
-            logger.info(f"[leakage] KESIN drop: '{col}' (kardinalite orani {nunique/n_rows:.2f})")
+            dropped.append({"column": col, "reason": f"asiri kardinalite ({nunique}/{n_rows}, ID-benzeri)"})
+            logger.info(f"[leakage] KESIN drop: '{col}' (kardinalite orani {nunique/n_rows:.2f}, ID-benzeri)")
             continue
 
     # ── Korelasyon tabanlı (yalnızca numeric + y numeric ise) ──

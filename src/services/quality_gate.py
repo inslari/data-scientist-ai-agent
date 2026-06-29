@@ -74,21 +74,39 @@ def evaluate_quality_gate(state: dict) -> dict:
             "value": round(gap, 3),
         })
 
-    # Domain leakage (high confidence) — yalnızca MODELDE KALAN kolonlar için uyar.
-    # Detector'ın high-confidence suspect'leri feature_builder tarafından zaten
-    # düşürülmüş olabilir (feature_report.leakage_dropped'a kaydedilir). Düşürülen
-    # kolon modele hiç girmediğinden onun için "tahminler güvenilir olmayabilir"
-    # demek yanıltıcı (örn. RowNumber/CustomerId/Surname gibi tanımlayıcılar drop
-    # edilip yine de uyarı veriyordu). Drop edilmişleri uyarıdan çıkar.
+    # Domain leakage (high confidence) — yalnızca MODELDE GERÇEKTEN KALAN kolonlar için uyar.
+    # Detector'ın high-confidence suspect'i feature_builder tarafından düşürülmüş olabilir;
+    # düşen kolon modele hiç girmediğinden onun için "tahminler güvenilir olmayabilir" demek
+    # yanıltıcıdır (örn. customer_id/RowNumber/Surname gibi tanımlayıcılar drop edilip yine de
+    # uyarı veriyordu).
+    #
+    # ASIL ÖLÇÜT: feature_report.final_features = modele giren gerçek kolon listesi
+    # (X_train.columns). Bir kolon; identifier/timestamp erken-drop'u, critic drop'u,
+    # kardinalite/korelasyon drop'u VB. herhangi bir yolla modelden çıkmış olabilir ve
+    # bunların hepsi leakage_dropped'a yazılmaz (örn. id/ts drop'u yalnızca log'a yazar).
+    # Bu yüzden tek güvenilir sinyal final_features ÜYELİĞİdir. leakage_dropped sadece
+    # final_features mevcut değilse (eski koşu) geriye-uyumlu fallback olarak kullanılır.
     checks_performed.append("domain_leakage")
     feature_report = state.get("feature_report") or {}
     dropped_cols = {
         d.get("column") for d in (feature_report.get("leakage_dropped") or [])
         if isinstance(d, dict)
     }
+    final_features = feature_report.get("final_features") or []
+    final_features_low = {str(f).lower() for f in final_features}
+
+    def _is_in_model(col: str | None) -> bool:
+        """Kolon modele gerçekten girdi mi? final_features varsa ona göre (case-insensitive),
+        yoksa leakage_dropped fallback'ine göre karar verir."""
+        if col is None:
+            return False
+        if final_features_low:
+            return str(col).lower() in final_features_low
+        return col not in dropped_cols
+
     concerns = domain_leakage.get("concerns", []) or []
     high_concerns = [c for c in concerns if c.get("confidence") == "high"]
-    high_in_model = [c for c in high_concerns if c.get("column_name") not in dropped_cols]
+    high_in_model = [c for c in high_concerns if _is_in_model(c.get("column_name"))]
     if high_in_model:
         cols = [c["column_name"] for c in high_in_model]
         warnings.append({
