@@ -29,6 +29,7 @@ def check_table(table_name):
 
 existing_cols = check_table("projects")
 data_group_cols = check_table("data_groups")
+job_cols = check_table("background_jobs")
 
 with engine.connect() as conn:
     if "query" not in existing_cols:
@@ -77,6 +78,11 @@ with engine.connect() as conn:
     if "ttd_suggestions" not in data_group_cols:
         print("Adding 'ttd_suggestions' column to 'data_groups'...")
         conn.execute(text("ALTER TABLE data_groups ADD COLUMN ttd_suggestions JSON"))
+
+    # Rapor dili — run anında UI'dan job'a yazılır (tr|en)
+    if "language" not in job_cols:
+        print("Adding 'language' column to 'background_jobs'...")
+        conn.execute(text("ALTER TABLE background_jobs ADD COLUMN language VARCHAR"))
 
     conn.commit()
 

@@ -25,6 +25,7 @@ class BackgroundJobModel(Base):
     data_group_id = Column(Integer, nullable=True)
     is_resume = Column(Integer, default=0)       # 0 = False, 1 = True
     force_restart = Column(Integer, default=0)   # 0 = False, 1 = True
+    language = Column(String, nullable=True)     # rapor dili (tr|en) — run anında UI'dan
 
     # Lifecycle
     status = Column(String, default="pending", index=True)  # pending, running, completed, failed

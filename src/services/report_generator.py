@@ -33,6 +33,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.core.config import settings
 from src.state import AgentState
 from src.core.prompt_loader import load_prompt
+from src.core.report_i18n import (
+    normalize_lang,
+    LANGUAGE_NAME,
+    R,
+    freq_label,
+    split_label,
+)
 from src.domains import get_active_pack
 from src.domains.base import MerchantContext
 from src.domains.schemas import MerchantAnalysis
@@ -68,8 +75,12 @@ def _overfitting_scores(ovf: dict) -> tuple[Any, Any, str]:
     return None, None, ""
 
 
-def _build_context(state: AgentState) -> str:
-    """Formats all state outputs into a structured text block for the LLM."""
+def _build_context(state: AgentState, lang: str = "tr") -> str:
+    """Formats all state outputs into a structured text block for the LLM.
+
+    Çıktıya VERBATIM kopyalanan parçalar (status rozeti, Karar, FAIL/WARN) ``lang``
+    diline lokalize edilir; geri kalan etiketler LLM girdisidir (yeniden yazılır).
+    """
     lines: list[str] = []
     intent = state.get("intent", "unknown")
 
@@ -81,25 +92,25 @@ def _build_context(state: AgentState) -> str:
         # Durum rozeti — H1 DEĞİL; deterministik başlığın altında küçük durum satırı.
         # Kategorik "güvenilir/üretime alınmamalı" iddiası yok, sadece durum işareti.
         badge = {
-            "pass": "✅ Durum: güçlü performans",
-            "warn": "⚠️ Durum: dikkat gerektiren noktalar var",
-            "fail": "🛑 Durum: yetersiz, gözden geçirme gerekli",
+            "pass": R("badge_pass", lang),
+            "warn": R("badge_warn", lang),
+            "fail": R("badge_fail", lang),
         }.get(qg.get("status"), "")
 
         if badge:
             lines.append(f"**{badge}**\n")
-        lines.append(f"**Karar:** {summary}\n")
-        
+        lines.append(f"**{R('decision', lang)}:** {summary}\n")
+
         failures = qg.get("failures", [])
         if failures:
-            lines.append("## Kritik Sorunlar (FAIL)")
+            lines.append(f"## {R('fail_header', lang)}")
             for f in failures:
                 lines.append(f"  - {f['message']}")
             lines.append("")
-        
+
         warnings = qg.get("warnings", [])
         if warnings:
-            lines.append("## Uyarılar (WARN)")
+            lines.append(f"## {R('warn_header', lang)}")
             for w in warnings:
                 lines.append(f"  - {w['message']}")
             lines.append("")
@@ -409,13 +420,13 @@ SYSTEM_PROMPT_ANOMALY    = load_prompt("report_system_anomaly.md")
 _SUPERVISED_INTENTS = ("classification", "regression")
 
 
-def _report_title_for(intent: str) -> str:
+def _report_title_for(intent: str, lang: str = "tr") -> str:
     """Intent'e göre sabit, generik rapor başlığı. Hedef adı başlıkta GEÇMEZ."""
     if intent == "clustering":
-        return "Kümeleme Analizi Raporu"
+        return R("title_clustering", lang)
     if intent == "anomaly_detection":
-        return "Anomali Tespiti Raporu"
-    return "Model Değerlendirme Raporu"
+        return R("title_anomaly", lang)
+    return R("title_model", lang)
 
 
 def _resolve_target_name(state: AgentState) -> str:
@@ -431,7 +442,7 @@ def _resolve_target_name(state: AgentState) -> str:
     )
 
 
-def _build_report_header(state: AgentState) -> str:
+def _build_report_header(state: AgentState, lang: str = "tr") -> str:
     """
     Deterministik H1 başlık + meta satırı üretir:
         # <generik başlık>
@@ -442,34 +453,25 @@ def _build_report_header(state: AgentState) -> str:
     model_name = state.get("model_name", "unknown")
     timestamp = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    title = _report_title_for(intent)
+    title = _report_title_for(intent, lang)
 
     parts: list[str] = []
     if intent in _SUPERVISED_INTENTS:
         target_name = _resolve_target_name(state)
         if target_name:
-            parts.append(f"hedef: {target_name}")
-    parts.append(f"görev: {intent}")
-    parts.append(f"model: {model_name}")
+            parts.append(f"{R('meta_target', lang)}: {target_name}")
+    parts.append(f"{R('meta_task', lang)}: {intent}")
+    parts.append(f"{R('meta_model', lang)}: {model_name}")
     parts.append(timestamp)
 
     return f"# {title}\n> {' · '.join(parts)}\n"
 
 
-# Zaman serisi (timeseries) deterministik özet bölümü — LLM'e bırakılmaz
-
-# frequency / split_strategy ham değerlerini sade Türkçe etikete çevir
-_FREQ_TR = {"daily": "günlük", "weekly": "haftalık", "monthly": "aylık"}
-
-_SPLIT_TR = {
-    "global_chronological": "kronolojik holdout — geçmişle eğitildi, gelecekte test edildi",
-    "entity_aware": "entity-bazlı kronolojik holdout — her entity kendi içinde geçmişle eğitilip gelecekte test edildi",
-    "random": "rastgele bölme",
-    "none": "ayrı bir bölme uygulanmadı",
-}
+# Zaman serisi (timeseries) deterministik özet bölümü — LLM'e bırakılmaz.
+# frequency / split_strategy ham değerleri report_i18n'deki dil haritalarıyla çevrilir.
 
 
-def _build_timeseries_section(state: AgentState) -> str:
+def _build_timeseries_section(state: AgentState, lang: str = "tr") -> str:
     """modality=timeseries ise zaman serisine özel deterministik bir özet bölümü döndürür.
 
     Yalnızca feature_report.timeseries_lag içinde GERÇEKTEN bulunan değerleri yazar
@@ -484,50 +486,48 @@ def _build_timeseries_section(state: AgentState) -> str:
         return ""
 
     lines: list[str] = [
-        "## Zaman Serisi Analizi",
+        R("ts_title", lang),
         "",
-        "- Bu bir **zaman serisi** analizidir; satırlar zaman eksenine göre sıralanıp işlenmiştir.",
+        R("ts_intro", lang),
     ]
 
     # (b) tespit edilen frekans
     freq = ts.get("frequency")
     if freq:
-        lines.append(f"- Tespit edilen frekans: **{_FREQ_TR.get(freq, freq)}**")
+        lines.append(R("ts_freq", lang, f=freq_label(freq, lang)))
 
     # (c) kullanılan split (entity-aware ise ayrıca belirtilir)
     split = fr.get("split_strategy")
-    if split in _SPLIT_TR:
-        lines.append(f"- Eğitim/test ayrımı: **{_SPLIT_TR[split]}**")
+    split_txt = split_label(split, lang)
+    if split_txt:
+        lines.append(R("ts_split", lang, s=split_txt))
 
     # (d) üretilen feature türleri — lag / rolling pencereleri
     lag_w = ts.get("windows") or []
     if lag_w:
         n_lag = len(ts.get("lag_columns") or [])
         lines.append(
-            f"- Lag (gecikme) pencereleri: {', '.join(str(w) for w in lag_w)}"
-            + (f" ({n_lag} lag özelliği)" if n_lag else "")
+            R("ts_lag", lang, w=", ".join(str(w) for w in lag_w))
+            + (R("ts_lag_n", lang, n=n_lag) if n_lag else "")
         )
     roll_w = ts.get("roll_windows") or []
     if roll_w:
         n_roll = len(ts.get("rolling_columns") or [])
         lines.append(
-            f"- Rolling (hareketli ortalama/std) pencereleri: {', '.join(str(w) for w in roll_w)}"
-            + (f" ({n_roll} rolling özelliği)" if n_roll else "")
+            R("ts_roll", lang, w=", ".join(str(w) for w in roll_w))
+            + (R("ts_roll_n", lang, n=n_roll) if n_roll else "")
         )
     dropped_lead = ts.get("dropped_lead_rows")
     if dropped_lead:
-        lines.append(f"- Geçmişi yetersiz ilk {dropped_lead} satır eğitim öncesi düşürüldü.")
+        lines.append(R("ts_dropped_lead", lang, n=dropped_lead))
 
     # (e) multi-entity (panel) bilgisi — yalnızca entity_col doluysa
     entity_col = ts.get("entity_col")
     if entity_col:
-        seg = (
-            f"- Çok-entity (panel) veri: **{entity_col}** sütununa göre gruplandı; "
-            "lag/rolling/frekans her entity'nin kendi içinde hesaplandı"
-        )
+        seg = R("ts_entity", lang, c=entity_col)
         dropped_ent = ts.get("dropped_entities")
         if dropped_ent:
-            seg += f". Yetersiz geçmişe sahip {dropped_ent} küçük entity düşürüldü"
+            seg += R("ts_dropped_ent", lang, n=dropped_ent)
         lines.append(seg)
 
     lines.append("")
@@ -551,29 +551,39 @@ def generate_report(state: AgentState) -> dict:
     """
     logger.info("\n[report] Başlıyor...")
 
+    # Rapor çıktı dili (UI'dan gelir; boş → "tr"). Tüm deterministik/verbatim
+    # dizeler ve LLM çıktısı bu dile göre üretilir.
+    lang = normalize_lang(state.get("report_language"))
+
     # Check for pipeline errors first
     if state.get("error"):
         error_msg = state.get("error")
         logger.warning(f"[report] UYARI: Pipeline hatası algılandı: {error_msg}")
         return {
             **state,
-            "report": f"# ❌ Analiz Tamamlanamadı\n\nVeri işleme sürecinde kritik bir hata meydana geldi ve analiz durduruldu:\n\n**Hata Nedeni:** {error_msg}\n\n*Lütfen daha büyük veya daha tutarlı bir veri seti ile tekrar deneyin.*",
+            "report": (
+                f"{R('err_incomplete_title', lang)}\n\n"
+                + R("err_incomplete_body", lang, e=error_msg)
+            ),
             "current_step": "report_node",
         }
 
     # control evaluation report
     ev = state.get("evaluation_report", {})
     if not ev:
-        error_msg = "Evaluation raporu bulunamadı, report_node atlanıyor."
-        logger.warning(f"[report] UYARI: {error_msg}")
+        logger.warning(f"[report] UYARI: {R('err_noeval', 'tr')}")
         return {
             **state,
-            "report": f"# ❌ Rapor Üretilemedi\n\n{error_msg}\n\nBu durum genellikle modelin kurulamamasından kaynaklanır.",
+            "report": (
+                f"{R('err_noreport_title', lang)}\n\n"
+                f"{R('err_noeval', lang)}\n\n"
+                f"{R('err_noreport_body', lang)}"
+            ),
             "current_step": "report_node",
         }
 
-    # build context
-    context = _build_context(state)
+    # build context (verbatim parçalar lang'e lokalize)
+    context = _build_context(state, lang)
     logger.info(f"[report] Context hazırlandı ({len(context)} karakter)")
 
     # select system prompt based on intent
@@ -601,17 +611,23 @@ def generate_report(state: AgentState) -> dict:
     except Exception as e:  # pragma: no cover - defensive
         logger.info(f"[report] Domain pack yorum merceği başarısız ({e}); atlanıyor.")
 
+    # Çıktı dili direktifi — en yüksek öncelik; .md'lerdeki sabit dil cümlesi kaldırıldı,
+    # dil buradan dinamik geliyor. LLM her başlık/etiket/cümleyi bu dilde yazar.
+    system_prompt = system_prompt + (
+        f"\n\n## OUTPUT LANGUAGE (HIGHEST PRIORITY)\n"
+        f"Write the ENTIRE report in {LANGUAGE_NAME[lang]} — every section heading, "
+        f"label, bullet and sentence must be in {LANGUAGE_NAME[lang]}. Translate the "
+        f"section headings too. Do NOT mix languages. "
+        f"(The verbatim status/decision/FAIL/WARN lines from the context are already "
+        f"in {LANGUAGE_NAME[lang]}; copy them as-is.)"
+    )
+
     # llm
     llm = _get_llm()
     user_query = state.get("user_query", "")
     model_name = state.get("model_name", "unknown")
 
-    prompt = (
-        f"Kullanıcı sorusu: '{user_query}'\n\n"
-        f"Aşağıda pipeline'ın tüm çıktıları bulunmaktadır. "
-        f"Bu verileri kullanarak kapsamlı bir analiz raporu yaz.\n\n"
-        f"{context}"
-    )
+    prompt = R("human_intro", lang, q=user_query, ctx=context)
 
     logger.info("[report] LLM'den rapor üretiliyor...")
     try:
@@ -628,15 +644,15 @@ def generate_report(state: AgentState) -> dict:
         # Deterministik başlık + meta satırını en üste ekle (LLM başlık üretmiyor).
         # Zaman serisi özeti yalnızca modality=timeseries iken araya girer (tabular'da "").
         report_text = (
-            _build_report_header(state) + "\n"
-            + _build_timeseries_section(state)
+            _build_report_header(state, lang) + "\n"
+            + _build_timeseries_section(state, lang)
             + report_text.lstrip()
         )
 
     except Exception as e:
         logger.error(f"[report] LLM hatası: {e}")
-        # create fallback report if llm fails 
-        report_text = _generate_fallback_report(state)
+        # create fallback report if llm fails
+        report_text = _generate_fallback_report(state, lang)
 
     logger.info(f"[report] Rapor tamamlandı ({len(report_text)} karakter)")
 
@@ -648,8 +664,11 @@ def generate_report(state: AgentState) -> dict:
 
 
 # fallback report (llm failes)
-def _generate_fallback_report(state: AgentState) -> str:
-    """LLM çağrısı başarısız olursa state verilerinden doğrudan rapor üretir."""
+def _generate_fallback_report(state: AgentState, lang: str = "tr") -> str:
+    """LLM çağrısı başarısız olursa state verilerinden doğrudan rapor üretir.
+
+    Tüm yapısal başlık/etiketler ``lang`` diline lokalizedir (report_i18n).
+    """
     ev = state.get("evaluation_report", {})
     test_m = ev.get("test_metrics", {})
     ovf = ev.get("overfitting", {})
@@ -661,31 +680,26 @@ def _generate_fallback_report(state: AgentState) -> str:
     model_name = state.get("model_name", "unknown")
     intent = state.get("intent", "unknown")
     tables = state.get("relevant_tables", [])
-    timestamp = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    roc = test_m.get("roc_auc", test_m.get("roc_auc_ovr", "N/A"))
-    acc = test_m.get("accuracy", "N/A")
-    f1 = test_m.get("f1_weighted", "N/A")
-    mcc = test_m.get("mcc", "N/A")
     grade = rel.get("grade", "?")
     score = rel.get("score", 0)
 
-    ts_section = _build_timeseries_section(state)
+    ts_section = _build_timeseries_section(state, lang)
     lines = [
-        _build_report_header(state).rstrip("\n"),
+        _build_report_header(state, lang).rstrip("\n"),
         "",
     ]
     if ts_section:
         lines += [ts_section.rstrip("\n"), ""]
     lines += [
-        "## 1. Yönetici Özeti",
-        f"- Analiz tipi: **{intent}**",
-        f"- Kullanılan tablolar: {', '.join(tables)}",
-        f"- En iyi model: **{model_name}**",
-        f"- Genel güvenilirlik: **{score}/100 (Grade: {grade})**",
+        R("fb_h1", lang),
+        f"- {R('fb_analysis_type', lang)}: **{intent}**",
+        f"- {R('fb_tables', lang)}: {', '.join(tables)}",
+        f"- {R('fb_best_model', lang)}: **{model_name}**",
+        f"- {R('fb_overall_rel', lang)}: **{score}/100 (Grade: {grade})**",
         "",
-        "## 2. Model Performansı",
-        f"| Metrik | Değer |",
+        R("fb_h2", lang),
+        f"| {R('fb_metric', lang)} | {R('fb_value', lang)} |",
         f"|--------|-------|",
     ]
 
@@ -693,75 +707,77 @@ def _generate_fallback_report(state: AgentState) -> str:
         lines.append(f"| {k} | {v} |")
 
     if ci:
-        lines += ["", "### Bootstrap Güven Aralıkları (%95)"]
+        lines += ["", R("fb_ci", lang)]
         for metric, vals in ci.items():
             lines.append(f"- **{metric}**: {vals['mean']} [{vals['lower']} — {vals['upper']}]")
     else:
-        lines.append("\n*Bootstrap güven aralığı bu çalışmada hesaplanmadı.*")
+        lines.append(f"\n{R('fb_no_ci', lang)}")
 
     disp_s, test_s, ovf_label = _overfitting_scores(ovf)
     if ovf and disp_s is not None:
         lines += [
             "",
-            "## 3. Overfitting Analizi",
+            R("fb_h3", lang),
             f"- {ovf_label}: {disp_s} | Test: {test_s}",
-            f"- Fark ({ovf_label}−Test): {ovf.get('gap')} | Durum: **{ovf.get('status')}**",
+            f"- {R('fb_gap', lang)} ({ovf_label}−Test): {ovf.get('gap')} | {R('fb_status', lang)}: **{ovf.get('status')}**",
             f"- {ovf.get('description', '')}",
         ]
         _tr = ovf.get("train_score", ovf.get("train_r2"))
         if ovf_label == "CV (5-fold)" and _tr is not None:
-            lines.append(f"- Not: Train (resubstitution) {_tr} — ezber skoru, genelleme göstergesi değil.")
+            lines.append(f"- {R('fb_resub_note', lang, tr=_tr)}")
     else:
-        lines.append("\n*Overfitting analizi bu çalışmada uygulanmadı.*")
+        lines.append(f"\n{R('fb_no_ovf', lang)}")
 
     if cal and isinstance(cal, dict) and cal.get('brier_score') is not None:
         lines += [
             "",
-            "## 4. Kalibrasyon",
-            f"- Brier Score: {cal.get('brier_score')}",
-            f"- İyi kalibre: {'✅' if cal.get('is_well_calibrated') else '❌'}",
+            R("fb_h4", lang),
+            f"- {R('fb_brier', lang)}: {cal.get('brier_score')}",
+            f"- {R('fb_well_cal', lang)}: {'✅' if cal.get('is_well_calibrated') else '❌'}",
         ]
     else:
-        lines.append("\n*Kalibrasyon analizi bu çalışmada uygulanmadı.*")
+        lines.append(f"\n{R('fb_no_cal', lang)}")
 
     if shap and shap.get("top5_shap_features"):
-        lines += ["", "## 5. En Etkili Özellikler (SHAP)"]
+        lines += ["", R("fb_h5", lang)]
         for feat, pct in shap.get("top5_shap_features", {}).items():
             lines.append(f"- **{feat}**: %{pct}")
     else:
-        lines.append("\n*SHAP açıklanabilirlik analizi bu çalışmada hesaplanmadı.*")
+        lines.append(f"\n{R('fb_no_shap', lang)}")
 
     if err:
         conf = err.get("confidence_analysis", {})
+        hce = conf.get("high_confidence_errors", 0)
+        suffix = R("fb_count_suffix", lang)
         lines += [
             "",
-            "## 6. Hata Analizi",
-            f"- Toplam hata: {err.get('n_errors')}/{err.get('n_total')} ({err.get('error_rate', 0)*100:.2f}%)",
-            f"- Yüksek güven hatası: {conf.get('high_confidence_errors', 0)} adet",
+            R("fb_h6", lang),
+            f"- {R('fb_total_err', lang)}: {err.get('n_errors')}/{err.get('n_total')} ({err.get('error_rate', 0)*100:.2f}%)",
+            f"- {R('fb_high_conf_err', lang)}: {hce}" + (f" {suffix}" if suffix else ""),
         ]
 
     bias = ev.get("bias_analysis", {})
     if bias:
-        lines += ["", "## 7. Bias & Fairness Analizi"]
+        lines += ["", R("fb_h7", lang)]
         for base_col, cols in bias.items():
-            lines.append(f"- **Grup: {base_col}**")
+            lines.append(f"- **{R('fb_group', lang)}: {base_col}**")
             for col, metrics in cols.items():
                 lines.append(f"  - {col}: FPR={metrics.get('fpr', 0):.3f}, FNR={metrics.get('fnr', 0):.3f}")
     else:
-        lines.append("\n*Adalet/yanlılık analizi bu veri setinde uygulanmadı (demografik etiket yok).*")
+        lines.append(f"\n{R('fb_no_bias', lang)}")
 
     opt_thresh = ev.get("optimal_threshold")
     if opt_thresh:
         lines += [
             "",
-            "## 8. Operasyonel Öneri",
-            f"- Varsayılan 0.5 yerine **{opt_thresh}** threshold'u kullanmak recall'u artırır.",
+            R("fb_h8", lang),
+            R("fb_threshold", lang, t=opt_thresh),
         ]
 
     lines += [
         "",
-        "## 9. Güvenilirlik",
-        f"- Skor: **{score}/100** | Grade: **{grade}**",
+        R("fb_h9", lang),
+        f"- {R('fb_score', lang)}: **{score}/100** | Grade: **{grade}**",
     ]
     for factor in rel.get("factors", []):
         lines.append(f"  - ✓ {factor}")

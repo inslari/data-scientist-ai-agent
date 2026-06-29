@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.core.logging_config import get_logger
+from src.core.report_i18n import normalize_lang, R
 logger = get_logger(__name__)
 
 
@@ -14,6 +15,9 @@ def evaluate_quality_gate(state: dict) -> dict:
       warn  - Çalışıyor ama dikkat edilmesi gereken durumlar var
       fail  - Yetersiz, üretime alınmamalı
     """
+    # Rapor diliyle aynı: mesajlar/summary çıktıya verbatim girdiği için lokalize edilir.
+    lang = normalize_lang(state.get("report_language"))
+
     evaluation_report = state.get("evaluation_report") or {}
     test_metrics      = evaluation_report.get("test_metrics") or {}
     overfitting       = evaluation_report.get("overfitting") or {}
@@ -35,7 +39,7 @@ def evaluate_quality_gate(state: dict) -> dict:
         if auc < 0.60:
             failures.append({
                 "code": "low_auc",
-                "message": f"AUC çok düşük ({auc:.3f}). Model rastgele tahminden zar zor iyi.",
+                "message": R("low_auc", lang, a=auc),
                 "value": round(auc, 3),
             })
 
@@ -46,7 +50,7 @@ def evaluate_quality_gate(state: dict) -> dict:
         if r2 < 0.30:
             failures.append({
                 "code": "low_r2",
-                "message": f"R² çok düşük ({r2:.3f}). Model hedefi açıklayamıyor.",
+                "message": R("low_r2", lang, r=r2),
                 "value": round(r2, 3),
             })
 
@@ -56,7 +60,7 @@ def evaluate_quality_gate(state: dict) -> dict:
     if gap > 0.20:
         failures.append({
             "code": "severe_overfitting",
-            "message": f"Ciddi overfitting (train-test farkı: {gap:.3f}). Model eğitim verisini ezberlemiş.",
+            "message": R("severe_overfitting", lang, g=gap),
             "value": round(gap, 3),
         })
 
@@ -66,7 +70,7 @@ def evaluate_quality_gate(state: dict) -> dict:
     if 0.10 < gap <= 0.20:
         warnings.append({
             "code": "mild_overfitting",
-            "message": f"Hafif overfitting (fark: {gap:.3f}). Modelin genelleme kalitesini kontrol edin.",
+            "message": R("mild_overfitting", lang, g=gap),
             "value": round(gap, 3),
         })
 
@@ -89,7 +93,7 @@ def evaluate_quality_gate(state: dict) -> dict:
         cols = [c["column_name"] for c in high_in_model]
         warnings.append({
             "code": "domain_leakage_high",
-            "message": f"Yüksek şüpheli leakage: {', '.join(cols)}. Tahminler güvenilir olmayabilir.",
+            "message": R("domain_leakage_high", lang, cols=", ".join(cols)),
             "details": high_in_model,
         })
 
@@ -99,7 +103,7 @@ def evaluate_quality_gate(state: dict) -> dict:
     if importance_suspects:
         warnings.append({
             "code": "importance_dominance",
-            "message": f"{len(importance_suspects)} feature anormal yüksek importance'a sahip.",
+            "message": R("importance_dominance", lang, n=len(importance_suspects)),
             "details": importance_suspects,
         })
 
@@ -116,21 +120,10 @@ def evaluate_quality_gate(state: dict) -> dict:
 
     if high_lock:
         feats = ", ".join(c["feature"] for c in high_lock)
-        if is_regression:
-            high_message = (
-                f"Olası veri sızıntısı: {feats}. "
-                f"Bu özellikler belirli aralıklarda hedefi dar bir bantta neredeyse tam belirliyor "
-                f"(hedefin varyansı çöküyor) — yani model 'tahmin' etmek yerine cevabı doğrudan "
-                f"görüyor olabilir. Gerçek kullanımda bu bilgi elde olmayabilir; bu özelliklerin "
-                f"çıkarılması önerilir."
-            )
-        else:
-            high_message = (
-                f"Olası veri sızıntısı: {feats}. "
-                f"Bu özellikler belirli aralıklarda sonucu neredeyse kesin belirliyor — "
-                f"yani model 'tahmin' etmek yerine cevabı doğrudan görüyor olabilir. "
-                f"Gerçek kullanımda bu bilgi elde olmayabilir; bu özelliklerin çıkarılması önerilir."
-            )
+        high_message = R(
+            "target_lock_high_reg" if is_regression else "target_lock_high_clf",
+            lang, f=feats,
+        )
         warnings.append({
             "code": "target_lock_leakage_high",
             "message": high_message,
@@ -138,20 +131,10 @@ def evaluate_quality_gate(state: dict) -> dict:
         })
     if low_lock:
         feats = ", ".join(c["feature"] for c in low_lock)
-        if is_regression:
-            low_message = (
-                f"Güçlü belirleyici özellik: {feats}. "
-                f"Hedefle güçlü ama tutarlı bir ilişkisi var (belirli aralıklarda varyansını "
-                f"kademeli azaltıyor) — bu genelde normaldir, sızıntı değil gerçek bir sinyaldir. "
-                f"Yine de gerçek kullanımda bu bilginin elde olacağından emin olun."
-            )
-        else:
-            low_message = (
-                f"Güçlü belirleyici özellik: {feats}. "
-                f"Sonuçla güçlü ama tutarlı bir ilişkisi var — bu genelde normaldir, "
-                f"sızıntı değil gerçek bir sinyaldir. Yine de gerçek kullanımda bu bilginin "
-                f"elde olacağından emin olun."
-            )
+        low_message = R(
+            "target_lock_low_reg" if is_regression else "target_lock_low_clf",
+            lang, f=feats,
+        )
         warnings.append({
             "code": "target_lock_signal_low",
             "message": low_message,
@@ -164,7 +147,7 @@ def evaluate_quality_gate(state: dict) -> dict:
     if rel_score < 50 and not failures:  # FAIL durumunda gereksiz
         warnings.append({
             "code": "low_reliability",
-            "message": f"Güvenilirlik skoru düşük ({rel_score}/100).",
+            "message": R("low_reliability", lang, s=rel_score),
             "value": rel_score,
         })
 
@@ -174,7 +157,7 @@ def evaluate_quality_gate(state: dict) -> dict:
         if mape > 60 and not failures:
             warnings.append({
                 "code": "high_mape",
-                "message": f"MAPE yüksek (%{mape:.1f}). Tahmin hataları büyük olabilir.",
+                "message": R("high_mape", lang, m=mape),
                 "value": round(mape, 1),
             })
 
@@ -195,21 +178,14 @@ def evaluate_quality_gate(state: dict) -> dict:
         if unique_count is not None and unique_count <= 1:
             warnings.append({
                 "code": "target_zero_variance",
-                "message": (
-                    f"Seçilen hedef '{target_col}' tek bir değerden oluşuyor (sıfır varyans) — "
-                    f"modellenecek bir değişkenlik yok."
-                ),
+                "message": R("target_zero_variance", lang, c=target_col),
                 "value": unique_count,
             })
         # 2) ID-vari — kardinalite ≈ satır sayısı (eşik feature_builder ile aynı: 0.95)
         elif unique_rate is not None and unique_rate > 0.95:
             warnings.append({
                 "code": "target_id_like",
-                "message": (
-                    f"Seçilen hedef '{target_col}' neredeyse tüm satırlarda benzersiz "
-                    f"(%{unique_rate*100:.0f}) — bir kimlik (ID) sütunu olabilir, "
-                    f"modelleme anlamlı olmayabilir."
-                ),
+                "message": R("target_id_like", lang, c=target_col, p=unique_rate * 100),
                 "value": round(unique_rate, 4),
             })
 
@@ -217,10 +193,7 @@ def evaluate_quality_gate(state: dict) -> dict:
         if null_rate is not None and null_rate > 0.50:
             warnings.append({
                 "code": "target_high_null",
-                "message": (
-                    f"Seçilen hedef '{target_col}' satırların %{null_rate*100:.0f}'inde boş — "
-                    f"yüksek eksik oranı modellemeyi güvenilmez kılabilir."
-                ),
+                "message": R("target_high_null", lang, c=target_col, p=null_rate * 100),
                 "value": round(null_rate, 4),
             })
 
@@ -229,24 +202,15 @@ def evaluate_quality_gate(state: dict) -> dict:
     if failures:
         status = "fail"
         severity = "critical"
-        summary = (
-            f"Model yetersiz — {len(failures)} kritik sorun tespit edildi. "
-            "Sonuçlar bu haliyle güvenilir değil; sorunlar giderilmeden kullanılmamalı."
-        )
+        summary = R("summary_fail", lang, n=len(failures))
     elif warnings:
         status = "warn"
         severity = "caution"
-        summary = (
-            f"Model çalışıyor ancak {len(warnings)} dikkat edilmesi gereken durum var. "
-            "Sonuçları kullanmadan önce kontrol edin."
-        )
+        summary = R("summary_warn", lang, n=len(warnings))
     else:
         status = "pass"
         severity = "ok"
-        summary = (
-            "Model güçlü performans gösteriyor. Dağıtımdan önce bağımsız "
-            "doğrulama ve sürekli izleme önerilir."
-        )
+        summary = R("summary_pass", lang)
 
     logger.info(f"\n[quality_gate] STATUS: {status.upper()}")
     logger.info(f"[quality_gate] {summary}")

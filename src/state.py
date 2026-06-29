@@ -31,6 +31,9 @@ class AgentState(TypedDict, total=False):
     time_col: str                    # timeseries için kronolojik split'te satırları sıralayan zaman sütunu
     entity_col: str                  # opsiyonel multi-entity gruplama sütunu — "" = GLOBAL (tek seri); dolu = grup-içi lag/rolling/split
 
+    # Rapor çıktı dili (UI dilinden gelir) — report_generator + quality_gate kullanır
+    report_language: str             # "tr" | "en" — boş/eksik → "tr" (mevcut müşteri varsayılanı)
+
     # Target Discovery Node output
     target_definition: dict          # Target definition for modeling
 
