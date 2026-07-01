@@ -89,4 +89,19 @@ class Settings:
     # Per-run override is possible via initial_state["domain_pack"].
     DOMAIN_PACK: str = os.getenv("DOMAIN_PACK", "none")
 
+    # ── Database Maintenance / Cleanup ────────────────────────────────────────
+    # Worker sürecinde çalışan (API'yi bloklamayan) periyodik temizlik görevi:
+    # şişen checkpoint tabloları (LangGraph), eski background_jobs, app_logs ve
+    # orphan cache satırlarını budar. İlk çalıştırmada bir kez de temizlik yapar.
+    MAINTENANCE_ENABLED: bool = os.getenv("MAINTENANCE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    MAINTENANCE_RUN_ON_STARTUP: bool = os.getenv("MAINTENANCE_RUN_ON_STARTUP", "true").strip().lower() in ("1", "true", "yes", "on")
+    MAINTENANCE_INTERVAL_HOURS: float = float(os.getenv("MAINTENANCE_INTERVAL_HOURS", "24"))
+    # Terminal (completed/failed) projelerin checkpoint'leri bu günden eskiyse silinir.
+    # Orphan (projesi silinmiş) thread'ler yaşına bakılmaksızın silinir.
+    CHECKPOINT_RETENTION_DAYS: int = int(os.getenv("CHECKPOINT_RETENTION_DAYS", "7"))
+    # Tamamlanmış/başarısız background_jobs bu günden eskiyse silinir.
+    JOB_RETENTION_DAYS: int = int(os.getenv("JOB_RETENTION_DAYS", "7"))
+    # app_logs retention (gün). 0/negatif → log budama atlanır.
+    LOG_RETENTION_DAYS: int = int(os.getenv("LOG_RETENTION_DAYS", "30"))
+
 settings = Settings()

@@ -23,6 +23,7 @@ Base.metadata.create_all(bind=engine)
 from api.routes.mcp import router as mcp_router
 from api.routes.csv import router as csv_router
 from api.routes.data_group import router as data_group_router
+from api.routes.data_viz import router as data_viz_router
 from api.routes.project import router as project_router
 from api.routes.auth import router as auth_router
 from api.routes.domain_pack import router as domain_pack_router
@@ -72,6 +73,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # ty
 app.add_middleware(SlowAPIMiddleware)
 
 app.include_router(data_group_router)
+app.include_router(data_viz_router)
 app.include_router(data_group_query_router)
 app.include_router(project_router)
 app.include_router(mcp_router)

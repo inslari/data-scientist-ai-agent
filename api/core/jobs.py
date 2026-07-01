@@ -27,3 +27,20 @@ def enqueue_ttd_suggestions(db: Session, data_group_id: int) -> None:
     except Exception as e:
         db.rollback()
         logger.info(f"[jobs] enqueue_ttd_suggestions başarısız (group {data_group_id}): {str(e)[:150]}")
+
+
+def enqueue_viz_suggestions(db: Session, data_group_id: int) -> None:
+    """
+    Bir data group için Data Visualization öneri kartlarını arka planda üretmek
+    üzere worker kuyruğuna iş ekler (best-effort; commit eden çağırandır).
+    """
+    try:
+        db.add(BackgroundJobModel(
+            task_type="generate_viz_suggestions",
+            data_group_id=data_group_id,
+            status="pending",
+        ))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.info(f"[jobs] enqueue_viz_suggestions başarısız (group {data_group_id}): {str(e)[:150]}")

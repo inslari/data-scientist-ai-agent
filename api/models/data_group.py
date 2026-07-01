@@ -23,6 +23,10 @@ class DataGroupModel(Base):
     # üretilir). NULL = henüz üretilmedi → UI boş liste gösterir. list[str].
     ttd_suggestions = Column(JSON, nullable=True)
 
+    # Data Visualization öneri kartları (LLM ile arka planda üretilir).
+    # NULL = henüz üretilmedi. list[dict]: {title, description, chart_type, x, y, agg}.
+    viz_suggestions = Column(JSON, nullable=True)
+
     # Domain (sector) pack for this dataset. Used by Talk-to-Data chat and as the
     # fallback for projects on this data group. NULL/empty = global DOMAIN_PACK.
     domain_pack = Column(String, nullable=True)
@@ -36,6 +40,7 @@ class DataGroupModel(Base):
     csv_files = relationship("CSVFileModel", back_populates="data_group", cascade="all, delete-orphan")
     projects = relationship("ProjectModel", back_populates="data_group")
     chat_messages = relationship("ChatMessageModel", back_populates="data_group", cascade="all, delete-orphan", order_by="ChatMessageModel.created_at")
+    visualizations = relationship("VisualizationModel", back_populates="data_group", cascade="all, delete-orphan", order_by="VisualizationModel.created_at")
     user = relationship("UserModel")
 
 
@@ -57,3 +62,24 @@ class ChatMessageModel(Base):
 
     # Relationship back to DataGroup
     data_group = relationship("DataGroupModel", back_populates="chat_messages")
+
+
+class VisualizationModel(Base):
+    """
+    Data Visualization sayfasında üretilen bir grafiğin kalıcı kaydı (galeri geçmişi).
+    matplotlib PNG'si base64 olarak image_b64'te saklanır; chart varsa interaktif payload.
+    """
+    __tablename__ = "visualizations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    data_group_id = Column(Integer, ForeignKey("data_groups.id"), index=True)
+    created_at = Column(Integer, index=True)
+
+    user_query = Column(String, nullable=True)     # serbest istek ya da seçilen kart başlığı
+    spec = Column(JSON, nullable=True)              # _VizSpec.model_dump()
+    image_b64 = Column(Text, nullable=True)         # matplotlib PNG (base64)
+    chart = Column(JSON, nullable=True)             # recharts payload | None
+    sql = Column(String, nullable=True)
+    summary = Column(String, nullable=True)         # NL yorum
+
+    data_group = relationship("DataGroupModel", back_populates="visualizations")

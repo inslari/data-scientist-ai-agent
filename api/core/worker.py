@@ -54,6 +54,45 @@ async def job_worker_loop() -> None:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
+async def maintenance_loop() -> None:
+    """
+    DB bakım/temizlik döngüsü — job_worker_loop ile YAN YANA (ayrı asyncio task)
+    çalışır; API'yi bloklamaz. Açılışta bir kez (opsiyonel) + periyodik olarak
+    şişen checkpoint/cache/log/job tablolarını budar.
+
+    Ağır DELETE'ler senkron olduğundan asyncio.to_thread ile ayrı thread'de koşar;
+    böylece job polling event loop'u serbest kalır.
+    """
+    if not settings.MAINTENANCE_ENABLED:
+        logger.info("[maintenance] Devre dışı (MAINTENANCE_ENABLED=false).")
+        return
+
+    interval = max(float(settings.MAINTENANCE_INTERVAL_HOURS), 0.1) * 3600.0
+    logger.info(f"[maintenance] Bakım döngüsü başladı (her {settings.MAINTENANCE_INTERVAL_HOURS}s aralık).")
+
+    if settings.MAINTENANCE_RUN_ON_STARTUP:
+        await _run_maintenance_safe()
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            await _run_maintenance_safe()
+        except asyncio.CancelledError:
+            logger.info("[maintenance] Bakım görevi iptal edildi — kapanıyor.")
+            break
+        except Exception as exc:
+            logger.error(f"[maintenance] Bakım döngüsünde beklenmeyen hata: {exc}")
+
+
+async def _run_maintenance_safe() -> None:
+    """run_maintenance'ı ayrı thread'de çağırır; hatayı yutar (döngü ölmesin)."""
+    try:
+        from src.services.db_maintenance import run_maintenance
+        await asyncio.to_thread(run_maintenance)
+    except Exception as exc:
+        logger.error(f"[maintenance] run_maintenance başarısız: {exc}")
+
+
 async def _process_next_job() -> None:
     """
     Picks the oldest pending job, marks it as running, and executes it.
@@ -104,6 +143,8 @@ async def _execute_job(job: BackgroundJobModel) -> None:
         await _run_project_job(job)
     elif job.task_type == "generate_ttd_suggestions":
         await _generate_ttd_suggestions_job(job)
+    elif job.task_type == "generate_viz_suggestions":
+        await _generate_viz_suggestions_job(job)
     else:
         _mark_job(job.id, "failed", f"Unknown task_type: {job.task_type}")
 
@@ -152,6 +193,53 @@ async def _generate_ttd_suggestions_job(job: BackgroundJobModel) -> None:
     except Exception as e:
         db.rollback()
         logger.info(f"[Worker] TTD öneri kaydı başarısız (group {data_group_id}): {str(e)[:200]}")
+    finally:
+        db.close()
+
+    _mark_job(job.id, "completed")
+
+
+async def _generate_viz_suggestions_job(job: BackgroundJobModel) -> None:
+    """
+    Bir data group için Data Visualization öneri kartlarını üretir ve
+    DataGroupModel.viz_suggestions kolonuna yazar. Best-effort (boş liste kabul edilir).
+    """
+    data_group_id = job.data_group_id
+    if not data_group_id:
+        _mark_job(job.id, "failed", "generate_viz_suggestions: data_group_id missing")
+        return
+
+    db = SessionLocal()
+    try:
+        dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+        if not dg:
+            _mark_job(job.id, "failed", f"Data group {data_group_id} not found")
+            return
+        user_id = dg.user_id
+    finally:
+        db.close()
+
+    suggestions: list[dict] = []
+    try:
+        from src.services.viz_suggestion_generator import generate_viz_suggestions
+        db = SessionLocal()
+        try:
+            suggestions = await generate_viz_suggestions(data_group_id, db, user_id)
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"[Worker] Viz öneri üretimi hata (group {data_group_id}): {str(e)[:200]}")
+
+    db = SessionLocal()
+    try:
+        dg = db.query(DataGroupModel).filter(DataGroupModel.id == data_group_id).first()
+        if dg:
+            dg.viz_suggestions = suggestions
+            db.commit()
+            logger.info(f"[Worker] Viz önerileri kaydedildi (group {data_group_id}): {len(suggestions)} adet")
+    except Exception as e:
+        db.rollback()
+        logger.info(f"[Worker] Viz öneri kaydı başarısız (group {data_group_id}): {str(e)[:200]}")
     finally:
         db.close()
 

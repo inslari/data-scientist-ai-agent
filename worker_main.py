@@ -15,7 +15,7 @@ from api.models.user import UserModel
 from api.models.mcp import MCPConfigModel
 from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # table auto-created via create_all
 from api.models.log_entry import LogEntryModel  # app_logs table — DB logging hedefi
-from api.core.worker import job_worker_loop
+from api.core.worker import job_worker_loop, maintenance_loop
 
 def recover_interrupted_jobs():
     """
@@ -72,9 +72,22 @@ def main():
         import sys
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        asyncio.run(job_worker_loop())
+        asyncio.run(_run_loops())
     except KeyboardInterrupt:
         print("\n[Worker Process] Shutting down cleanly due to KeyboardInterrupt.")
+
+
+async def _run_loops():
+    """
+    Job işleme döngüsü + DB bakım döngüsünü aynı event loop'ta yan yana çalıştırır.
+    maintenance_loop ağır işleri ayrı thread'e attığı için job polling'i bloklamaz.
+    Bakım görevi çökse bile job döngüsü ayakta kalır (return_exceptions).
+    """
+    await asyncio.gather(
+        job_worker_loop(),
+        maintenance_loop(),
+        return_exceptions=True,
+    )
 
 if __name__ == "__main__":
     main()
