@@ -27,6 +27,9 @@ class DataGroupResponse(DataGroupBase):
     # Talk-to-Data örnek soru önerileri. None/[] = henüz üretilmedi → UI boş gösterir.
     ttd_suggestions: Optional[List[str]] = None
 
+    # Data Visualization öneri kartları. None/[] = henüz üretilmedi → UI boş gösterir.
+    viz_suggestions: Optional[List[dict]] = None
+
     model_config = ConfigDict(from_attributes=True)
 
 

@@ -79,6 +79,11 @@ with engine.connect() as conn:
         print("Adding 'ttd_suggestions' column to 'data_groups'...")
         conn.execute(text("ALTER TABLE data_groups ADD COLUMN ttd_suggestions JSON"))
 
+    # Data Visualization öneri kartları (LLM ile arka planda üretilir)
+    if "viz_suggestions" not in data_group_cols:
+        print("Adding 'viz_suggestions' column to 'data_groups'...")
+        conn.execute(text("ALTER TABLE data_groups ADD COLUMN viz_suggestions JSON"))
+
     # Rapor dili — run anında UI'dan job'a yazılır (tr|en)
     if "language" not in job_cols:
         print("Adding 'language' column to 'background_jobs'...")
@@ -103,5 +108,24 @@ with engine.connect() as conn:
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_data_group_queries_data_group_id ON data_group_queries (data_group_id)"))
     conn.commit()
 print("Table 'data_group_queries' ensured.")
+
+# Create visualizations table (Data Visualization gallery, idempotent)
+with engine.connect() as conn:
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS visualizations (
+            id SERIAL PRIMARY KEY,
+            data_group_id INTEGER NOT NULL REFERENCES data_groups(id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL,
+            user_query VARCHAR,
+            spec JSON,
+            image_b64 TEXT,
+            chart JSON,
+            sql TEXT,
+            summary TEXT
+        )
+    """))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_visualizations_data_group_id ON visualizations (data_group_id)"))
+    conn.commit()
+print("Table 'visualizations' ensured.")
 
 print("Migration completed.")

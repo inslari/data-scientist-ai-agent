@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from typing import List
 
 from api.core.database import get_db, DATA_DIR
-from api.core.jobs import enqueue_ttd_suggestions
+from api.core.jobs import enqueue_ttd_suggestions, enqueue_viz_suggestions
 from api.core.storage import storage
 from api.models.csv import CSVFileModel
 from api.models.data_group import DataGroupModel
@@ -140,6 +140,7 @@ async def upload_csv(
     # dosya yüklendiyse, Talk-to-Data örnek sorularını arka planda üret.
     if not data_group_id and uploaded_files:
         enqueue_ttd_suggestions(db, data_group.id)
+        enqueue_viz_suggestions(db, data_group.id)
 
     return {
         "status": "success" if uploaded_files else "error",
