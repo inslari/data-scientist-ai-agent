@@ -69,6 +69,41 @@ class Settings:
     INTELLIGENCE_ENGINE_MODEL: str = os.getenv("INTELLIGENCE_ENGINE_MODEL", "gpt-4o")
     DEFAULT_TEMPERATURE: float = 0.0
 
+    # ── LLM reliability primitives (C1) ───────────────────────────────────────
+    # Every get_llm() instance carries these so a single transient 429/500/timeout
+    # is retried by the provider SDK (exponential backoff) instead of aborting a
+    # multi-minute job. Applied via each provider's native constructor params so
+    # the returned object stays a BaseChatModel (callers still use
+    # .with_structured_output / create_agent on it).
+    LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "3"))
+    LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "60"))
+    # 0/negatif → cap uygulanmaz (yapısal JSON çıktısını kesmemek için varsayılan 0).
+    LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "0"))
+
+    # Tool-using expert council + synthesizer model tier (H2). Multi-step ReAct
+    # reasoning degrades on a mini model; route the council to the heavier
+    # intelligence-engine model by default. Falls back to INTELLIGENCE_ENGINE_*.
+    COUNCIL_MODEL: str = os.getenv("COUNCIL_MODEL", os.getenv("INTELLIGENCE_ENGINE_MODEL", "gpt-4o"))
+    COUNCIL_PROVIDER: str = os.getenv("COUNCIL_PROVIDER", os.getenv("INTELLIGENCE_ENGINE_PROVIDER", os.getenv("LLM_PROVIDER", "openai")))
+
+    # ── Cost / token accounting + budget (C3) ─────────────────────────────────
+    # A LangChain callback records usage_metadata per call into the llm_usage
+    # table (keyed by project_id). ENABLE_LLM_USAGE_TRACKING toggles recording;
+    # LLM_TOKEN_BUDGET (>0) aborts a run once cumulative tokens exceed the cap.
+    ENABLE_LLM_USAGE_TRACKING: bool = os.getenv("ENABLE_LLM_USAGE_TRACKING", "true").strip().lower() in ("1", "true", "yes", "on")
+    LLM_TOKEN_BUDGET: int = int(os.getenv("LLM_TOKEN_BUDGET", "0"))
+
+    # ── Merchant/Domain council gating (H1) ───────────────────────────────────
+    # The expensive concurrent council only adds value on the intents that
+    # consume its findings (feature engineering / interpretation). Plain SQL, EDA
+    # and report intents skip it. Comma-separated intent allow-list.
+    COUNCIL_INTENTS: set = {
+        s.strip() for s in os.getenv(
+            "COUNCIL_INTENTS",
+            "classification,regression,clustering,deep_analysis",
+        ).split(",") if s.strip()
+    }
+
     # Ollama generation limits. The defaults (num_ctx=2048, capped num_predict)
     # are far too small for schema-analysis prompts + their large JSON output:
     # the prompt overflows the context window (→ empty response) or the JSON is

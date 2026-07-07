@@ -11,6 +11,7 @@ from api.models.job import BackgroundJobModel  # Must be imported so the table i
 from api.models.data_group_query import DataGroupQueryModel  # Must be imported so the table is created
 from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # Must be imported so the table is created
 from api.models.log_entry import LogEntryModel  # Must be imported so the app_logs table is created
+from api.models.llm_usage import LLMUsageModel  # Must be imported so the llm_usage table is created (C3)
 
 # Yapısal logging — süreç başında bir kez. API'de DB logging varsayılan kapalı
 # (LOG_DB_ENABLED=true ile açılabilir); tablo yine create_all ile oluşur.

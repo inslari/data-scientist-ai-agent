@@ -84,6 +84,14 @@ async def get_data_group_schema_logic(group_id: int, db: Session, user_id: int):
     raise HTTPException(status_code=400, detail="Unknown source type")
 
 async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Session, user_id: int):
+    # Central read-only guard (C2): this is the shared choke point for both graphs'
+    # agent-generated SQL and the user-facing query endpoint. Enforcing here also
+    # covers the CSV/DuckDB path, which otherwise executed arbitrary SQL unguarded.
+    from src.core.sql_safety import validate_read_only
+    ok, reason = validate_read_only(req.query)
+    if not ok:
+        return {"status": "error", "result": f"Rejected: {reason}"}
+
     db_group = db.query(DataGroupModel).filter(DataGroupModel.id == group_id, DataGroupModel.user_id == user_id).first()
     if not db_group:
         raise HTTPException(status_code=404, detail="Data group not found")

@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from ..state import AgentState
 from ..core.llm import get_llm
 from ..core.prompt_loader import create_chat_prompt
+from ..core.structured import invoke_structured
 from ..schemas.feature_plan_schemas import FeaturePlan
 from ..domains import get_active_pack
 from ..domains.base import MerchantContext, trim_doc
@@ -54,7 +55,6 @@ def feature_plan_node(state: AgentState) -> AgentState:
 
     model_name = os.getenv("LLM_MODEL_NAME", "gpt-4o")
     llm = get_llm(model_name=model_name, temperature=0)
-    structured_llm = llm.with_structured_output(FeaturePlan)
 
     target_hint = ""
     if target_def_initial.get("column_name"):
@@ -117,9 +117,7 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
         )
         logger.info("[feature_plan] Dataset domain_doc feature plan'a eklendi.")
 
-    chain = FEATURE_PLAN_PROMPT | structured_llm
-
-    plan: FeaturePlan = chain.invoke({  # type: ignore[assignment]
+    prompt_value = FEATURE_PLAN_PROMPT.invoke({
         "user_query": user_query,
         "intent": intent,
         "tables_summary": tables_summary,
@@ -129,6 +127,9 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
         "domain_hint": domain_hint,
         "domain_doc": domain_doc,
     })
+
+    # Structured output with a text-parser fallback (C1/H4).
+    plan: FeaturePlan = invoke_structured(llm, prompt_value, FeaturePlan)
 
     # ── Post-processing: Dinamik target validation ────────────────────────────
     # LLM'in hedef kolon seçimini hem target_discovery_node önerisi

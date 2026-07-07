@@ -3,6 +3,7 @@ from ..state import AgentState
 from ..core.llm import get_llm
 from ..core.config import settings
 from ..core.prompt_loader import create_chat_prompt
+from ..core.structured import invoke_structured
 from ..schemas.intent_schemas import IntentResult
 from ..domains import get_active_pack
 
@@ -58,16 +59,16 @@ def intent_node(state: AgentState) -> AgentState:
         }
 
     llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
-    structured_llm = llm.with_structured_output(IntentResult)
 
     INTENT_PROMPT = create_chat_prompt(
         "intent_discovery.md", "Kullanıcı sorusu: {user_query}\n\n{domain_context}"
     )
-    chain = INTENT_PROMPT | structured_llm
-
-    result: IntentResult = chain.invoke(  # type: ignore[assignment]
+    prompt_value = INTENT_PROMPT.invoke(
         {"user_query": state["user_query"], "domain_context": domain_context or ""}
     )
+
+    # Structured output with a text-parser fallback (C1/H4).
+    result: IntentResult = invoke_structured(llm, prompt_value, IntentResult)
 
     return {
         "intent": result.intent,

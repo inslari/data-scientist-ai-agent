@@ -474,6 +474,13 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                 db_s.close()
 
     # --- Setup saver and run ---
+    # Token usage accounting + per-run budget (C3): the tracker is active for the
+    # whole graph run (get_llm's callback records into it, incl. the council's
+    # asyncio.gather children, which inherit this context), and flushes aggregated
+    # llm_usage rows on exit.
+    from src.core.llm_usage import track_usage
+    _usage = track_usage(project_id)
+    _usage.__enter__()
     try:
         if is_postgres:
             from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -530,6 +537,13 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                     db_s.commit()
             finally:
                 db_s.close()
+
+    finally:
+        # Flush aggregated token usage for this run (best-effort; never masks the job result).
+        try:
+            _usage.__exit__(None, None, None)
+        except Exception as _flush_err:  # pragma: no cover - defensive
+            logger.warning(f"[Worker] llm_usage flush failed for project {project_id}: {_flush_err}")
 
     _mark_job(job.id, "failed" if error_trace else "completed", error_trace)
 

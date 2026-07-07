@@ -35,7 +35,15 @@ class SqlToolTest(unittest.TestCase):
         tool = make_sql_tool(data_group_id=1, user_id=1)
         out = asyncio.run(tool.ainvoke({"sql": "DROP TABLE t"}))
         self.assertIn("ERROR", out)
-        self.assertIn("read-only", out)
+        self.assertIn("DROP", out)
+
+    def test_rejects_stacked_statement(self):
+        # The prefix-only guard used to let a SELECT-prefixed stacked statement
+        # through; the sqlparse guard rejects multi-statement SQL (C2).
+        tool = make_sql_tool(data_group_id=1, user_id=1)
+        out = asyncio.run(tool.ainvoke({"sql": "SELECT 1; DROP TABLE t"}))
+        self.assertIn("ERROR", out)
+        self.assertIn("Multiple statements", out)
 
 
 class ExtractFindingTest(unittest.TestCase):

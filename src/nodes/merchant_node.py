@@ -6,6 +6,7 @@ from langchain_core.runnables import RunnableConfig
 
 from src.state import AgentState
 from src.domains import get_active_pack
+from src.core.config import settings
 
 from src.core.logging_config import get_logger
 logger = get_logger(__name__)
@@ -56,6 +57,18 @@ async def merchant_intelligence_node(state: AgentState, config: RunnableConfig) 
 
     pack = get_active_pack(state.get("domain_pack"))
     if pack.name == "none":
+        return {"current_step": "merchant_intelligence_node"}
+
+    # Council gating (H1): the concurrent expert council + synthesizer is expensive
+    # and only the ML/analysis intents consume its findings (feature engineering,
+    # interpretation). Plain SQL / EDA / report questions skip it entirely instead
+    # of paying for the full council before routing.
+    intent = state.get("intent", "eda")
+    if intent not in settings.COUNCIL_INTENTS:
+        logger.info(
+            f"[merchant_node] intent='{intent}' konsey kapsamı dışında "
+            f"({sorted(settings.COUNCIL_INTENTS)}); konsey atlanıyor."
+        )
         return {"current_step": "merchant_intelligence_node"}
 
     data_group_id = config.get("configurable", {}).get("data_group_id")

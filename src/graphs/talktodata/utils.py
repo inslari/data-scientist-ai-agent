@@ -106,54 +106,8 @@ def _infer_chart_from_text(text: str, columns: list, user_query: str):
     title = user_query[:60] if user_query else "Query Results"
     return _ChartConfig(type=ctype, x=x_col, y=y_col, title=title)
 
-class _StructuredJsonParser(BaseOutputParser):
-    """
-    Robust parser that handles LLMs which:
-    - Return raw text instead of JSON
-    - Wrap JSON in markdown code fences
-    - Return plain text (handled via fallback_field)
-    - Use wrong field names (handled by model_validators above)
-    """
-    pydantic_object: type
-    fallback_field: Optional[str] = None  # If set, plain-text responses are wrapped as {fallback_field: text}
-
-    class Config:
-        arbitrary_types_allowed = True
-
-    def parse(self, text: str):
-        text = text.strip()
-        # Strip markdown code fences
-        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-        if fence_match:
-            text = fence_match.group(1).strip()
-        # Try to find a JSON object in the text
-        json_match = re.search(r"\{[\s\S]*\}", text)
-        if json_match:
-            try:
-                data = json.loads(json_match.group(0))
-                return self.pydantic_object.model_validate(data)
-            except (json.JSONDecodeError, Exception):
-                pass  # Fall through to plain-text handling
-        # No JSON found — use fallback_field if configured
-        if self.fallback_field:
-            return self.pydantic_object.model_validate({self.fallback_field: text})
-        raise ValueError(f"No JSON object found in LLM output: {text[:200]}")
-
-    def get_format_instructions(self) -> str:
-        from langchain_core.output_parsers import PydanticOutputParser
-        return PydanticOutputParser(pydantic_object=self.pydantic_object).get_format_instructions()
-
-def _parse_with_fallback(llm, prompt_value, pydantic_cls, fallback_field: Optional[str] = None):
-    """
-    Try with_structured_output first, fall back to _StructuredJsonParser.
-    Returns an instance of pydantic_cls.
-    """
-    try:
-        return (prompt_value | llm.with_structured_output(pydantic_cls)).invoke({})
-    except Exception as e1:
-        logger.error(f"[TTD] with_structured_output failed ({type(e1).__name__}), trying text parser")
-        raw_text = llm.invoke(prompt_value).content
-        return _StructuredJsonParser(
-            pydantic_object=pydantic_cls,
-            fallback_field=fallback_field,
-        ).parse(raw_text)
+# The structured-output parser + fallback helper now live in src.core.structured
+# so the main pipeline shares one implementation (H4). Kept under the old private
+# names here so the TTD nodes that import them keep working unchanged.
+from src.core.structured import StructuredJsonParser as _StructuredJsonParser  # noqa: E402,F401
+from src.core.structured import invoke_structured as _parse_with_fallback  # noqa: E402,F401

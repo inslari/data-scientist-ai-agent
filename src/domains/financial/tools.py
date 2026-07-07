@@ -14,12 +14,14 @@ from __future__ import annotations
 
 from langchain_core.tools import tool
 
+from src.core.sql_safety import validate_read_only
+
 _MAX_RESULT_CHARS = 3000
 
 
 def _is_read_only(sql: str) -> bool:
-    head = sql.strip().lstrip("(").upper()
-    return head.startswith("SELECT") or head.startswith("WITH")
+    ok, _ = validate_read_only(sql)
+    return ok
 
 
 def make_sql_tool(data_group_id: int, user_id: int):
@@ -37,8 +39,9 @@ def make_sql_tool(data_group_id: int, user_id: int):
         min/max/avg, null rates, and class balance. Only SELECT / WITH queries are
         allowed. Prefer aggregate queries and always add a LIMIT when selecting raw rows.
         """
-        if not sql or not _is_read_only(sql):
-            return "ERROR: Only read-only SELECT/WITH queries are allowed."
+        ok, reason = validate_read_only(sql)
+        if not ok:
+            return f"ERROR: {reason}"
 
         # Imported lazily to avoid import cycles at module load.
         from api.core.database import SessionLocal

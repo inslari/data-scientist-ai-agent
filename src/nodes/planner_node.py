@@ -3,6 +3,7 @@ from ..state import AgentState
 from ..core.llm import get_llm
 from ..core.config import settings
 from ..core.prompt_loader import create_chat_prompt
+from ..core.structured import invoke_structured
 from ..schemas.planner_schemas import AnalysisPlan
 
 
@@ -12,7 +13,6 @@ def planner_node(state: AgentState) -> AgentState:
     Node 3: Takes the database intelligence and user query as input and produces an analysis plan.
     """
     llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
-    structured_llm = llm.with_structured_output(AnalysisPlan)
 
     db_intelligence = state.get("db_intelligence", {})
     intent = state.get("intent", "eda")
@@ -22,14 +22,16 @@ def planner_node(state: AgentState) -> AgentState:
     tables_summary = _summarize_db_intelligence(db_intelligence, relevant_tables)
 
     PLANNER_PROMPT = create_chat_prompt("planner_system.md", "planner_human.md")
-    chain = PLANNER_PROMPT | structured_llm
-
-    result: AnalysisPlan = chain.invoke({  # type: ignore[assignment]
+    prompt_value = PLANNER_PROMPT.invoke({
         "user_query": user_query,
         "intent": intent,
         "relevant_tables": relevant_tables,
         "tables_summary": tables_summary
     })
+
+    # Structured output with a text-parser fallback (C1/H4): a parse failure on a
+    # weaker model degrades gracefully instead of aborting the whole run.
+    result: AnalysisPlan = invoke_structured(llm, prompt_value, AnalysisPlan)
 
     plan = sorted(
         [step.model_dump() for step in result.steps],
