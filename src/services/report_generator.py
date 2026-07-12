@@ -33,6 +33,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.core.config import settings
 from src.state import AgentState
 from src.core.prompt_loader import load_prompt
+from src.core.feature_naming import humanize_feature
 from src.core.report_i18n import (
     normalize_lang,
     LANGUAGE_NAME,
@@ -73,6 +74,28 @@ def _overfitting_scores(ovf: dict) -> tuple[Any, Any, str]:
     if ovf.get("train_r2") is not None:
         return ovf.get("train_r2"), ovf.get("test_r2"), "Train"
     return None, None, ""
+
+
+def _plainify_rec(rec: str) -> str:
+    """Profiling önerisindeki iç işleme jargonunu (RobustScaler, IQR capping,
+    one-hot/label/target encoding, log/sqrt transform) genel kullanıcı için sade
+    ETKİYE çevirir. Metod adı LLM'e hiç verilmez → rapora sızamaz (deterministik).
+    Sol taraf (kolon + sorun) korunur; '→ metod' kuyruğu sade etkiyle değiştirilir."""
+    if "→" not in rec:
+        return rec
+    left, right = rec.split("→", 1)
+    r = right.lower()
+    if "encoding" in r or "one-hot" in r or "one hot" in r:
+        eff = "kategoriler sayıya çevrildi"
+    elif "transform" in r or "log" in r or "sqrt" in r:
+        eff = "çarpık dağılım dengelendi"
+    elif "scaler" in r or "capping" in r or "outlier" in r or "iqr" in r:
+        eff = "uç değerler dengelendi"
+    elif "drop" in r or "çıkar" in r:
+        eff = "kolon modelden çıkarıldı"
+    else:
+        return left.strip()
+    return f"{left.strip()} → {eff}"
 
 
 def _build_context(state: AgentState, lang: str = "tr") -> str:
@@ -147,7 +170,7 @@ def _build_context(state: AgentState, lang: str = "tr") -> str:
         )
         if recs:
             for r in recs[:5]:
-                lines.append(f"  - {r}")
+                lines.append(f"  - {_plainify_rec(r)}")
         lines.append("")
 
     # feature plan
@@ -281,7 +304,7 @@ def _build_context(state: AgentState, lang: str = "tr") -> str:
             lines.append("### En Etkili Özellikler (Anomali Sürücleri)")
             total_imp = sum(fi_anom.values()) or 1
             for feat, imp in list(fi_anom.items())[:8]:
-                lines.append(f"  - {feat}: %{imp/total_imp*100:.1f}")
+                lines.append(f"  - {humanize_feature(feat, lang)}: %{imp/total_imp*100:.1f}")
             lines.append("")
 
     else:
@@ -314,7 +337,10 @@ def _build_context(state: AgentState, lang: str = "tr") -> str:
                 lines.append(f"  - {k}: {v}")
 
             if ci:
-                lines.append("\n### Bootstrap Güven Aralıkları (%95)")
+                lines.append(
+                    "\n### Güven Aralığı (%95)\n"
+                    "  (skorun tekrarlı örneklemeyle ne kadar oynadığı — dar aralık = sonuç güvenilir/kararlı)"
+                )
                 for metric, vals in ci.items():
                     lines.append(f"  - {metric}: {vals['mean']} [{vals['lower']} — {vals['upper']}]")
             else:
@@ -322,24 +348,35 @@ def _build_context(state: AgentState, lang: str = "tr") -> str:
 
             disp_s, test_s, ovf_label = _overfitting_scores(ovf)
             if ovf and disp_s is not None:
+                _is_cv = str(ovf_label).upper().startswith("CV")
                 ovf_lines = (
-                    f"\n### Overfitting\n"
+                    f"\n### Genelleme (CV çapraz-doğrulama vs Test)\n"
                     f"  - {ovf_label}: {disp_s} | Test: {test_s}\n"
                     f"  - Fark ({ovf_label}−Test): {ovf.get('gap')} | Durum: {ovf.get('status')}\n"
                     f"  - {ovf.get('description')}"
                 )
-                # CV gösteriliyorsa train (resubstitution) bilgi notu — ezber skoru, genelleme değil
+                if _is_cv:
+                    ovf_lines += (
+                        f"\n  - OVERFIT DEĞERLENDİRMESİ: SADECE bu {ovf_label}−Test farkına bak. "
+                        f"Fark küçükse model iyi genelleşiyordur; 'overfit var' YAZMA."
+                    )
+                # Train (resubstitution) skoru varsa: OVERFIT GÖSTERGESİ DEĞİL — LLM'i uyar.
                 _tr = ovf.get("train_score", ovf.get("train_r2"))
-                if ovf_label == "CV (5-fold)" and _tr is not None:
-                    ovf_lines += f"\n  - Not: Train (resubstitution) {_tr} — ezber skoru, genelleme göstergesi değil."
+                if _tr is not None:
+                    ovf_lines += (
+                        f"\n  - ÖNEMLİ: Train skoru {_tr} yapısal olarak yüksektir "
+                        f"(CV-tabanlı ensemble modelinde ~%99 normaldir) ve OVERFIT GÖSTERGESİ DEĞİLDİR. "
+                        f"Train ile Test'i KARŞILAŞTIRMA; overfit kararını yalnızca CV−Test farkına göre ver."
+                    )
                 lines.append(ovf_lines)
             else:
-                lines.append("\n*Overfitting analizi bu çalışmada uygulanmadı.*")
+                lines.append("\n*Genelleme (overfit) analizi bu çalışmada uygulanmadı.*")
 
             if cal and isinstance(cal, dict) and cal.get('brier_score') is not None:
                 lines.append(
-                    f"\n### Kalibrasyon\n"
-                    f"  - Brier Score: {cal.get('brier_score')}\n"
+                    f"\n### Olasılık Güvenilirliği (kalibrasyon)\n"
+                    f"  - Brier Score: {cal.get('brier_score')} "
+                    f"(olasılık tahminlerinin ne kadar gerçekçi olduğu; 0'a yakın = güvenilir)\n"
                     f"  - İyi kalibre: {cal.get('is_well_calibrated')}"
                 )
             else:
@@ -354,14 +391,20 @@ def _build_context(state: AgentState, lang: str = "tr") -> str:
                 )
                 feat_diff = err.get("feature_distribution_diff", {})
                 if feat_diff:
-                    lines.append("  - En farklı feature'lar (Cohen's d):")
+                    lines.append(
+                        "  - Hatalı vakaların doğru vakalardan en çok ayrıştığı özellikler "
+                        "(fark büyüklüğü — Cohen's d: 0.2 küçük, 0.5 orta, 0.8 büyük fark):"
+                    )
                     for feat, info in list(feat_diff.items())[:3]:
-                        lines.append(f"      {feat}: d={info['cohens_d']} ({info['effect_magnitude']})")
+                        lines.append(f"      {humanize_feature(feat, lang)}: fark={info['cohens_d']} ({info['effect_magnitude']})")
 
             if shap and shap.get("top5_shap_features"):
-                lines.append("\n### SHAP (Açıklanabilir AI)")
+                lines.append(
+                    "\n### Modelin Kararında En Etkili Özellikler\n"
+                    "  (her özelliğin tahmine katkı payı — SHAP yöntemiyle hesaplandı)"
+                )
                 for feat, pct in list(shap.get("top5_shap_features", {}).items())[:5]:
-                    lines.append(f"  - {feat}: %{pct}")
+                    lines.append(f"  - {humanize_feature(feat, lang)}: %{pct}")
             else:
                 lines.append("\n*SHAP açıklanabilirlik analizi bu çalışmada hesaplanmadı.*")
 
@@ -391,7 +434,10 @@ def _build_context(state: AgentState, lang: str = "tr") -> str:
                 lines.append("\n*Adalet/yanlılık analizi bu veri setinde uygulanmadı (demografik etiket yok).*")
 
             if opt_thresh:
-                lines.append(f"\n- Optimal Threshold (Youden's J): {opt_thresh}")
+                lines.append(
+                    f"\n- En dengeli karar eşiği: {opt_thresh} "
+                    f"(varsayılan 0.5 yerine; doğru yakalama ile yanlış alarm arasında en iyi dengeyi kurar)"
+                )
 
             if rel and rel.get('score') is not None:
                 lines.append(
@@ -555,6 +601,37 @@ def generate_report(state: AgentState) -> dict:
     # dizeler ve LLM çıktısı bu dile göre üretilir.
     lang = normalize_lang(state.get("report_language"))
 
+    # Veri Kalitesi (Katman 2) hard-fail → aksiyona dönük özel rapor.
+    # Generic 'error'/'0 satır' yolundan ÖNCE: kullanıcı NE bozuldu / KAÇ satır
+    # atlandı görsün (TR/EN). Bkz. src/services/data_quality.py.
+    if state.get("data_quality_status") == "failed":
+        dqr = state.get("data_quality_report", {}) or {}
+        reason = (dqr.get("decision", {}) or {}).get("reason", "")
+        q = dqr.get("quarantine", {}) or {}
+        th = dqr.get("target_health", {}) or {}
+        struct = dqr.get("structural", {}) or {}
+        _tables = struct.get("tables", []) or []
+        cols = _tables[0].get("expected_cols", "?") if _tables else struct.get("expected_cols", "?")
+
+        parts = [R("dq_failed_title", lang), "", R("dq_failed_intro", lang), ""]
+        if reason == "target_role_content_conflict":
+            parts.append(R("dq_target_conflict", lang,
+                           col=th.get("target", "?"), nunique=th.get("nunique", "?")))
+        elif reason == "structural_mismatch_high":
+            parts.append(R("dq_structural_high", lang,
+                           n=q.get("rows", 0), total=q.get("total", 0),
+                           rate=f"%{q.get('mismatch_rate', 0) * 100:.1f}", cols=cols))
+        elif reason == "structural_mismatch_target":
+            parts.append(R("dq_structural", lang,
+                           n=q.get("rows", 0), total=q.get("total", 0), cols=cols))
+        parts.append(R("dq_action_hint", lang))
+        logger.warning(f"[report] Veri kalitesi hard-fail: reason='{reason}'")
+        return {
+            **state,
+            "report": "\n".join(parts),
+            "current_step": "report_node",
+        }
+
     # Check for pipeline errors first
     if state.get("error"):
         error_msg = state.get("error")
@@ -653,6 +730,42 @@ def generate_report(state: AgentState) -> dict:
         logger.error(f"[report] LLM hatası: {e}")
         # create fallback report if llm fails
         report_text = _generate_fallback_report(state, lang)
+
+    # Veri kalitesi 'degraded' (bazı satır karantinaya alındı ama modele devam
+    # edildi) → başarılı raporun sonuna görünür not düş. Kullanıcı kaç satırın
+    # neden atlandığını görsün ("herkes anlasın" vaadi).
+    if state.get("data_quality_status") == "degraded":
+        _q = (state.get("data_quality_report", {}) or {}).get("quarantine", {}) or {}
+        if _q.get("rows", 0) > 0:
+            report_text += R("dq_degraded_note", lang, n=_q.get("rows", 0))
+
+    # Training cap örneklemesi (MAX_TRAINING_ROWS aşıldı) → görünür not (sessiz değil).
+    _samp = (state.get("feature_report", {}) or {}).get("sampling", {}) or {}
+    if _samp.get("sampled"):
+        if _samp.get("method") == "stratified":
+            report_text += R("sampling_note_stratified", lang,
+                             orig=_samp.get("original_rows", 0), n=_samp.get("sampled_rows", 0),
+                             before=_samp.get("minority_pct_before", "?"),
+                             after=_samp.get("minority_pct_after", "?"), cap=_samp.get("cap", 0))
+        else:
+            report_text += R("sampling_note_random", lang,
+                             orig=_samp.get("original_rows", 0), n=_samp.get("sampled_rows", 0),
+                             cap=_samp.get("cap", 0))
+
+    # Büyük-N model guard (roster kısıldı) → görünür not (sessiz değil).
+    _guard = state.get("heavy_model_guard", {}) or {}
+    if _guard.get("applied"):
+        _parts = []
+        if _guard.get("dropped"):
+            _parts.append(R("heavy_guard_dropped", lang, models=", ".join(_guard["dropped"])))
+        if _guard.get("reduced"):
+            _changes = "; ".join(f"{k} {v}" for k, v in _guard["reduced"].items())
+            _parts.append(R("heavy_guard_reduced", lang,
+                            models=", ".join(_guard["reduced"].keys()), changes=_changes))
+        if _parts:
+            _detail = (" ve " if lang == "tr" else " and ").join(_parts)
+            report_text += R("heavy_model_guard_note", lang, n=_guard.get("n_train", 0),
+                             thr=_guard.get("threshold", 0), detail=_detail)
 
     logger.info(f"[report] Rapor tamamlandı ({len(report_text)} karakter)")
 

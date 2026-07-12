@@ -104,6 +104,18 @@ class AgentState(TypedDict, total=False):
     # Quality Gate
     quality_gate: dict
 
+    # Data Quality / Validation Layer (iki katmanlı: yapısal yükleme-anı + anlamsal
+    # modelleme-öncesi). Tek tutarlı katman, tek durum. data_quality_node yazar.
+    #   status: "ok" | "degraded" | "failed"
+    #   report: {structural, semantic, target_health, quarantine, autofixes, notes}
+    # 'failed' → route_after_data_quality kısa-devre report_node; worker job'ı FAILED işaretler.
+    data_quality_status: str
+    data_quality_report: dict
+
+    # Büyük-N model guard: n_train eşik üstündeyse ağır CPU-kilitli modeller kısıldı.
+    # automl_node yazar, report_generator not düşer (sessiz değil). {} = tetiklenmedi.
+    heavy_model_guard: dict
+
     # Retry History — append-only delta per turn (see critic_feedback note)
     retry_history: Annotated[list[dict], operator.add]
     # Audit Trail / Tracking

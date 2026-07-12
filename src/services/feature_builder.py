@@ -132,15 +132,27 @@ def _load_data(state: dict) -> pd.DataFrame:
                     logger.info(f"[feature_eng] Target kolon suffix'li bulundu: '{target_col}' → '{actual_target}'")
                     break
 
-    # Small data: take all
-    if total <= ML_SAMPLE_ROWS:
+    # ── Training cap (dinamik, stratified) ───────────────────────────────────
+    # total <= cap → tüm veri. total > cap → sınıf ORANINI KORUYAN stratified
+    # örnekleme (classification) ya da temsili random (regression). Dengesizlik
+    # DUZELTİLMEZ (downstream SMOTE/class_weight halleder) → test seti gerçekçi,
+    # pozitif oranı korunur. Örnekleme SESSİZ DEĞİL: metadata df.attrs'a yazılır →
+    # build_features → feature_report → rapor notu (TR/EN). Cap env-override'lı
+    # (settings.MAX_TRAINING_ROWS) — kademeli açmak için.
+    cap = settings.MAX_TRAINING_ROWS
+
+    if total <= cap:
         df = conn.execute(f"SELECT * FROM {pq}").df()
-        logger.info(f"[feature_eng] Tum veri yuklendi: {len(df):,} satır")
+        logger.info(f"[feature_eng] Tum veri yuklendi: {len(df):,} satır (cap={cap:,})")
         conn.close()
         df = df.convert_dtypes(convert_integer=False)
+        df.attrs["_dq_sampling"] = {"sampled": False, "original_rows": total,
+                                    "sampled_rows": total, "method": "none", "cap": cap}
         return df
 
-    # Big data + target confirmed -> smart sampling
+    sampling_meta: dict = {"sampled": True, "original_rows": total, "cap": cap}
+
+    # Stratified (sınıf oranını koru) — yalnız confirmed + classification-benzeri target
     if actual_target and confirmed:
         try:
             dist = conn.execute(
@@ -148,66 +160,47 @@ def _load_data(state: dict) -> pd.DataFrame:
                 f'WHERE "{actual_target}" IS NOT NULL '
                 f'GROUP BY "{actual_target}" ORDER BY cnt'
             ).fetchall()
-
-            if len(dist) >= 2:
-                minority_class = dist[0][0]
-                minority_count = dist[0][1]
-                majority_class = dist[-1][0]
-                majority_count = dist[-1][1]
-                ratio = minority_count / max(majority_count, 1)
-
-                logger.info(f"[feature_eng] Target dagilimi: "
-                      f"minority({minority_class})={minority_count:,}, "
-                      f"majority({majority_class})={majority_count:,}, "
-                      f"ratio={ratio:.4f}")
-
-                if ratio < 0.3:
-                    # Imbalanced → minority hepsini al + majority orantılı
-                    minority_limit = min(minority_count, ML_SAMPLE_ROWS // 3)
-                    majority_limit = min(majority_count, ML_SAMPLE_ROWS - minority_limit)
-
-                    df_min = conn.execute(
-                        f'SELECT * FROM {pq} WHERE "{actual_target}" = $1 '
-                        f'USING SAMPLE {minority_limit}', [minority_class]
+            n_classes = len(dist)
+            # 2..DQ_TARGET_MAX_CARD sınıf → classification-benzeri (stratify anlamlı).
+            # Üstü → sürekli/regresyon target → random'a düş (stratify anlamsız).
+            if 2 <= n_classes <= settings.DQ_TARGET_MAX_CARD:
+                frames = []
+                for cls_val, cls_cnt in dist:
+                    # Proportional: her sınıf cap * (cls_cnt/total) → ORAN KORUNUR.
+                    # (imbalance-aware "tüm azınlığı al" YOK — oranı bozuyordu.)
+                    cls_n = max(1, round(cap * cls_cnt / total))
+                    df_cls = conn.execute(
+                        f'SELECT * FROM (SELECT * FROM {pq} WHERE "{actual_target}" = $1) '
+                        f'USING SAMPLE {cls_n} ROWS', [cls_val]
                     ).df()
-                    df_maj = conn.execute(
-                        f'SELECT * FROM {pq} WHERE "{actual_target}" = $1 '
-                        f'USING SAMPLE {majority_limit}', [majority_class]
-                    ).df()
+                    frames.append(df_cls)
+                df = pd.concat(frames, ignore_index=True).sample(
+                    frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
 
-                    df = pd.concat([df_min, df_maj], ignore_index=True)
-                    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-
-                    logger.info(f"[feature_eng] Imbalance-aware sampling: "
-                          f"minority={len(df_min):,} + majority={len(df_maj):,} = {len(df):,}")
-                    conn.close()
-                    df = df.convert_dtypes(convert_integer=False)
-                    return df
-                else:
-                    # Balanced → stratified
-                    frames = []
-                    for cls_val, cls_cnt in dist:
-                        cls_n = max(1, int(ML_SAMPLE_ROWS * cls_cnt / total))
-                        df_cls = conn.execute(
-                            f'SELECT * FROM {pq} WHERE "{actual_target}" = $1 '
-                            f'USING SAMPLE {cls_n}', [cls_val]
-                        ).df()
-                        frames.append(df_cls)
-                    df = pd.concat(frames, ignore_index=True)
-                    logger.info(f"[feature_eng] Stratified sample: {len(df):,}/{total:,} satır")
-                    conn.close()
-                    df = df.convert_dtypes(convert_integer=False)
-                    return df
-
+                before_min = min(c for _, c in dist) / max(total, 1)
+                vc = df[actual_target].value_counts()
+                after_min = (vc.min() / len(df)) if len(df) else 0.0
+                sampling_meta.update({
+                    "method": "stratified", "sampled_rows": len(df), "n_classes": n_classes,
+                    "minority_pct_before": round(before_min * 100, 2),
+                    "minority_pct_after": round(after_min * 100, 2),
+                })
+                logger.info(f"[feature_eng] Stratified cap: {total:,} → {len(df):,} satır "
+                      f"(cap={cap:,}), azınlık %{before_min*100:.2f} → %{after_min*100:.2f} (oran korundu)")
+                conn.close()
+                df = df.convert_dtypes(convert_integer=False)
+                df.attrs["_dq_sampling"] = sampling_meta
+                return df
         except Exception as e:
-            logger.error(f"[feature_eng] Akilli sampling hatasi: {e} → random fallback")
+            logger.error(f"[feature_eng] Stratified sampling hatasi: {e} → random fallback")
 
-    # Fallback: random sample
-    df = conn.execute(f"SELECT * FROM {pq} USING SAMPLE {ML_SAMPLE_ROWS}").df()
-    logger.info(f"[feature_eng] Random sample: {len(df):,}/{total:,} satır "
-          f"(target {'confirmed' if confirmed else 'unconfirmed'})")
+    # Random (regression / target yok / stratify uygulanamadı) — temsili örneklem
+    df = conn.execute(f"SELECT * FROM {pq} USING SAMPLE {cap} ROWS").df()
+    sampling_meta.update({"method": "random", "sampled_rows": len(df)})
+    logger.info(f"[feature_eng] Random cap: {total:,} → {len(df):,} satır (cap={cap:,})")
     conn.close()
     df = df.convert_dtypes(convert_integer=False)
+    df.attrs["_dq_sampling"] = sampling_meta
     return df
     
 # Column suffix normalization
@@ -1308,6 +1301,8 @@ _COUNT_ENCODE_MIN_CARD = 2
 _GROUPBY_MAX_CARD      = 50     # gruplama kolonu en fazla bu kart (yuksekse grup ort. anlamsiz)
 _GROUPBY_MAX_NUM_COLS  = 3      # patlama korumasi: en fazla N sayisal × M kategorik
 _GROUPBY_MAX_CAT_COLS  = 3
+_GROUPBY_MIN_GROUP_SIZE = 30    # grup istatistigi ancak >= bu kadar satir varsa guvenilir; kucuk grup → global fallback
+_GROUPBY_MAX_FEATURES  = 30     # sert backstop: dev+zdev+grpstd toplami bu kadari gecemez (patlama korumasi)
 _MISSING_IND_MAX_COLS  = 30
 
 
@@ -1385,23 +1380,33 @@ def _count_encode_tt(
 def _groupby_deviation_tt(
     X_train: pd.DataFrame, X_test: pd.DataFrame, meta=None, exclude: set | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """'dev_<num>_by_<cat>' = num - (o kategorinin TRAIN'deki num ortalamasi): bir satirin
-    kendi grup-normundan SAPMASI. Grandmaster tablo feature'larinin en guclulerinden
-    (orn. bu musterinin harcamasi, ulkesinin ortalamasina gore ne kadar yuksek). Grup
-    ortalamalari SADECE train'den; gorulmeyen kategori → train GLOBAL ortalamasi (sapma=0
-    civari). Leakage-safe (target kullanmaz). Patlama korumasi: dusuk-kardinaliteli cat'ler
-    (dolu/stabil grup) × en yuksek normalize-varyansli sayisal kolonlar, cift sayisi cap'li.
-    Encode ONCESI calismali (ham kategorikleri grup anahtari yapar).
+    """Grup-istatistik feature aileleri (her cat×num cifti icin, TRAIN-fit → test-map):
+      * 'dev_<num>_by_<cat>'    = num − grup ortalamasi (satirin kendi grup-normundan sapmasi)
+      * 'zdev_<num>_by_<cat>'   = (num − grup ort.) / grup std → OLCEK-BAGIMSIZ sapma
+                                  (farkli olcekli kolonlari kiyaslanabilir yapar; sigma=0 → 0)
+      * 'grpstd_<num>_by_<cat>' = grubun std'i (o kategorinin ic degiskenligi)
+    Grandmaster tablo feature'larinin en guclulerinden (orn. bu musterinin harcamasi,
+    ulkesi ortalamasindan kac std yukarida). TUM istatistikler SADECE train'den; gorulmeyen
+    kategori → train GLOBAL istatistigi. Leakage-safe (target kullanmaz).
+
+    MIN-GRUP KAPISI (``_GROUPBY_MIN_GROUP_SIZE``): grup istatistigi ancak grup >= N satir
+    iceriyorsa guvenilir; kucuk gruplar (2-3 satir) gurultulu ortalama uretir → onlar global
+    istatistige duser. Bir cat'te >=2 guvenilir grup yoksa o cat tamamen atlanir (feature
+    dejenere/sabit olurdu). BACKSTOP (``_GROUPBY_MAX_FEATURES``): toplam uretimi cap'ler
+    (deterministik sira: cat dis, num ic, aile sirasi dev→zdev→grpstd).
+
+    Patlama korumasi: dusuk-kardinaliteli cat'ler × en yuksek normalize-varyansli sayisallar,
+    cift sayisi cap'li. Encode ONCESI calismali (ham kategorikleri grup anahtari yapar).
     ``exclude``: leakage-suspect/target kolonlari ne grup anahtari ne sayisal girdi yap."""
     exclude = exclude or set()
     cat_cols = [c for c in X_train.select_dtypes(include="object").columns
                 if c not in exclude and _GROUPBY_MAX_CARD >= X_train[c].nunique() >= 2]
     num_cols = X_train.select_dtypes(include="number").columns.tolist()
-    # Turetilmis kolonlari (count_/dev_/is_zero_/ratio_/isna) grup-deviation GIRDISI yapma
-    # → gurultu/dongu onle (is_zero_/ratio_ = pre-split flag/oran motorlarinin ciktilari)
+    # Turetilmis kolonlari grup-deviation GIRDISI yapma → gurultu/dongu onle.
+    # zdev_/grpstd_ ayrica eklenir: startswith("dev_") 'zdev_'i YAKALAMAZ.
     num_cols = [c for c in num_cols
                 if c not in exclude
-                and not c.startswith(("count_", "dev_", "is_zero_", "ratio_"))
+                and not c.startswith(("count_", "dev_", "zdev_", "grpstd_", "is_zero_", "ratio_"))
                 and not c.endswith("_isna")]
     if not cat_cols or not num_cols:
         return X_train, X_test, []
@@ -1419,20 +1424,59 @@ def _groupby_deviation_tt(
     num_cols = sorted(num_cols, key=lambda c: (-_norm_var(c), c))[:_GROUPBY_MAX_NUM_COLS]
 
     added: list[str] = []
+
+    def _emit(name: str, tr: "pd.Series", te: "pd.Series") -> None:
+        if name in X_train.columns:
+            return
+        X_train[name] = tr.values
+        X_test[name]  = te.values
+        added.append(name)
+
     for cat in cat_cols:
+        if len(added) >= _GROUPBY_MAX_FEATURES:
+            break
+        # Guvenilir grup kapisi: sadece >= N satirli gruplarin istatistigi kullanilir;
+        # kalanlar (ve gorulmeyen test kategorileri) global istatistige duser.
+        sizes = X_train[cat].value_counts()
+        reliable = set(sizes[sizes >= _GROUPBY_MIN_GROUP_SIZE].index)
+        if len(reliable) < 2:
+            continue  # >=2 guvenilir kontrast grubu yok → feature dejenere olurdu, atla
+        cat_tr, cat_te = X_train[cat], X_test[cat]
         for num in num_cols:
-            name = f"dev_{num}_by_{cat}"
-            if name in X_train.columns:
-                continue
-            grp_mean = X_train.groupby(cat)[num].mean()
-            global_mean = float(pd.to_numeric(X_train[num], errors="coerce").mean())
-            tr_map = X_train[cat].map(grp_mean).fillna(global_mean)
-            te_map = X_test[cat].map(grp_mean).fillna(global_mean)
-            X_train[name] = (pd.to_numeric(X_train[num], errors="coerce") - tr_map).fillna(0.0)
-            X_test[name]  = (pd.to_numeric(X_test[num], errors="coerce") - te_map).fillna(0.0)
-            added.append(name)
+            if len(added) >= _GROUPBY_MAX_FEATURES:
+                break
+            xtr = pd.to_numeric(X_train[num], errors="coerce")
+            xte = pd.to_numeric(X_test[num], errors="coerce")
+            g = xtr.groupby(cat_tr)
+            grp_mean = g.mean()
+            grp_std  = g.std(ddof=0)   # ddof=0 → tek-degerli grup NaN degil 0 verir
+            global_mean = float(xtr.mean())
+            global_std  = float(xtr.std(ddof=0))
+            if pd.isna(global_mean):
+                global_mean = 0.0
+            if pd.isna(global_std):
+                global_std = 0.0
+            # guvenilmez gruplari global'e sabitle (index bazli where)
+            grp_mean = grp_mean.where(grp_mean.index.isin(reliable), global_mean)
+            grp_std  = grp_std.where(grp_std.index.isin(reliable), global_std)
+
+            mean_tr = cat_tr.map(grp_mean).fillna(global_mean)
+            mean_te = cat_te.map(grp_mean).fillna(global_mean)
+            std_tr  = cat_tr.map(grp_std).fillna(global_std)
+            std_te  = cat_te.map(grp_std).fillna(global_std)
+
+            # dev = x − grup ort.
+            _emit(f"dev_{num}_by_{cat}",
+                  (xtr - mean_tr).fillna(0.0), (xte - mean_te).fillna(0.0))
+            # zdev = (x − grup ort.) / grup std ; sigma=0/NaN → 0 (guvenli)
+            z_tr = ((xtr - mean_tr) / std_tr.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            z_te = ((xte - mean_te) / std_te.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            _emit(f"zdev_{num}_by_{cat}", z_tr, z_te)
+            # grpstd = grubun std'i (grup ici degiskenlik)
+            _emit(f"grpstd_{num}_by_{cat}", std_tr.fillna(0.0), std_te.fillna(0.0))
+
     if added:
-        logger.info(f"[feature_eng] Groupby-deviation ({len(added)}, train-fit): {added}")
+        logger.info(f"[feature_eng] Groupby-stats ({len(added)}, train-fit, cap={_GROUPBY_MAX_FEATURES}): {added}")
     return X_train, X_test, added
 
 
@@ -1834,6 +1878,9 @@ def build_features(state: dict) -> dict:
 
     try:
         df = _load_data(state)
+        # Örnekleme metadatasını HEMEN yakala — df.attrs sonraki FE transformasyonlarında
+        # düşebilir; feature_report'a taşınıp rapora yansıtılacak (sessiz değil).
+        sampling_meta = dict(df.attrs.get("_dq_sampling", {}))
     except Exception as e:
         import traceback
         logger.error(f"\n[feature_eng] HATA: {e}")
@@ -2188,6 +2235,8 @@ def build_features(state: dict) -> dict:
         "timeseries_lag":           ts_lag_info,
         "split_strategy":           split_strategy,
         "split_imbalanced_entities": split_imbalanced,
+        # Training cap örnekleme bilgisi (sessiz değil → rapora yansır)
+        "sampling":                 sampling_meta,
     }
 
     # Ağır split dizilerini diske yaz; state'te yalnızca dosya yolu taşı

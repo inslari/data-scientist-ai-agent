@@ -19,6 +19,7 @@ from src.nodes.leakage_detector_node import leakage_detector_node
 from src.nodes.entity_resolution_node import entity_resolution_node
 from src.nodes.analysis_node import analysis_node
 from src.nodes.merchant_node import merchant_intelligence_node
+from src.nodes.data_quality_node import data_quality_node
 
 
 # Routing functions
@@ -52,6 +53,19 @@ def route_after_execution(state: AgentState) -> str:
     return "report_node"
 
 
+def route_after_data_quality(state: AgentState) -> str:
+    """Katman 2 sonrası yönlendirme.
+
+    data_quality_status=="failed" → report_node (kısa-devre, aksiyona dönük mesaj).
+    Aksi halde MEVCUT fork mantığı (route_after_execution) DEĞİŞMEDEN yeniden
+    kullanılır — deep_analysis/clustering/anomaly/eda dallanması birebir korunur,
+    davranış değişmez (tek yön kaynağı, drift yok).
+    """
+    if state.get("data_quality_status") == "failed":
+        return "report_node"
+    return route_after_execution(state)
+
+
 def route_after_critic(state: AgentState) -> str:
     """
     split for critic node after
@@ -77,7 +91,8 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
                     ├─ [sql_query] → sql_node → END
                     └─ [other] → planner_node
                                       → target_discovery_node
-                                           → execution_node
+                                           → execution_node → data_quality_node
+                                                 ├─ [DQ failed] → report_node → END
                                                  ├─ [classification/regression/clustering]
                                                  │    → entity_resolution_node → leakage_detector_node → feature_plan_node
                                                  │         → feature_engineering_node → automl_node → evaluation_node → critic_node
@@ -105,6 +120,7 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
     graph.add_node("entity_resolution_node",   entity_resolution_node)
     graph.add_node("analysis_node",            analysis_node)
     graph.add_node("merchant_intelligence_node", merchant_intelligence_node)
+    graph.add_node("data_quality_node",        data_quality_node)
 
     # START → intent_node → db_context_node → merchant_intelligence_node
     graph.add_edge(START, "intent_node")
@@ -130,9 +146,13 @@ def build_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
     # ML pipeline
     graph.add_edge("planner_node", "execution_node")
 
+    # execution_node → data_quality_node (Katman 2) → fork.
+    # Fork mantığı route_after_execution'da AYNEN kalır; data_quality_node yalnız
+    # önüne failed→report_node dalını ekler (route_after_data_quality).
+    graph.add_edge("execution_node", "data_quality_node")
     graph.add_conditional_edges(
-        "execution_node",
-        route_after_execution,
+        "data_quality_node",
+        route_after_data_quality,
         ["entity_resolution_node", "analysis_node", "automl_node", "report_node"],
     )
     graph.add_edge("analysis_node", END)

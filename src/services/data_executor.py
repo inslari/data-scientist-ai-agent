@@ -23,7 +23,6 @@ Neden DuckDB:
 
 import ast
 import asyncio
-import re
 import tempfile
 import uuid
 from pathlib import Path
@@ -43,9 +42,12 @@ logger = get_logger(__name__)
 
 # ── Sabitler ────────────────────────────────────────────────
 CHUNK_SIZE        = 5_000   # MCP'den kaç satır çekileceği (per chunk) — küçük chunk = hızlı sorgu, daha az iptal/spin riski
-MAX_FETCH_ROWS    = 300_000  # Tek tablodan max çekilecek satır
-ML_SAMPLE_ROWS    = 300_000  # ML eğitimi için max satır
-PROFILE_SAMPLE    = 300_000  # Profiling için max satır (yoksa full)
+# Transport/bellek tavanı — env-override'lı (settings.MAX_FETCH_ROWS). Fetch LIMIT'i
+# ve serialization (encode_result) bu tavanı kullanır; asıl training cap ayrı ve
+# stratified'dır (feature_builder + settings.MAX_TRAINING_ROWS).
+MAX_FETCH_ROWS    = settings.MAX_FETCH_ROWS  # Tek tablodan max çekilecek satır (transport)
+ML_SAMPLE_ROWS    = settings.MAX_FETCH_ROWS  # DuckDBEngine.stratified_sample default n (transport tavanı)
+PROFILE_SAMPLE    = settings.MAX_FETCH_ROWS  # Profiling için max satır (yoksa full)
 PARQUET_DIR       = Path(tempfile.gettempdir()) / "ds_agent_data"
 PARQUET_DIR.mkdir(exist_ok=True)
 
@@ -56,40 +58,10 @@ def _make_safe(name: str) -> str:
     return f"t_{s}" if s and s[0].isdigit() else s
 
 
-def _coerce_scalar(p: str):
-    """
-    Repr wrapper'larını gerçek değere indirger:
-      np.int64(0)        -> 0
-      np.float64(1.5)    -> 1.5
-      Decimal('10.5')    -> 10.5
-      Timestamp('...')   -> '...' (string, parquet datetime'a çevirir)
-      Period('2017-09')  -> '2017-09'
-      <NA>/nan/None/null -> None
-    Wrapper yoksa int -> float -> string sırasıyla dener.
-    """
-    s = p.strip()
-
-    # Genel wrapper: AnyName('...') veya AnyName(123) -> içindeki değer
-    m = re.match(r"[\w.]+\(\s*['\"]?(.+?)['\"]?\s*\)$", s)
-    if m:
-        s = m.group(1).strip()
-
-    # Null varyantları
-    if s.lower() in ("nan", "na", "<na>", "none", "null", ""):
-        return None
-
-    # Kalan tırnakları temizle
-    if len(s) >= 2 and s[0] in "'\"" and s[-1] in "'\"":
-        s = s[1:-1]
-
-    # Sayıya çevir
-    try:
-        return int(s)
-    except ValueError:
-        try:
-            return float(s)
-        except ValueError:
-            return s
+# NOT: eski `_coerce_scalar` + `_parse_tuple_line` (repr wrapper regex fallback'i)
+# kaldırıldı. Serialize/parse artık src/core/row_codec içinde simetrik ve ast-only —
+# üretici hücreleri literal-güvenli primitife indirger, bu yüzden `Timestamp(...)`
+# gibi non-literal repr'ler hiç oluşmaz (kaynağında çözülür, istemcide tahmin yok).
 
 # ── Relationship graph traversal ─────────────────────────────
 def _resolve_all_related_tables(
@@ -250,60 +222,39 @@ def _select_anchor_table(
 
 
 def _parse_mcp_to_df(raw: str, table_name: str = "") -> pd.DataFrame:
+    """Kanonik sorgu-sonucu metnini DataFrame'e çevirir.
 
+    Parse + yapısal doğrulama (Layer 1a) tek kaynakta: src/core/row_codec.
+    decode_result ast-only'dir (kırılgan regex YOK) ve alan-sayısı invaryantını
+    uygular — uyuşmayan satır KARANTİNAYA alınır (sessiz pad/trim yok). Üretici
+    tarafındaki row_codec.encode_result ile simetriktir.
+    """
     if not raw:
         raise ValueError(f"[{table_name}] MCP boş yanıt döndürdü.")
     if raw.strip().startswith("Error") or raw.strip().startswith("SQL Error"):
         raise ValueError(f"[{table_name}] MCP SQL hatası: {raw[:200]}")
 
-    lines = raw.strip().splitlines()
-    columns: list[str] = []
-    for line in lines:
-        if line.startswith("Columns:"):
-            columns = [c.strip() for c in line.replace("Columns:","").split(",")]
-            break
+    from src.core.row_codec import decode_result
+    columns, rows, structural = decode_result(raw)
     if not columns:
         raise ValueError(f"[{table_name}] Kolon bilgisi bulunamadı.")
 
-    rows = []
-    for line in lines:
-        line = line.strip()
-        if line.startswith("(") and line.endswith(")"):
-            try:
-                parsed = _parse_tuple_line(line)
-                rows.append(_pad_or_trim(parsed, len(columns)))
-            except Exception:
-                continue
+    structural = {"table": table_name, **structural}
+    if structural["quarantined_rows"]:
+        logger.warning(
+            f"[{table_name or 'parse'}] Yapısal karantina: "
+            f"{structural['quarantined_rows']:,}/{structural['total_rows']:,} "
+            f"satır header ({structural['expected_cols']} kolon) ile uyuşmadı (kolon kayması şüphesi)."
+        )
 
     if not rows:
-        return pd.DataFrame(columns=columns)
-
-    df = pd.DataFrame(rows, columns=columns)
-    return _infer_dtypes(df)
-
-
-def _pad_or_trim(row: tuple, n: int) -> tuple:
-    lst = list(row)
-    lst.extend([None] * max(0, n - len(lst)))
-    return tuple(lst[:n])
-
-
-def _parse_tuple_line(line: str) -> tuple:
-    try:
-        return ast.literal_eval(line)
-    except (ValueError, SyntaxError):
-        inner = line[1:-1]
-        parts = re.split(r",\s*(?=(?:[^'\"]*['\"][^'\"]*['\"])*[^'\"]*$)", inner)
-        parsed = []
-        for p in parts:
-            p = p.strip()
-            if p in ("None","NULL","null",""):
-                parsed.append(None)
-            elif p.startswith(("'",'"')) and p.endswith(("'",'"')):
-                parsed.append(p[1:-1])
-            else:
-                parsed.append(_coerce_scalar(p))
-        return tuple(parsed)
+        df = pd.DataFrame(columns=columns)
+    else:
+        df = _infer_dtypes(pd.DataFrame(rows, columns=columns))
+    # attrs LangGraph state'ine değil, execute_data_operations'a taşınır (df.attrs
+    # bazı pandas işlemlerinde düşebilir; en son set ediyoruz, hemen okunuyor).
+    df.attrs["_dq_structural"] = structural
+    return df
 
 
 def _infer_dtypes(df: pd.DataFrame) -> pd.DataFrame:
@@ -570,8 +521,13 @@ class DuckDBEngine:
                 ).fetchone()
                 cls_count = cls_count_row[0] if cls_count_row else 0
                 cls_sample = max(1, int(n * cls_count / total)) if total > 0 else 0
+                # USING SAMPLE tablo taramasında WHERE'DEN ÖNCE uygulanır; doğrudan
+                # `... WHERE t=$1 USING SAMPLE k` önce tüm tablodan k örnekler sonra
+                # filtreler → nadir sınıfta 0 satır. Filtreyi alt-sorguda kapatıp
+                # örneklemeyi ondan sonra (ve ROWS ile satır-sayısı olarak) uygula.
                 df_cls = self.conn.execute(
-                    f'SELECT * FROM {safe} WHERE "{target_col}" = $1 USING SAMPLE {cls_sample}', [cls]
+                    f'SELECT * FROM (SELECT * FROM {safe} WHERE "{target_col}" = $1) '
+                    f'USING SAMPLE {cls_sample} ROWS', [cls]
                 ).df()
                 frames.append(df_cls)
             result = pd.concat(frames, ignore_index=True)
@@ -580,7 +536,7 @@ class DuckDBEngine:
         else:
             # Random sample
             result = self.conn.execute(
-                f"SELECT * FROM {safe} USING SAMPLE {n}"
+                f"SELECT * FROM {safe} USING SAMPLE {n} ROWS"
             ).df()
             logger.info(f"[duckdb] Random sample: {len(result):,}/{total:,} satır")
             return result
@@ -731,6 +687,7 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
     profiling_report:dict       = {}
     data_path:       str        = ""
     merged_table:    str        = ""
+    structural_reports: list[dict] = []   # Layer 1a: her parse'ın yapısal DQ raporu
 
     try:
         for step in analysis_plan:
@@ -770,6 +727,8 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
                 dfs: dict[str, pd.DataFrame] = {}
                 for table, raw in raw_results.items():
                     df = _parse_mcp_to_df(raw, table)
+                    if df.attrs.get("_dq_structural"):
+                        structural_reports.append(df.attrs["_dq_structural"])
                     dfs[table] = df
                     duck.load(table, df)
                     logger.info(f"[execution] '{table}': {len(df):,} satır")
@@ -833,6 +792,8 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
 
                         raw_joined = "\n".join(chunks_text)
                         merged_df = _parse_mcp_to_df(raw_joined, "joined")
+                        if merged_df.attrs.get("_dq_structural"):
+                            structural_reports.append(merged_df.attrs["_dq_structural"])
                         logger.info(f"[execution] DB-side JOIN sonucu: {len(merged_df):,} satır × {len(merged_df.columns)} kolon")
                     else:
                         # merge_ops boş → tablolar arasında bilinen ilişki yok, anchor kullan
@@ -895,7 +856,31 @@ async def execute_data_operations(state: dict, config: RunnableConfig) -> dict:
         "sql_results": sql_results,
         "data_path": data_path,
         "profiling_report": profiling_report,
+        # Layer 1a yapısal DQ özeti — data_quality_node (Layer 2) tüketir.
+        "data_quality_structural": _aggregate_structural(structural_reports),
         "error": None
+    }
+
+
+def _aggregate_structural(reports: list[dict]) -> dict:
+    """Parse başına yapısal raporları tek özete indirger (kayma sayacı).
+
+    Birden çok tablo/joined parse edilebilir; toplam karantina ve genel
+    mismatch oranı çıkarılır, en bozuk parse'ın örnek satırları taşınır.
+    """
+    if not reports:
+        return {"checked": False, "quarantined_rows": 0, "total_rows": 0, "mismatch_rate": 0.0, "tables": []}
+    total = sum(r.get("total_rows", 0) for r in reports)
+    quarantined = sum(r.get("quarantined_rows", 0) for r in reports)
+    worst = max(reports, key=lambda r: r.get("mismatch_rate", 0.0))
+    return {
+        "checked":          True,
+        "total_rows":       total,
+        "quarantined_rows": quarantined,
+        "mismatch_rate":    round(quarantined / max(total, 1), 4),
+        "worst_table":      worst.get("table", ""),
+        "sample_bad_rows":  worst.get("sample_bad_rows", []),
+        "tables":           reports,
     }
 
 

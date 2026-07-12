@@ -139,4 +139,53 @@ class Settings:
     # app_logs retention (gün). 0/negatif → log budama atlanır.
     LOG_RETENTION_DAYS: int = int(os.getenv("LOG_RETENTION_DAYS", "30"))
 
+    # ── Data Quality / Validation Layer (iki katmanlı: yapısal + anlamsal) ─────
+    # Bozuk CSV / kolon kayması / rol-içerik çelişkisi otonom pipeline'ı sessizce
+    # bozmasın diye deterministik (LLM'siz) veri kalitesi kapısının eşikleri.
+    # Hepsi env override'lı. Sinyaller domain/dil bağımsız (ad-morfolojisi + istatistik).
+    #
+    # nunique BİRİNCİL sinyaldir: nunique==DQ_BINARY_NUNIQUE (2) → KESİN binary,
+    # distinct_ratio ne olursa olsun "continuous/bozuk" DENMEZ. distinct_ratio yalnız
+    # yüksek-kardinaliteli target'ta destekleyici teyit sinyalidir.
+    DQ_BINARY_NUNIQUE: int = int(os.getenv("DQ_BINARY_NUNIQUE", "2"))
+    # Classification target için üst kardinalite. Üstü → sınıf etiketi değil (aday sürekli).
+    DQ_TARGET_MAX_CARD: int = int(os.getenv("DQ_TARGET_MAX_CARD", "50"))
+    # Yalnız destekleyici: numeric target'ta distinct/non_null bunun üstündeyse sürekliliğe kanıt.
+    DQ_CONTINUOUS_RATIO: float = float(os.getenv("DQ_CONTINUOUS_RATIO", "0.20"))
+    # Küçük-n koruması: target sürekli-bozulma verdiği için gereken min non-null satır.
+    DQ_MIN_ROWS_TARGET_CHECK: int = int(os.getenv("DQ_MIN_ROWS_TARGET_CHECK", "30"))
+    # VARCHAR kolonun bu oranda TRY_CAST-numeric parse edilebilmesi → "sayı ama string"
+    # kesin reader-misconfig → otomatik cast (auto-fix).
+    DQ_NUMERIC_STRING_RATE: float = float(os.getenv("DQ_NUMERIC_STRING_RATE", "0.95"))
+    # Yapısal karantina oranı (alan sayısı ≠ header) bunu aşarsa → her akışta 'failed'.
+    # Altında: target'lı akışta yine 'failed' (etiket hizası kanıtlanamaz), target'sız akışta 'degraded'.
+    DQ_STRUCT_FAIL_RATE: float = float(os.getenv("DQ_STRUCT_FAIL_RATE", "0.02"))
+
+    # ── Satır capleri: transport tavanı vs stratified training cap ────────────
+    # İKİ AYRI kavram (bilinçli): transport first-N keser, training cap stratified
+    # örnekler. Aynı değer ikisine verilirse stratifikasyon imkânsız olur (feature
+    # engineering, örnekleyeceği popülasyonu göremez). Bkz. tasarım notu.
+    #
+    # MAX_FETCH_ROWS — TRANSPORT/BELLEK tavanı: kaç satır tel üzerinden taşınıp RAM'e
+    #   alınır. Kullanılan yer: data_executor fetch LIMIT + iki encode_result çağrısı
+    #   (mcp_server, data_group CSV). Tam veri feature engineering'e ulaşsın diye yüksek.
+    MAX_FETCH_ROWS: int = int(os.getenv("MAX_FETCH_ROWS", "300000"))
+    # MAX_TRAINING_ROWS — STRATIFIED training cap: kaç satırda eğitilir. Aşımda sınıf
+    #   oranını KORUYAN stratified örnekleme (imbalance downstream SMOTE/class_weight'te
+    #   halledilir) + loglu + rapora yansıyan (sessiz truncate YOK). Kademeli açmak için
+    #   düşük/güvenli default; env ile büyütülür (ör. 300000 → tam eğitim).
+    MAX_TRAINING_ROWS: int = int(os.getenv("MAX_TRAINING_ROWS", "50000"))
+
+    # ── Büyük-N model guard ───────────────────────────────────────────────────
+    # Eğitim satırı (n_train) bu eşiği aşınca ağır CPU-kilitli modeller roster'dan
+    # kısılır: AdaBoost düşer (yavaş + boosting üçlüsünün gerisinde), RF/ExtraTrees
+    # n_estimators HEAVY_MODEL_TREES'e çekilir (model roster'da kalır → şampiyon
+    # seçimi stabil; dropping değil). Sinyal SATIR SAYISINA bağlı, kolon/veri adına
+    # değil. Eşik-altı → tüm roster açık (mevcut davranış birebir). Sessiz değil:
+    # loglanır + rapora yansır (TR/EN). Default 100k: credit(~26k)/churn(~8k)/
+    # fraud@50k(40k) eşiğin ALTINDA → roster + ROC hiç değişmez.
+    HEAVY_MODEL_MAX_ROWS: int = int(os.getenv("HEAVY_MODEL_MAX_ROWS", "100000"))
+    # Guard tetiklenince RF/ExtraTrees'in düşürüleceği ağaç sayısı (200→bu).
+    HEAVY_MODEL_TREES: int = int(os.getenv("HEAVY_MODEL_TREES", "100"))
+
 settings = Settings()

@@ -123,15 +123,31 @@ async def run_data_group_query_logic(group_id: int, req: QueryRequest, db: Sessi
                     local_path = ctx.__enter__()
                     context_managers.append(ctx)
 
+                    # TODO(dq-layer1b): Veri Kalitesi Katmanı 1b — yükleme-anı yapısal
+                    # doğrulama. read_csv_auto'yu store_rejects=true + strict_mode ile
+                    # oku, reject_errors/reject_scans'tan bozuk satırları (kolon-sayısı
+                    # uyuşmazlığı, delimiter/quoting bozukluğu) say ve raporla. Şu an
+                    # sadece Layer 1a (MCP-parse invaryantı) + Layer 2 (anlamsal) aktif;
+                    # bkz. src/services/data_quality.py.
                     con.execute(f'CREATE VIEW "{table_name}" AS SELECT * FROM read_csv_auto(\'{local_path}\')')
 
                 result_df = con.execute(query).df()
 
+                # Sağlam serialization (bkz. src/core/row_codec.py): her hücre
+                # literal-güvenli primitife indirgenir. Eski `str(row)`, pandas
+                # Timestamp'i `Timestamp('...', tz='...')` (içteki virgül) olarak
+                # yazıp istemcide kolon kaymasına yol açıyordu — asıl fraud bozulması.
+                from src.core.row_codec import encode_result
+                from src.core.config import settings
                 columns = result_df.columns.tolist()
-                output_lines = [f"Columns: {', '.join(columns)}"]
-                for row in result_df.itertuples(index=False, name=None):
-                    output_lines.append(str(row))
-                return {"status": "success", "result": "\n".join(output_lines)}
+                # Transport tavanı: env-override'lı (settings.MAX_FETCH_ROWS). Tam veri
+                # feature engineering'e ulaşsın diye yüksek; asıl training cap ayrı ve
+                # stratified (feature_builder + MAX_TRAINING_ROWS). Sessiz 10k truncate YOK.
+                result_text = encode_result(
+                    columns, result_df.itertuples(index=False, name=None),
+                    max_rows=settings.MAX_FETCH_ROWS,
+                )
+                return {"status": "success", "result": result_text}
             except Exception as e:
                 return {"status": "error", "result": f"SQL Error: {str(e)}"}
             finally:

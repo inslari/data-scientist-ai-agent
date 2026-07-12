@@ -69,6 +69,9 @@ async def execution_node(state: AgentState, config: RunnableConfig) -> AgentStat
         "dataframe": result.get("dataframe"),
         "db_intelligence": result.get("db_intelligence", state.get("db_intelligence")),
         "profiling_report": result.get("profiling_report", state.get("profiling_report")),
+        # Layer 1a yapısal DQ tohumu — data_quality_node (Layer 2) okur, anlamsal
+        # + target-sağlık ekleyip nihai data_quality_status'u belirler.
+        "data_quality_report": {"structural": result.get("data_quality_structural", {})},
         "current_step": "execution_node",
     }
 
