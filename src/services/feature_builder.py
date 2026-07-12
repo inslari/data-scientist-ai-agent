@@ -132,15 +132,27 @@ def _load_data(state: dict) -> pd.DataFrame:
                     logger.info(f"[feature_eng] Target kolon suffix'li bulundu: '{target_col}' → '{actual_target}'")
                     break
 
-    # Small data: take all
-    if total <= ML_SAMPLE_ROWS:
+    # ── Training cap (dinamik, stratified) ───────────────────────────────────
+    # total <= cap → tüm veri. total > cap → sınıf ORANINI KORUYAN stratified
+    # örnekleme (classification) ya da temsili random (regression). Dengesizlik
+    # DUZELTİLMEZ (downstream SMOTE/class_weight halleder) → test seti gerçekçi,
+    # pozitif oranı korunur. Örnekleme SESSİZ DEĞİL: metadata df.attrs'a yazılır →
+    # build_features → feature_report → rapor notu (TR/EN). Cap env-override'lı
+    # (settings.MAX_TRAINING_ROWS) — kademeli açmak için.
+    cap = settings.MAX_TRAINING_ROWS
+
+    if total <= cap:
         df = conn.execute(f"SELECT * FROM {pq}").df()
-        logger.info(f"[feature_eng] Tum veri yuklendi: {len(df):,} satır")
+        logger.info(f"[feature_eng] Tum veri yuklendi: {len(df):,} satır (cap={cap:,})")
         conn.close()
         df = df.convert_dtypes(convert_integer=False)
+        df.attrs["_dq_sampling"] = {"sampled": False, "original_rows": total,
+                                    "sampled_rows": total, "method": "none", "cap": cap}
         return df
 
-    # Big data + target confirmed -> smart sampling
+    sampling_meta: dict = {"sampled": True, "original_rows": total, "cap": cap}
+
+    # Stratified (sınıf oranını koru) — yalnız confirmed + classification-benzeri target
     if actual_target and confirmed:
         try:
             dist = conn.execute(
@@ -148,66 +160,47 @@ def _load_data(state: dict) -> pd.DataFrame:
                 f'WHERE "{actual_target}" IS NOT NULL '
                 f'GROUP BY "{actual_target}" ORDER BY cnt'
             ).fetchall()
-
-            if len(dist) >= 2:
-                minority_class = dist[0][0]
-                minority_count = dist[0][1]
-                majority_class = dist[-1][0]
-                majority_count = dist[-1][1]
-                ratio = minority_count / max(majority_count, 1)
-
-                logger.info(f"[feature_eng] Target dagilimi: "
-                      f"minority({minority_class})={minority_count:,}, "
-                      f"majority({majority_class})={majority_count:,}, "
-                      f"ratio={ratio:.4f}")
-
-                if ratio < 0.3:
-                    # Imbalanced → minority hepsini al + majority orantılı
-                    minority_limit = min(minority_count, ML_SAMPLE_ROWS // 3)
-                    majority_limit = min(majority_count, ML_SAMPLE_ROWS - minority_limit)
-
-                    df_min = conn.execute(
-                        f'SELECT * FROM {pq} WHERE "{actual_target}" = $1 '
-                        f'USING SAMPLE {minority_limit}', [minority_class]
+            n_classes = len(dist)
+            # 2..DQ_TARGET_MAX_CARD sınıf → classification-benzeri (stratify anlamlı).
+            # Üstü → sürekli/regresyon target → random'a düş (stratify anlamsız).
+            if 2 <= n_classes <= settings.DQ_TARGET_MAX_CARD:
+                frames = []
+                for cls_val, cls_cnt in dist:
+                    # Proportional: her sınıf cap * (cls_cnt/total) → ORAN KORUNUR.
+                    # (imbalance-aware "tüm azınlığı al" YOK — oranı bozuyordu.)
+                    cls_n = max(1, round(cap * cls_cnt / total))
+                    df_cls = conn.execute(
+                        f'SELECT * FROM (SELECT * FROM {pq} WHERE "{actual_target}" = $1) '
+                        f'USING SAMPLE {cls_n} ROWS', [cls_val]
                     ).df()
-                    df_maj = conn.execute(
-                        f'SELECT * FROM {pq} WHERE "{actual_target}" = $1 '
-                        f'USING SAMPLE {majority_limit}', [majority_class]
-                    ).df()
+                    frames.append(df_cls)
+                df = pd.concat(frames, ignore_index=True).sample(
+                    frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
 
-                    df = pd.concat([df_min, df_maj], ignore_index=True)
-                    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-
-                    logger.info(f"[feature_eng] Imbalance-aware sampling: "
-                          f"minority={len(df_min):,} + majority={len(df_maj):,} = {len(df):,}")
-                    conn.close()
-                    df = df.convert_dtypes(convert_integer=False)
-                    return df
-                else:
-                    # Balanced → stratified
-                    frames = []
-                    for cls_val, cls_cnt in dist:
-                        cls_n = max(1, int(ML_SAMPLE_ROWS * cls_cnt / total))
-                        df_cls = conn.execute(
-                            f'SELECT * FROM {pq} WHERE "{actual_target}" = $1 '
-                            f'USING SAMPLE {cls_n}', [cls_val]
-                        ).df()
-                        frames.append(df_cls)
-                    df = pd.concat(frames, ignore_index=True)
-                    logger.info(f"[feature_eng] Stratified sample: {len(df):,}/{total:,} satır")
-                    conn.close()
-                    df = df.convert_dtypes(convert_integer=False)
-                    return df
-
+                before_min = min(c for _, c in dist) / max(total, 1)
+                vc = df[actual_target].value_counts()
+                after_min = (vc.min() / len(df)) if len(df) else 0.0
+                sampling_meta.update({
+                    "method": "stratified", "sampled_rows": len(df), "n_classes": n_classes,
+                    "minority_pct_before": round(before_min * 100, 2),
+                    "minority_pct_after": round(after_min * 100, 2),
+                })
+                logger.info(f"[feature_eng] Stratified cap: {total:,} → {len(df):,} satır "
+                      f"(cap={cap:,}), azınlık %{before_min*100:.2f} → %{after_min*100:.2f} (oran korundu)")
+                conn.close()
+                df = df.convert_dtypes(convert_integer=False)
+                df.attrs["_dq_sampling"] = sampling_meta
+                return df
         except Exception as e:
-            logger.error(f"[feature_eng] Akilli sampling hatasi: {e} → random fallback")
+            logger.error(f"[feature_eng] Stratified sampling hatasi: {e} → random fallback")
 
-    # Fallback: random sample
-    df = conn.execute(f"SELECT * FROM {pq} USING SAMPLE {ML_SAMPLE_ROWS}").df()
-    logger.info(f"[feature_eng] Random sample: {len(df):,}/{total:,} satır "
-          f"(target {'confirmed' if confirmed else 'unconfirmed'})")
+    # Random (regression / target yok / stratify uygulanamadı) — temsili örneklem
+    df = conn.execute(f"SELECT * FROM {pq} USING SAMPLE {cap} ROWS").df()
+    sampling_meta.update({"method": "random", "sampled_rows": len(df)})
+    logger.info(f"[feature_eng] Random cap: {total:,} → {len(df):,} satır (cap={cap:,})")
     conn.close()
     df = df.convert_dtypes(convert_integer=False)
+    df.attrs["_dq_sampling"] = sampling_meta
     return df
     
 # Column suffix normalization
@@ -1885,6 +1878,9 @@ def build_features(state: dict) -> dict:
 
     try:
         df = _load_data(state)
+        # Örnekleme metadatasını HEMEN yakala — df.attrs sonraki FE transformasyonlarında
+        # düşebilir; feature_report'a taşınıp rapora yansıtılacak (sessiz değil).
+        sampling_meta = dict(df.attrs.get("_dq_sampling", {}))
     except Exception as e:
         import traceback
         logger.error(f"\n[feature_eng] HATA: {e}")
@@ -2239,6 +2235,8 @@ def build_features(state: dict) -> dict:
         "timeseries_lag":           ts_lag_info,
         "split_strategy":           split_strategy,
         "split_imbalanced_entities": split_imbalanced,
+        # Training cap örnekleme bilgisi (sessiz değil → rapora yansır)
+        "sampling":                 sampling_meta,
     }
 
     # Ağır split dizilerini diske yaz; state'te yalnızca dosya yolu taşı

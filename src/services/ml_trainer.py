@@ -235,6 +235,62 @@ def _prep_data(X_train_raw, X_test_raw, y_train_raw, y_test_raw):
     return X_train, X_test, y_train, y_test
 
 
+# ── Büyük-N model guard ───────────────────────────────────────────────────────
+# Eğitim satırı (n_train) settings.HEAVY_MODEL_MAX_ROWS'u aşınca ağır CPU-kilitli
+# modelleri kısar. AdaBoost DÜŞER (yavaş + boosting üçlüsünün gerisinde); RF/
+# ExtraTrees n_estimators HEAVY_MODEL_TREES'e çekilir (roster'da KALIR → şampiyon
+# seçimi stabil, dropping değil). Eşik-altı → NO-OP (mevcut roster birebir). Sinyal
+# satır sayısına bağlı (kolon/veri adına değil). Sessiz değil: not döner → rapora yansır.
+def _rfet_n_estimators_high(model_name: str, n_rows: int) -> int:
+    """RF/ExtraTrees için Optuna n_estimators üst sınırı — büyük-N'de guard'a bağlı düşer.
+
+    Bu olmadan tuning, guard'ın düşürdüğü ağaç sayısını geri şişirir → kazanç buharlaşır.
+    """
+    if model_name in ("random_forest", "extra_trees") and n_rows > settings.HEAVY_MODEL_MAX_ROWS:
+        return max(50, min(300, settings.HEAVY_MODEL_TREES))
+    return 300
+
+
+def _apply_heavy_model_guard(models: dict, n_train: int) -> tuple[dict, dict]:
+    """Roster'ı büyük-N'de kısar. Eşik-altı → (models, no-op note) değişmeden döner.
+
+    Dönüş: (filtrelenmiş_models, note). note rapora taşınır (heavy_model_guard).
+    """
+    threshold = settings.HEAVY_MODEL_MAX_ROWS
+    note = {"applied": False, "n_train": int(n_train), "threshold": threshold,
+            "dropped": [], "reduced": {}}
+    if n_train <= threshold:
+        return models, note
+
+    from sklearn.base import clone
+    trees = settings.HEAVY_MODEL_TREES
+    out: dict = {}
+    for name, model in models.items():
+        if name == "adaboost":
+            note["dropped"].append(name)               # yavaş + zayıf → tamamen düş
+            continue
+        if name in ("random_forest", "extra_trees"):
+            try:
+                orig = int(clone(model).get_params().get("n_estimators", 200))
+                if orig > trees:
+                    out[name] = clone(model).set_params(n_estimators=trees)
+                    note["reduced"][name] = f"{orig}→{trees}"
+                    continue
+            except Exception:
+                pass                                    # set_params olmazsa modeli koru
+        out[name] = model
+
+    if not out:  # güvenlik: roster asla boşaltılmaz (ör. top_models sadece adaboost)
+        logger.warning("[automl] heavy_model_guard: roster boşalacaktı → guard atlandı")
+        return models, {"applied": False, "n_train": int(n_train), "threshold": threshold,
+                        "dropped": [], "reduced": {}}
+
+    note["applied"] = True
+    logger.info(f"[automl] heavy_model_guard: n_train={n_train:,} > {threshold:,} → "
+                f"dropped={note['dropped']} reduced={note['reduced']}")
+    return out, note
+
+
 # Optuna tuning
 def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, is_binary: bool, strong_regularization: bool = False, is_imbalanced: bool = False) -> Any:
     """Tunes the selected model using Optuna. If strong_regularization is True, shrinks the search space to prevent overfitting."""
@@ -248,7 +304,7 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
         params = {}
         if model_name == "random_forest":
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "n_estimators": trial.suggest_int("n_estimators", 50, _rfet_n_estimators_high("random_forest", len(X_train))),
                 "max_depth": trial.suggest_int("max_depth", 5, 12) if strong_regularization else trial.suggest_int("max_depth", 3, 20),
                 "min_samples_split": trial.suggest_int("min_samples_split", 20, 100) if strong_regularization else trial.suggest_int("min_samples_split", 2, 10),
                 "min_samples_leaf": trial.suggest_int("min_samples_leaf", 10, 50) if strong_regularization else trial.suggest_int("min_samples_leaf", 1, 5),
@@ -257,7 +313,7 @@ def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: 
             model = RandomForestClassifier(**params, random_state=RANDOM_STATE, n_jobs=-1)
         elif model_name == "extra_trees":
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "n_estimators": trial.suggest_int("n_estimators", 50, _rfet_n_estimators_high("extra_trees", len(X_train))),
                 "max_depth": trial.suggest_int("max_depth", 5, 12) if strong_regularization else trial.suggest_int("max_depth", 3, 20),
                 "min_samples_split": trial.suggest_int("min_samples_split", 20, 100) if strong_regularization else trial.suggest_int("min_samples_split", 2, 10),
                 "min_samples_leaf": trial.suggest_int("min_samples_leaf", 10, 50) if strong_regularization else trial.suggest_int("min_samples_leaf", 1, 5),
@@ -339,14 +395,14 @@ def _tune_model_regression(model_name: str, X_train: pd.DataFrame, y_train: np.n
         params = {}
         if model_name == "random_forest":
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "n_estimators": trial.suggest_int("n_estimators", 50, _rfet_n_estimators_high("random_forest", len(X_train))),
                 "max_depth": trial.suggest_int("max_depth", 3, 7) if strong_regularization else trial.suggest_int("max_depth", 3, 20),
                 "min_samples_split": trial.suggest_int("min_samples_split", 10, 50) if strong_regularization else trial.suggest_int("min_samples_split", 2, 10),
             }
             model = RandomForestRegressor(**params, random_state=RANDOM_STATE, n_jobs=-1)
         elif model_name == "extra_trees":
             params = {
-                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "n_estimators": trial.suggest_int("n_estimators", 50, _rfet_n_estimators_high("extra_trees", len(X_train))),
                 "max_depth": trial.suggest_int("max_depth", 3, 7) if strong_regularization else trial.suggest_int("max_depth", 3, 20),
                 "min_samples_split": trial.suggest_int("min_samples_split", 10, 50) if strong_regularization else trial.suggest_int("min_samples_split", 2, 10),
             }
@@ -958,7 +1014,11 @@ def _run_classification(
         models = _get_classification_models_balanced(class_weights)
     else:
         models = _get_classification_models()
-        
+
+    # Büyük-N guard: ağır CPU-kilitli modelleri kıs (eşik-altı no-op). top_models
+    # filtresinden ÖNCE → düşen modeller (adaboost) filtreye hiç girmez.
+    models, _guard_note = _apply_heavy_model_guard(models, len(X_train))
+
     if top_models:
         logger.info(f"[automl] Sadece Top Modeller denenecek: {top_models}")
         models = {k: v for k, v in models.items() if k in top_models}
@@ -1133,6 +1193,7 @@ def _run_classification(
             pass
  
     metrics["feature_importance"] = _extract_feature_importance(best_model, feature_names)
+    metrics["heavy_model_guard"] = _guard_note
     return best_name, best_model, metrics
  
 
@@ -1177,7 +1238,10 @@ def _run_regression(
     y_test_transformed = np.log1p(y_test) if log_applied else y_test
  
     models  = _get_regression_models()
-    
+
+    # Büyük-N guard: ağır CPU-kilitli modelleri kıs (eşik-altı no-op). top_models öncesi.
+    models, _guard_note = _apply_heavy_model_guard(models, len(X_train))
+
     if top_models:
         logger.info(f"[automl] Sadece Top Modeller denenecek: {top_models}")
         models = {k: v for k, v in models.items() if k in top_models}
@@ -1272,6 +1336,7 @@ def _run_regression(
         metrics["blend_weights"] = dict(zip(_blend_bases, np.round(blend_weights, 4).tolist()))
 
     metrics["feature_importance"] = _extract_feature_importance(best_model, feature_names)
+    metrics["heavy_model_guard"] = _guard_note
     return best_name, best_model, metrics
 
 
@@ -1730,6 +1795,9 @@ def train_model(state: AgentState) -> dict:
     # inline yerine yol taşı (checkpoint payload şişmesini önler).
     y_paths = dump_y(y_train, y_test)
 
+    # Büyük-N guard notunu metrics'ten ayıkla → state'e taşı (rapora yansır).
+    guard_note = metrics.pop("heavy_model_guard", {}) if isinstance(metrics, dict) else {}
+
     return {
         **state,
         "intent": intent,
@@ -1739,5 +1807,6 @@ def train_model(state: AgentState) -> dict:
         "model_artifact": model_path,
         "metrics": metrics,
         "top_models": top_models,
+        "heavy_model_guard": guard_note,
         "current_step": "automl_node",
     }

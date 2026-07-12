@@ -601,6 +601,37 @@ def generate_report(state: AgentState) -> dict:
     # dizeler ve LLM çıktısı bu dile göre üretilir.
     lang = normalize_lang(state.get("report_language"))
 
+    # Veri Kalitesi (Katman 2) hard-fail → aksiyona dönük özel rapor.
+    # Generic 'error'/'0 satır' yolundan ÖNCE: kullanıcı NE bozuldu / KAÇ satır
+    # atlandı görsün (TR/EN). Bkz. src/services/data_quality.py.
+    if state.get("data_quality_status") == "failed":
+        dqr = state.get("data_quality_report", {}) or {}
+        reason = (dqr.get("decision", {}) or {}).get("reason", "")
+        q = dqr.get("quarantine", {}) or {}
+        th = dqr.get("target_health", {}) or {}
+        struct = dqr.get("structural", {}) or {}
+        _tables = struct.get("tables", []) or []
+        cols = _tables[0].get("expected_cols", "?") if _tables else struct.get("expected_cols", "?")
+
+        parts = [R("dq_failed_title", lang), "", R("dq_failed_intro", lang), ""]
+        if reason == "target_role_content_conflict":
+            parts.append(R("dq_target_conflict", lang,
+                           col=th.get("target", "?"), nunique=th.get("nunique", "?")))
+        elif reason == "structural_mismatch_high":
+            parts.append(R("dq_structural_high", lang,
+                           n=q.get("rows", 0), total=q.get("total", 0),
+                           rate=f"%{q.get('mismatch_rate', 0) * 100:.1f}", cols=cols))
+        elif reason == "structural_mismatch_target":
+            parts.append(R("dq_structural", lang,
+                           n=q.get("rows", 0), total=q.get("total", 0), cols=cols))
+        parts.append(R("dq_action_hint", lang))
+        logger.warning(f"[report] Veri kalitesi hard-fail: reason='{reason}'")
+        return {
+            **state,
+            "report": "\n".join(parts),
+            "current_step": "report_node",
+        }
+
     # Check for pipeline errors first
     if state.get("error"):
         error_msg = state.get("error")
@@ -699,6 +730,42 @@ def generate_report(state: AgentState) -> dict:
         logger.error(f"[report] LLM hatası: {e}")
         # create fallback report if llm fails
         report_text = _generate_fallback_report(state, lang)
+
+    # Veri kalitesi 'degraded' (bazı satır karantinaya alındı ama modele devam
+    # edildi) → başarılı raporun sonuna görünür not düş. Kullanıcı kaç satırın
+    # neden atlandığını görsün ("herkes anlasın" vaadi).
+    if state.get("data_quality_status") == "degraded":
+        _q = (state.get("data_quality_report", {}) or {}).get("quarantine", {}) or {}
+        if _q.get("rows", 0) > 0:
+            report_text += R("dq_degraded_note", lang, n=_q.get("rows", 0))
+
+    # Training cap örneklemesi (MAX_TRAINING_ROWS aşıldı) → görünür not (sessiz değil).
+    _samp = (state.get("feature_report", {}) or {}).get("sampling", {}) or {}
+    if _samp.get("sampled"):
+        if _samp.get("method") == "stratified":
+            report_text += R("sampling_note_stratified", lang,
+                             orig=_samp.get("original_rows", 0), n=_samp.get("sampled_rows", 0),
+                             before=_samp.get("minority_pct_before", "?"),
+                             after=_samp.get("minority_pct_after", "?"), cap=_samp.get("cap", 0))
+        else:
+            report_text += R("sampling_note_random", lang,
+                             orig=_samp.get("original_rows", 0), n=_samp.get("sampled_rows", 0),
+                             cap=_samp.get("cap", 0))
+
+    # Büyük-N model guard (roster kısıldı) → görünür not (sessiz değil).
+    _guard = state.get("heavy_model_guard", {}) or {}
+    if _guard.get("applied"):
+        _parts = []
+        if _guard.get("dropped"):
+            _parts.append(R("heavy_guard_dropped", lang, models=", ".join(_guard["dropped"])))
+        if _guard.get("reduced"):
+            _changes = "; ".join(f"{k} {v}" for k, v in _guard["reduced"].items())
+            _parts.append(R("heavy_guard_reduced", lang,
+                            models=", ".join(_guard["reduced"].keys()), changes=_changes))
+        if _parts:
+            _detail = (" ve " if lang == "tr" else " and ").join(_parts)
+            report_text += R("heavy_model_guard_note", lang, n=_guard.get("n_train", 0),
+                             thr=_guard.get("threshold", 0), detail=_detail)
 
     logger.info(f"[report] Rapor tamamlandı ({len(report_text)} karakter)")
 

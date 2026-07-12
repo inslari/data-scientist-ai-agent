@@ -159,17 +159,14 @@ def run_sql_query(query: str, db_name: str = "default") -> str:
             rows = result.fetchall()
             column_names = list(result.keys())
 
-        output = f"Columns: {', '.join(column_names)}\n"
-        output += f"Returned {len(rows)} rows.\nResults:\n"
-
-        MAX_DISPLAY_ROWS = 10_000
-        for row in rows[:MAX_DISPLAY_ROWS]:
-            output += str(tuple(row)) + "\n"
-
-        if len(rows) > MAX_DISPLAY_ROWS:
-            output += f"... (Showing only first {MAX_DISPLAY_ROWS} rows)"
-
-        return output
+        # Sağlam serialization: her hücre literal-güvenli primitife indirgenir, böylece
+        # Timestamp/Decimal/virgül-içeren-string satırı bölmez (kolon kayması). Üretici
+        # + istemci simetrisi için tek kaynak: src/core/row_codec.py.
+        # Transport tavanı env-override'lı (settings.MAX_FETCH_ROWS) — asıl training cap
+        # ayrı/stratified (feature_builder + MAX_TRAINING_ROWS).
+        from src.core.row_codec import encode_result
+        from src.core.config import settings
+        return encode_result(column_names, rows, max_rows=settings.MAX_FETCH_ROWS)
     except Exception as e:
         return f"SQL Error: {e}"
 

@@ -157,6 +157,64 @@ _STRINGS: dict[str, dict[str, str]] = {
         "tr": "Veri işleme sürecinde kritik bir hata meydana geldi ve analiz durduruldu:\n\n**Hata Nedeni:** {e}\n\n*Lütfen daha büyük veya daha tutarlı bir veri seti ile tekrar deneyin.*",
         "en": "A critical error occurred during data processing and the analysis was halted:\n\n**Error cause:** {e}\n\n*Please try again with a larger or more consistent dataset.*",
     },
+    # ---- data_quality (Katman 2): aksiyona dönük hata raporları ----
+    # Generic "0 satır" yerine kullanıcı NE bozuldu / KAÇ satır atlandı görsün.
+    "dq_failed_title": {
+        "tr": "# ❌ Veri Kalitesi Kontrolü: Analiz Durduruldu",
+        "en": "# ❌ Data Quality Check: Analysis Halted",
+    },
+    "dq_failed_intro": {
+        "tr": "Modelleme öncesi otomatik veri kalitesi kontrolü verinin güvenle modellenemeyeceğini tespit etti; yanıltıcı bir sonuç üretmemek için analiz durduruldu.",
+        "en": "The pre-modeling data quality check found the data cannot be safely modeled; analysis was halted to avoid producing a misleading result.",
+    },
+    # Target rol-içerik çelişkisi (fraud vakası): ad ikili ima ediyor ama sürekli.
+    "dq_target_conflict": {
+        "tr": "**Hedef değişken `{col}`** ikili (0/1) bir etiket bekleniyordu ama **{nunique} farklı sürekli değer** içeriyor. Bu genellikle kolon hizasının kayması (ör. içinde virgül olan bir alanın satırı bölmesi) sonucu hedef sütuna yanlış verinin düşmesinden kaynaklanır. Model eğitilmedi.",
+        "en": "**Target variable `{col}`** was expected to be a binary (0/1) label but contains **{nunique} distinct continuous values**. This usually means the columns are misaligned (e.g. a field with an embedded comma split the row), so the wrong data landed in the target column. No model was trained.",
+    },
+    # Yapısal kayma: kaç satır neden atlandı.
+    "dq_structural": {
+        "tr": "**{n}/{total} satır** hatalı format nedeniyle atlandı: alan sayısı beklenen **{cols} kolon** ile uyuşmuyor (kolon kayması imzası). Kalan satırların sütun hizası — özellikle hedef etiketi — güvenilir sayılamadığı için analiz durduruldu.",
+        "en": "**{n}/{total} rows** were skipped due to malformed format: their field count does not match the expected **{cols} columns** (column-shift signature). Because the remaining rows' column alignment — especially the target label — cannot be trusted, analysis was halted.",
+    },
+    "dq_structural_high": {
+        "tr": "**{n}/{total} satır** ({rate}) hatalı format nedeniyle atlandı — beklenen **{cols} kolon** ile alan sayısı uyuşmuyor. Bozulma oranı çok yüksek; veri güvenle modellenemez.",
+        "en": "**{n}/{total} rows** ({rate}) were skipped due to malformed format — field count does not match the expected **{cols} columns**. The corruption rate is too high to model the data safely.",
+    },
+    "dq_action_hint": {
+        "tr": "\n\n*Öneri: Kaynak dosyayı kontrol edin — içinde ayraç (virgül) barındıran alanların tırnaklandığından ve her satırın aynı sayıda sütuna sahip olduğundan emin olun, sonra yeniden yükleyin.*",
+        "en": "\n\n*Suggestion: Check the source file — ensure fields containing the delimiter (comma) are quoted and every row has the same number of columns, then re-upload.*",
+    },
+    # Training cap: büyük veri stratified örneklendi (sessiz değil, rapora yansır).
+    "sampling_note_stratified": {
+        "tr": "\n\n> ℹ️ **Örnekleme:** {orig:,} satırdan {n:,} satıra **stratified** örneklendi; sınıf oranı korundu (azınlık %{before} → %{after}). Sınır: `MAX_TRAINING_ROWS={cap:,}` (env ile artırılabilir).",
+        "en": "\n\n> ℹ️ **Sampling:** stratified-sampled {orig:,} → {n:,} rows; class ratio preserved (minority {before}% → {after}%). Limit: `MAX_TRAINING_ROWS={cap:,}` (raise via env).",
+    },
+    "sampling_note_random": {
+        "tr": "\n\n> ℹ️ **Örnekleme:** {orig:,} satırdan {n:,} satıra temsili (random) örneklendi. Sınır: `MAX_TRAINING_ROWS={cap:,}` (env ile artırılabilir).",
+        "en": "\n\n> ℹ️ **Sampling:** representatively (random) sampled {orig:,} → {n:,} rows. Limit: `MAX_TRAINING_ROWS={cap:,}` (raise via env).",
+    },
+
+    # Büyük-N model guard: roster neden değişti (sessiz değil, rapora yansır).
+    "heavy_model_guard_note": {
+        "tr": "\n\n> ⚙️ **Model seçimi:** {n:,} eğitim satırı > {thr:,} eşiği — {detail}. (`HEAVY_MODEL_MAX_ROWS` ile ayarlanır.)",
+        "en": "\n\n> ⚙️ **Model selection:** {n:,} training rows > {thr:,} threshold — {detail}. (tune via `HEAVY_MODEL_MAX_ROWS`.)",
+    },
+    "heavy_guard_dropped": {
+        "tr": "{models} hız/verim nedeniyle atlandı",
+        "en": "{models} skipped for speed/performance",
+    },
+    "heavy_guard_reduced": {
+        "tr": "{models} ağaç sayısı düşürüldü ({changes})",
+        "en": "{models} tree count reduced ({changes})",
+    },
+
+    # degraded: normal rapora eklenen veri-kalitesi notu (durdurmaz).
+    "dq_degraded_note": {
+        "tr": "\n\n> ⚠️ **Veri kalitesi notu:** {n} satır hatalı format nedeniyle atlandı; analiz kalan temiz satırlarla yapıldı.",
+        "en": "\n\n> ⚠️ **Data quality note:** {n} rows were skipped due to malformed format; analysis used the remaining clean rows.",
+    },
+
     "err_noreport_title": {"tr": "# ❌ Rapor Üretilemedi", "en": "# ❌ Report Could Not Be Generated"},
     "err_noeval": {
         "tr": "Evaluation raporu bulunamadı, report_node atlanıyor.",

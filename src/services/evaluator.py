@@ -241,6 +241,28 @@ def _evaluate_classification(
         except Exception:
             pass
 
+    # Interaktif threshold slider verisi — ham olasiliklar + gercek etiketler.
+    # NOT: evaluation dict'i ICINE gomuluyor (worker.py'deki [:5] kirpma yalnizca
+    # top-level y_test/X_test gibi anahtarlara uygulanir; buraya dokunmaz).
+    # Yalniz binary'de; frontend bu alan yoksa slider'i gizler.
+    if is_binary and y_prob_test is not None:
+        try:
+            # predict_proba[:,1] pozitif sinif = model.classes_[1]
+            classes_sorted = sorted(np.unique(np.concatenate([y_train, y_test])))
+            pos_label = classes_sorted[1] if len(classes_sorted) == 2 else 1
+            y_true_bin = (np.asarray(y_test) == pos_label).astype(int)
+            p1 = y_prob_test[:, 1]
+            evaluation["threshold_analysis"] = {
+                "y_true": [int(v) for v in y_true_bin],
+                "y_prob": [round(float(v), 4) for v in p1],   # 4 hane: NaN riski + payload
+                "optimal_threshold": (roc_curve_data or {}).get("optimal_threshold", 0.5),
+                "positive_label": int(pos_label) if isinstance(pos_label, (np.integer,)) else pos_label,
+                "pos_count": int(y_true_bin.sum()),
+                "neg_count": int((1 - y_true_bin).sum()),
+            }
+        except Exception:
+            pass
+
     # Feature importance analysis
     # Feature importance analysis
     fi = _extract_feature_importance(model, feature_names)
@@ -1378,7 +1400,7 @@ def evaluate_model(state: AgentState) -> dict:
 
     opt_thresh = evaluation_report.get("optimal_threshold")
     if opt_thresh is not None:
-        logger.info(f"\n[evaluation] Optimal Threshold (Youden's J): {opt_thresh}")
+        logger.info(f"\n[evaluation] Optimal Threshold (F1-maksimize): {opt_thresh}")
 
     fi_summary = evaluation_report.get("feature_importance_summary", {})
     if fi_summary:

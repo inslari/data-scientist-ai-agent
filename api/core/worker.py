@@ -446,13 +446,28 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
                 finally:
                     db_s.close()
 
-            # Mark project completed
+            # Mark project completed — AMA veri kalitesi hard-fail'i veya pipeline
+            # error'ı 'completed' saymayız. Graph exception atmadan (report_node
+            # aksiyona dönük raporu üreterek) bittiği için eskiden hep 'completed'
+            # işaretleniyordu; kullanılamaz sonuç artık 'failed' olur ve error_trace
+            # ile job da 'failed' işaretlenir (_mark_job).
+            dq_failed = final_state.get("data_quality_status") == "failed"
+            pipeline_error = final_state.get("error")
+            final_status = "failed" if (dq_failed or pipeline_error) else "completed"
+
             db_s = SessionLocal()
             try:
                 project_obj = db_s.query(ProjectModel).filter(ProjectModel.id == project_id).first()
                 if project_obj:
-                    project_obj.status = "completed"
+                    project_obj.status = final_status
                     project_obj.report = final_state.get("report", "")
+                    if final_status == "failed":
+                        if dq_failed:
+                            _dec = (final_state.get("data_quality_report", {}) or {}).get("decision", {}) or {}
+                            project_obj.error = f"data_quality:{_dec.get('reason', 'failed')}"
+                        else:
+                            project_obj.error = str(pipeline_error)[:2000]
+                        error_trace = project_obj.error
                     db_s.commit()
             finally:
                 db_s.close()

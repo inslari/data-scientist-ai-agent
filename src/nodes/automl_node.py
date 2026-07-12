@@ -38,5 +38,7 @@ def automl_node(state: AgentState) -> AgentState:
         "model_artifact": result.get("model_artifact"),
         "metrics": result.get("metrics", {}),
         "top_models": result.get("top_models", []),
+        # Büyük-N guard notu → rapora yansır (sessiz değil).
+        "heavy_model_guard": result.get("heavy_model_guard", {}),
         "current_step": "automl_node",
     })
