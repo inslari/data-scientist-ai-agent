@@ -35,6 +35,7 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
+    average_precision_score,
     log_loss,
     matthews_corrcoef,
     mean_absolute_error,
@@ -48,6 +49,7 @@ from sklearn.metrics import (
 )
 from sklearn.calibration import calibration_curve
 from src.services.leakage_detector import detect_target_lock
+from src.core.report_i18n import normalize_lang, R_METRIC
 from ..state import AgentState
 from ..history_tracker import log_experiment
 from src.core.logging_config import get_logger
@@ -67,6 +69,7 @@ def _evaluate_classification(
     y_test: np.ndarray,
     feature_names: list[str],
     cv_score: float | None = None,
+    cv_metric: str = "roc_auc",
 ) -> dict:
     """Comprehensive evaluation for binary and multiclass classification."""
     is_binary = len(np.unique(y_test)) == 2
@@ -77,11 +80,17 @@ def _evaluate_classification(
 
     y_prob_test = None
     y_prob_train = None
+    prob_error: str | None = None
     try:
         y_prob_test = model.predict_proba(X_test)
         y_prob_train = model.predict_proba(X_train)
-    except Exception:
-        pass
+    except Exception as e:
+        # SESSIZ BASARISIZLIK YASAK: buradan dusersek ROC, PR-AUC, kalibrasyon, ROC egrisi ve
+        # threshold slider'in HEPSI izsiz kaybolur. Cokmuyoruz (metriksiz rapor > rapor yok) ama
+        # hem log biraliyoruz hem de `metrics_unavailable` ile RAPORA tasiyoruz.
+        prob_error = f"{type(e).__name__}: {e}"
+        logger.warning(f"[evaluation] predict_proba basarisiz — olasilik-tabanli metrikler "
+                       f"(ROC/PR-AUC/kalibrasyon/threshold) hesaplanamayacak: {prob_error}")
 
     # Optimal Threshold Calculation
     roc_curve_data = None
@@ -94,7 +103,6 @@ def _evaluate_classification(
             # optimal_threshold = round(float(thresholds[optimal_idx]), 4)
 
             # Optimal threshold: F1 Skorunu maksimize ederek secelim (Dengesiz veriler icin daha iyi)
-            from sklearn.metrics import precision_recall_curve
             precision, recall, pr_thresholds = precision_recall_curve(y_test, y_prob_test[:, 1])
 
             num = 2 * recall * precision
@@ -146,10 +154,23 @@ def _evaluate_classification(
                 test_metrics["roc_auc_ovr"] = round(float(
                     roc_auc_score(y_test, y_prob_test, multi_class="ovr", average="weighted")
                 ), 4)
-        except Exception:
-            pass
+        except Exception as e:
+            # Metrik YOK ≠ metrik 0. quality_gate eksik ROC'u 0 sayip haksiz "dusuk performans"
+            # FAIL'i veriyordu; artik anahtar hic yazilmiyor ve gate EKSIK olarak ele aliyor.
+            logger.warning(f"[evaluation] ROC-AUC hesaplanamadi: {type(e).__name__}: {e}")
 
-
+    # PR-AUC — dengesiz veride ASIL metrik, o yüzden headline test_metrics içinde.
+    # `pr_auc_baseline` olmadan sayı yanıltıcıdır: ROC'un rastgele tabanı hep 0.5 ama
+    # PR-AUC'un tabanı POZİTİF ORANIDIR. %0.17 fraud'da rastgele model 0.0017 alır —
+    # bu bağlam olmadan "PR-AUC 0.71" vasat sanılır, oysa tabanın ~400 katı.
+    if is_binary and y_prob_test is not None:
+        try:
+            test_metrics["pr_auc"] = round(float(
+                average_precision_score(y_test, y_prob_test[:, 1])
+            ), 4)
+            test_metrics["pr_auc_baseline"] = round(float(np.mean(y_test)), 4)
+        except Exception as e:
+            logger.warning(f"[evaluation] PR-AUC hesaplanamadi: {type(e).__name__}: {e}")
 
     # Log loss
     if y_prob_test is not None:
@@ -159,6 +180,16 @@ def _evaluate_classification(
             pass
 
     evaluation["test_metrics"] = test_metrics
+
+    # Kullanici SESSIZCE EKSIK RAPOR ALMASIN: olasilik uretilemediyse hangi metriklerin NEDEN
+    # yok oldugunu rapora/UI'a tasi (bos kart gostermek yerine acik neden yaz).
+    if prob_error is not None:
+        evaluation["metrics_unavailable"] = {
+            "reason": "predict_proba_failed",
+            "detail": prob_error,
+            "affected": ["roc_auc", "pr_auc", "pr_auc_baseline", "log_loss",
+                         "roc_curve", "calibration", "threshold_analysis", "confidence_intervals"],
+        }
 
     # Train set metrics
     train_metrics = {
@@ -170,17 +201,33 @@ def _evaluate_classification(
         try:
             if is_binary:
                 train_metrics["roc_auc"] = round(float(roc_auc_score(y_train, y_prob_train[:, 1])), 4)
+                train_metrics["pr_auc"] = round(float(
+                    average_precision_score(y_train, y_prob_train[:, 1])
+                ), 4)
             else:
                 train_metrics["roc_auc_ovr"] = round(float(
                     roc_auc_score(y_train, y_prob_train, multi_class="ovr", average="weighted")
                 ), 4)
-        except Exception:
-            pass
+        except Exception as e:
+            # Sessizce dusersek gap `accuracy`'ye kayar (CV yoksa) → sahte overfit teshisi.
+            logger.warning(f"[evaluation] Train ROC/PR-AUC hesaplanamadi: {type(e).__name__}: {e}")
 
     evaluation["train_metrics"] = train_metrics
 
-    # Overfitting analysis — CV (dürüst) varsa CV−test bazlı
-    overfitting = _analyze_overfitting(train_metrics, test_metrics, cv_score=cv_score)
+    # Bootstrap CI — overfit teshisinden ONCE: verdict, test skorunun kendi GA'sini bilmeden
+    # verilemez (gap GA'nin icinde kaliyorsa iddia edilemez → `inconclusive`).
+    logger.info("Bootstrap CI hesaplanıyor...")
+    evaluation["confidence_intervals"] = _bootstrap_ci_classification(
+        model, X_test, y_test, is_binary, n_iterations=300
+    )
+
+    # Overfitting analysis — CV (dürüst) varsa CV−test bazlı.
+    # cv_metric: CV hangi metrikle koştuysa gap o metrik ÜZERİNDEN kıyaslanır; GA de aynı metrikten.
+    n_test_pos = int(np.sum(np.asarray(y_test) == sorted(np.unique(y_test))[-1])) if is_binary else None
+    overfitting = _analyze_overfitting(
+        train_metrics, test_metrics, cv_score=cv_score, cv_metric=cv_metric,
+        test_ci=evaluation["confidence_intervals"], n_test_positives=n_test_pos,
+    )
     evaluation["overfitting"] = overfitting
 
     # Confusion matrix
@@ -218,7 +265,6 @@ def _evaluate_classification(
     if is_binary and y_prob_test is not None:
         try:
             precision_curve, recall_curve, _ = precision_recall_curve(y_test, y_prob_test[:, 1])
-            from sklearn.metrics import average_precision_score
             evaluation["precision_recall_curve"] = {
                 "precision": [round(float(x), 4) for x in precision_curve[::max(1, len(precision_curve) // 20)]],
                 "recall": [round(float(x), 4) for x in recall_curve[::max(1, len(recall_curve) // 20)]],
@@ -280,11 +326,7 @@ def _evaluate_classification(
             for c in target_lock_concerns:
                 logger.info(f"  - {c['feature']} (imp={c['importance']}): {c['reason']}")
 
-    # Bootstrap confidence intervals
-    logger.info("Bootstrap CI hesaplanıyor...")
-    evaluation["confidence_intervals"] = _bootstrap_ci_classification(
-        model, X_test, y_test, is_binary, n_iterations=300
-    )
+    # (Bootstrap CI yukarida, overfit teshisinden ONCE hesaplandi.)
 
     # Error analysis
     evaluation["error_analysis"] = _analyze_errors(
@@ -447,17 +489,44 @@ def _safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 # Overfitting Analysis
-def _analyze_overfitting(train_metrics: dict, test_metrics: dict, cv_score: float | None = None) -> dict:
+def _analyze_overfitting(train_metrics: dict, test_metrics: dict, cv_score: float | None = None,
+                         cv_metric: str = "roc_auc", test_ci: dict | None = None,
+                         n_test_positives: int | None = None) -> dict:
     """Overfitting teşhisi.
+
+    ÖLÇÜM BELİRSİZLİĞİ (`inconclusive`): gap ancak ÖLÇÜLEBİLDİĞİ kadar iddia edilebilir.
+    Az pozitifli test setinde test skorunun örnekleme hatası devasadır (ULB: 34 pozitif,
+    PR-AUC bootstrap sd ~0.07) — gözlenen gap bu gürültünün İÇİNDE kalıyorsa "overfitting"
+    demek, örneklemin desteklemediği bir iddiadır. Sınama: CV skoru, test skorunun bootstrap
+    %95 GA'sının İÇİNDE mi? İçindeyse fark sıfırdan ayırt edilemiyor → verdict `inconclusive`,
+    regularization ÖNERİLMEZ. Sabit "min pozitif sayısı" eşiği YOK: ince test seti zaten
+    GA'yı genişletip kuralı kendiliğinden tetikler (pozitif sayısı yalnız GEREKÇE metninde).
+    Sınama muhafazakâr: CV'nin kendi gürültüsünü saymaz, yani belirsizliği EKSİK tahmin eder.
 
     KRİTİK: ağaç toplulukları (RF/XGB/GB/blend) train verisini ~ezberler →
     resubstitution train skoru ~1.0'dır ve test ile farkı YAPISAL olarak büyüktür;
     bu TEK BAŞINA gerçek overfitting'i GÖSTERMEZ. Dürüst sinyal: CV (out-of-fold)
     skoru ile holdout test arasındaki fark — ikisi de örnek-dışı. CV verilmişse onu
     baz alırız (grandmaster disiplini); yoksa eski resubstitution farkına düşeriz.
-    Resubstitution farkı bilgi olarak korunur (`train_score`, `gap_train_test`)."""
-    train_score = train_metrics.get("roc_auc") or train_metrics.get("roc_auc_ovr") or train_metrics.get("accuracy") or 0.0
-    test_score = test_metrics.get("roc_auc") or test_metrics.get("roc_auc_ovr") or test_metrics.get("accuracy") or 0.0
+    Resubstitution farkı bilgi olarak korunur (`train_score`, `gap_train_test`).
+
+    METRİK EŞLEŞMESİ: gap ancak AYNI metriğin iki ölçümü arasında anlamlıdır. Aşırı
+    dengesizlikte CV artık PR-AUC ile koşuyor (`cv_metric="pr_auc"`); o durumda test
+    tarafında da PR-AUC alınır. Karıştırmak (CV-PR-AUC − test-ROC) tamamen uydurma bir
+    fark üretir ve sahte "overfitting" teşhisi doğurur."""
+    # cv_metric CV'nin koştuğu metrik; train/test tarafı da aynı metrikten okunur.
+    _order = ([cv_metric] if cv_metric in ("pr_auc", "roc_auc", "roc_auc_ovr") else []) \
+        + ["roc_auc", "roc_auc_ovr", "accuracy"]
+
+    def _pick(m: dict) -> float:
+        for k in _order:
+            v = m.get(k)
+            if v:
+                return float(v)
+        return 0.0
+
+    train_score = _pick(train_metrics)
+    test_score = _pick(test_metrics)
     gap_train_test = round(float(train_score - test_score), 4)
 
     if cv_score is not None and cv_score > 0:
@@ -473,23 +542,47 @@ def _analyze_overfitting(train_metrics: dict, test_metrics: dict, cv_score: floa
     elif gap > OVERFITTING_THRESHOLD / 2:
         status = "mild_overfitting"
 
+    # Belirsizlik sinamasi — yalniz gap BIR SEY IDDIA EDIYORSA (normal'i susturmaya gerek yok)
+    # ve gap CV−test bazliysa (resubstitution farkinin bootstrap GA'si yok).
+    ci = (test_ci or {}).get(cv_metric) or {}
+    ci_lower, ci_upper = ci.get("lower"), ci.get("upper")
+    if (status != "normal" and basis == "cv_vs_test"
+            and ci_lower is not None and ci_upper is not None
+            and float(ci_lower) <= float(cv_score) <= float(ci_upper)):  # type: ignore[arg-type]
+        logger.info(
+            f"[evaluation] Overfit verdict SUSTURULDU: CV ({float(cv_score):.4f}) test "  # type: ignore[arg-type]
+            f"{cv_metric} GA'sinin ICINDE [{float(ci_lower):.4f}, {float(ci_upper):.4f}] — "
+            f"gap {gap:.4f} olcum gurultusunden ayirt edilemiyor "
+            f"(test pozitif sayisi: {n_test_positives})."
+        )
+        status = "inconclusive"
+
     # Grafik/metin için TUTARLI kaynak: CV varsa bar+gap CV−test bazlı (gap zaten öyle),
     # yoksa train−test. train_score (resubstitution) bilgi/not amaçlı korunur.
     use_cv = cv_score is not None and cv_score > 0
     display_score = round(float(cv_score if use_cv else train_score), 4)
-    display_label = "CV (5-fold)" if use_cv else "Train"
+    # Etikete METRİK ADI girer: aşırı dengesizlikte CV artık PR-AUC ile koşuyor ve kullanıcı
+    # "dün 0.97'ydi bugün 0.86" derse sebebin skor düşüşü değil METRİK DEĞİŞİMİ olduğunu
+    # ancak buradan anlayabilir.
+    _label = {"pr_auc": "PR-AUC", "roc_auc": "ROC-AUC", "roc_auc_ovr": "ROC-AUC (OvR)"}.get(cv_metric, cv_metric)
+    display_label = f"CV ({_label})" if use_cv else "Train"
 
     return {
         "train_score": round(float(train_score), 4),
         "test_score": round(float(test_score), 4),
         "cv_score": round(float(cv_score), 4) if cv_score is not None else None,
         "display_score": display_score,   # grafiğin 1. barı (CV varsa CV, yoksa train)
-        "display_label": display_label,   # "CV (5-fold)" | "Train"
+        "display_label": display_label,   # "CV (PR-AUC)" | "CV (ROC-AUC)" | "Train"
         "gap": gap,                       # dürüst gap (CV varsa CV−test)
         "gap_train_test": gap_train_test, # bilgi: resubstitution farkı (ağaçta doğal yüksek)
         "basis": basis,
+        "metric": cv_metric,              # gap HANGİ metrik üzerinden ölçüldü (karışmasın)
         "status": status,
-        "description": _overfitting_description(status, gap, basis),
+        "ci_lower": ci_lower,             # test skorunun bootstrap %95 GA'sı — AYNI metrik
+        "ci_upper": ci_upper,
+        "n_test_positives": n_test_positives,
+        "description": _overfitting_description(status, gap, basis, cv_metric,
+                                                ci_lower, ci_upper, n_test_positives),
     }
 
 
@@ -535,10 +628,26 @@ def _analyze_overfitting_regression(train_metrics: dict, test_metrics: dict, cv_
     }
 
 
-def _overfitting_description(status: str, gap: float, basis: str = "cv_vs_test") -> str:
+def _overfitting_description(status: str, gap: float, basis: str = "cv_vs_test",
+                             metric: str = "roc_auc", ci_lower: float | None = None,
+                             ci_upper: float | None = None,
+                             n_test_positives: int | None = None) -> str:
     # basis="cv_vs_test" → dürüst genelleme farkı (CV−test); "train_vs_test" → CV yoksa
     # resubstitution farkı (ağaçta doğal yüksek, yanıltıcı olabilir).
     ref = "CV (out-of-fold) ile test" if basis == "cv_vs_test" else "train (resubstitution) ile test"
+
+    if status == "inconclusive":
+        # Örneklemin desteklemediği iddiada bulunma: gap ölçüm gürültüsünün içinde.
+        pos = (f"test setinde yalnız {n_test_positives} pozitif örnek var; "
+               if n_test_positives is not None else "")
+        ci = (f"%95 güven aralığı [{float(ci_lower):.3f}, {float(ci_upper):.3f}]"
+              if ci_lower is not None and ci_upper is not None else "güven aralığı geniş")
+        return (f"Genelleme farkı ÖLÇÜLEMİYOR ({ref} farkı: {gap:.3f}, metrik: {metric}). "
+                f"{pos}bu yüzden test skorunun {ci} — CV skoru bu aralığın içinde kalıyor. "
+                "Gözlenen fark ölçüm gürültüsünden ayırt edilemediği için overfitting İDDİA "
+                "EDİLEMEZ; regularization önerilmez. Daha çok pozitif örnek içeren bir test "
+                "seti (veya daha fazla veri) olmadan bu soru cevaplanamaz.")
+
     descriptions = {
         "normal": f"Model iyi genelleştiriyor — {ref} performansı dengeli (fark: {gap:.3f}).",
         "mild_overfitting": f"Hafif overfitting mevcut ({ref} farkı: {gap:.3f}). "
@@ -568,8 +677,10 @@ def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
         fi = _rich(model, feature_names)
         if fi:
             return fi
-    except Exception:
-        pass
+    except Exception as e:
+        # Zengin yol dustu → asagidaki basit cikarim denenecek; yine de iz birak.
+        logger.warning(f"[evaluation] ml_trainer importance yolu basarisiz, basit cikarima "
+                       f"dusuluyor: {type(e).__name__}: {e}")
 
     # Fallback: ml_trainer import edilemez/boş dönerse basit çıkarım
     try:
@@ -590,8 +701,11 @@ def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
         if importances is not None:
             imp_dict = dict(zip(feature_names, importances.tolist()))
             return dict(sorted(imp_dict.items(), key=lambda x: x[1], reverse=True))
-    except Exception:
-        pass
+    except Exception as e:
+        # Bos importance = target-lock leakage dedektorunun kontrol edecek HICBIR SEYI olmamasi
+        # (sessizce "temiz" der) + SHAP/rapor bolumlerinin bos kalmasi. Sessiz gecilemez.
+        logger.warning(f"[evaluation] Feature importance cikarilamadi — leakage kontrolu ve "
+                       f"importance raporu bos kalacak: {type(e).__name__}: {e}")
     return {}
 
 
@@ -675,7 +789,10 @@ def _bootstrap_ci_classification(
     """Bootstrap samples with metric confidence intervals (classification)."""
     rng = np.random.default_rng(settings.RANDOM_SEED)
     n = len(y_test)
-    metrics_boot: dict[str, list] = {"accuracy": [], "f1_weighted": [], "roc_auc": [], "mcc": []}
+    metrics_boot: dict[str, list] = {"accuracy": [], "f1_weighted": [], "roc_auc": [], "mcc": [],
+                                     "pr_auc": []}
+    prob_failures = 0
+    last_prob_error = ""
 
     for _ in range(n_iterations):
         idx = rng.integers(0, n, size=n)
@@ -693,12 +810,29 @@ def _bootstrap_ci_classification(
             y_prob_b = model.predict_proba(X_b)
             if is_binary:
                 metrics_boot["roc_auc"].append(float(roc_auc_score(y_b, y_prob_b[:, 1])))
+                # PR-AUC'un GA'si overfit verdict'i icin ZORUNLU: gap PR-AUC uzerinden
+                # hesaplaniyorsa belirsizligi de PR-AUC'un kendi GA'siyla olculmeli.
+                metrics_boot["pr_auc"].append(
+                    float(average_precision_score(y_b, y_prob_b[:, 1]))
+                )
             else:
                 metrics_boot["roc_auc"].append(
                     float(roc_auc_score(y_b, y_prob_b, multi_class="ovr", average="weighted"))
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            # 300 iterasyonun ICINDE: her turda loglamak akinti yapar → bir kez, dongu sonrasi.
+            prob_failures += 1
+            last_prob_error = f"{type(e).__name__}: {e}"
+
+    if prob_failures:
+        # KRITIK: bu sessizce dusersen `pr_auc`/`roc_auc` GA'si HIC uretilmez ve overfit
+        # belirsizlik kuralı (status="inconclusive") sessizce DEVRE DISI kalir — yani ince
+        # test setinde sahte "overfitting_detected" geri doner. Iz birakmadan gecilemez.
+        logger.warning(
+            f"[evaluation] Bootstrap: {prob_failures}/{n_iterations} iterasyonda olasilik-tabanli "
+            f"metrik (ROC/PR-AUC) hesaplanamadi → guven araligi eksik kalabilir, overfit "
+            f"belirsizlik sinamasi calismayabilir. Son hata: {last_prob_error}"
+        )
 
     alpha = (1 - ci) / 2
     result = {}
@@ -1046,6 +1180,11 @@ def _compute_reliability_score(evaluation: dict) -> dict:
     elif ovf_status == "underfitting":
         score += 10
         factors.append("Underfitting")
+    elif ovf_status == "inconclusive":
+        # Olculemedi ≠ kotu. Overfitting'i KANITLAYAMADIGIMIZ icin cezalandirmak da,
+        # "yok" deyip tam puan vermek de yanlis olur → ortada, gerekcesi acikca yazili.
+        score += 15
+        factors.append("Genelleme olculemedi (ince test seti — overfitting ne dogrulandi ne curutuldu)")
 
     # Balance metric: F1 for classification, MAPE for regression (0-20 points)
     max_score += 20
@@ -1184,8 +1323,12 @@ def evaluate_model(state: AgentState) -> dict:
     # CV (out-of-fold) skoru — overfitting teşhisini resubstitution yerine dürüst
     # CV−test farkına dayandırmak için ml_trainer metrics'inden alınır.
     _m = state.get("metrics", {}) or {}
-    cv_score_cls = _m.get("cv_roc_auc")
+    cv_score_cls = _m.get("cv_score", _m.get("cv_roc_auc"))  # eski anahtar: legacy fallback
     cv_score_reg = _m.get("cv_r2")
+    # CV hangi metrikle koştu? Aşırı dengesizlikte PR-AUC olabiliyor. Gap'i AYNI metrik
+    # çifti üzerinden hesaplamak için taşınır (CV-PR-AUC vs test-ROC kıyaslamak sahte
+    # overfitting üretir).
+    cv_metric_cls = _m.get("cv_scoring_metric", "roc_auc")
 
     # Evaluation regarding task type
     if intent == "regression":
@@ -1202,7 +1345,8 @@ def evaluate_model(state: AgentState) -> dict:
         evaluation_report = _pass_anomaly_metrics(state)
     else:
         evaluation_report = _evaluate_classification(
-            model, X_train, y_train, X_test, y_test, feature_names, cv_score=cv_score_cls
+            model, X_train, y_train, X_test, y_test, feature_names,
+            cv_score=cv_score_cls, cv_metric=cv_metric_cls,
         )
 
     # Model name and feature plan
@@ -1218,6 +1362,7 @@ def evaluate_model(state: AgentState) -> dict:
             evaluation_report["bias_analysis"] = bias_report
 
     # Metric explanations for UI
+    lang = normalize_lang(state.get("report_language"))
     evaluation_report["metric_descriptions"] = {
         # Test Metrics
         "accuracy": {
@@ -1250,6 +1395,8 @@ def evaluate_model(state: AgentState) -> dict:
             "range": "0–1 (>0.9 mükemmel, >0.8 iyi, >0.7 kabul edilebilir)",
             "caveat": "Dengesiz veri setlerinde PR-AUC ile birlikte değerlendirilmeli.",
         },
+        "pr_auc": R_METRIC("pr_auc", lang),
+        "pr_auc_baseline": R_METRIC("pr_auc_baseline", lang),
         "log_loss": {
             "label": "Log Loss",
             "description": "Modelin olasılık tahminlerinin doğruluğunu ölçer. Küçük değer daha iyi.",
@@ -1305,6 +1452,8 @@ def evaluate_model(state: AgentState) -> dict:
                 "normal": "Fark < 0.025 — iyi genelleşme",
                 "mild_overfitting": "Fark 0.025–0.05 — hafif overfitting",
                 "overfitting_detected": "Fark > 0.05 — ciddi overfitting",
+                "inconclusive": "Fark, test skorunun %95 güven aralığının içinde — ölçüm belirsiz "
+                                "(az pozitifli test seti). Overfitting ne doğrulanabilir ne çürütülebilir.",
             },
         },
         "calibration": {

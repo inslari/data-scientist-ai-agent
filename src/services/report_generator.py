@@ -819,6 +819,10 @@ def _generate_fallback_report(state: AgentState, lang: str = "tr") -> str:
     for k, v in test_m.items():
         lines.append(f"| {k} | {v} |")
 
+    # Eksik metrikler BOŞ KART olarak değil, açık NEDEN olarak görünsün (sessiz başarısızlık yok).
+    if ev.get("metrics_unavailable"):
+        lines += ["", f"> ⚠️ {R('eval_no_probabilities', lang)}"]
+
     if ci:
         lines += ["", R("fb_ci", lang)]
         for metric, vals in ci.items():

@@ -42,6 +42,10 @@ class AgentState(TypedDict, total=False):
 
     # Feature Plan output
     feature_plan: dict               # Feature engineering plan from LLM
+    # Analist → feature_plan kanalı: HEDEF-KÖR yapısal ipuçları (yalnızca kolon adı,
+    # sıfır istatistik). analysis_engine.extract_plan_hints() üretir; target-farkındalıklı
+    # hiçbir bulgu (korelasyon skoru, feature önem sırası) bu kanaldan AKMAZ.
+    analysis_hints: dict             # {generated_from, target_aware, constant_columns, ...}
 
     # Execution Node output
     data_path: str

@@ -59,6 +59,8 @@ What problem was solved, how good is the model, and what is the direct answer to
 
 ## 5. Weaknesses & Risks
 - Assess generalization using ONLY the CV (cross-validation) vs Test comparison from the context. Do NOT compare the training score to test: in cross-validated ensemble models the training score is structurally near-perfect (~99%) and is NOT evidence of overfitting. If the CV−Test gap is small, state plainly that the model does almost as well on new data as in testing, and do NOT claim overfitting.
+- If `metrics_unavailable` is present in the evaluation report, the model could not produce probability estimates, so ROC-AUC / PR-AUC / calibration / ROC curve / threshold analysis DO NOT EXIST for this run. Say so explicitly in one sentence, base your performance discussion only on the label-based metrics that ARE present (accuracy, F1, MCC), and NEVER invent, estimate, or infer the missing values. Do not treat a missing metric as a zero or as a weakness of the model.
+- If `overfitting.status` is `inconclusive`, the gap fell INSIDE the bootstrap confidence interval of the test score — it cannot be distinguished from measurement noise (typically a test set with very few positives). In that case you MUST NOT claim overfitting and MUST NOT recommend regularization / simpler models on that basis. Say instead that the test set is too thin to answer the generalization question, report `n_test_positives`, and recommend more data / more positive examples as the way to settle it.
 - Evaluate "High Confidence Errors" (cases where the model was certain but wrong).
 - Draw actionable conclusions from the Error Analysis section.
 

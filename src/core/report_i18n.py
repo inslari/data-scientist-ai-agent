@@ -168,9 +168,12 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "The pre-modeling data quality check found the data cannot be safely modeled; analysis was halted to avoid producing a misleading result.",
     },
     # Target rol-içerik çelişkisi (fraud vakası): ad ikili ima ediyor ama sürekli.
+    # Kaçış notu: kural doğru (kolon kayması en olası sebep) ama kullanıcı çıkışsız kalmasın —
+    # `is_risk_score` gibi MEŞRU sürekli bir hedefte isimlendirme kasıtlıysa eşik env ile açılır.
+    # Kod davranışı değişmez; yalnız mesaj yolu gösterir.
     "dq_target_conflict": {
-        "tr": "**Hedef değişken `{col}`** ikili (0/1) bir etiket bekleniyordu ama **{nunique} farklı sürekli değer** içeriyor. Bu genellikle kolon hizasının kayması (ör. içinde virgül olan bir alanın satırı bölmesi) sonucu hedef sütuna yanlış verinin düşmesinden kaynaklanır. Model eğitilmedi.",
-        "en": "**Target variable `{col}`** was expected to be a binary (0/1) label but contains **{nunique} distinct continuous values**. This usually means the columns are misaligned (e.g. a field with an embedded comma split the row), so the wrong data landed in the target column. No model was trained.",
+        "tr": "**Hedef değişken `{col}`** ikili (0/1) bir etiket bekleniyordu ama **{nunique} farklı sürekli değer** içeriyor. Bu genellikle kolon hizasının kayması (ör. içinde virgül olan bir alanın satırı bölmesi) sonucu hedef sütuna yanlış verinin düşmesinden kaynaklanır. Model eğitilmedi.\n\n_Hedefiniz gerçekten sürekli bir skorsa (ör. `is_risk_score` = 0–100) ve bu isimlendirme kasıtlıysa, izin verilen benzersiz değer sınırını `DQ_TARGET_MAX_CARD` ortam değişkeniyle yükseltebilirsiniz._",
+        "en": "**Target variable `{col}`** was expected to be a binary (0/1) label but contains **{nunique} distinct continuous values**. This usually means the columns are misaligned (e.g. a field with an embedded comma split the row), so the wrong data landed in the target column. No model was trained.\n\n_If your target genuinely is a continuous score (e.g. `is_risk_score` = 0–100) and the naming is intentional, you can raise the allowed distinct-value limit via the `DQ_TARGET_MAX_CARD` environment variable._",
     },
     # Yapısal kayma: kaç satır neden atlandı.
     "dq_structural": {
@@ -233,6 +236,15 @@ _STRINGS: dict[str, dict[str, str]] = {
     "low_r2": {
         "tr": "R² çok düşük ({r:.3f}). Model hedefi açıklayamıyor.",
         "en": "R² is very low ({r:.3f}). The model cannot explain the target.",
+    },
+    # Sessiz başarısızlık yasağı: olasılık üretilemediyse kullanıcı BOŞ KART değil, NEDEN görsün.
+    "eval_no_probabilities": {
+        "tr": "Model bu veri için olasılık tahmini (`predict_proba`) üretemedi; bu yüzden ROC-AUC, PR-AUC, kalibrasyon, ROC eğrisi ve eşik (threshold) analizi **hesaplanamadı**. Aşağıdaki performans yorumu yalnızca sınıf tahminlerine dayanan metriklere (accuracy, F1, MCC) dayanmaktadır.",
+        "en": "The model could not produce probability estimates (`predict_proba`) for this data, so ROC-AUC, PR-AUC, calibration, the ROC curve and threshold analysis **could not be computed**. The performance discussion below rests only on label-based metrics (accuracy, F1, MCC).",
+    },
+    "auc_unavailable": {
+        "tr": "ROC-AUC hesaplanamadı (olasılık tahmini üretilemedi), bu yüzden ayrım gücü doğrulanamadı. Model accuracy/F1 üzerinden değerlendirildi.",
+        "en": "ROC-AUC could not be computed (no probability estimates), so discriminative power is unverified. The model was assessed on accuracy/F1 instead.",
     },
     "severe_overfitting": {
         "tr": "Ciddi overfitting (train-test farkı: {g:.3f}). Model eğitim verisini ezberlemiş.",
@@ -360,6 +372,76 @@ def R(key: str, lang: str, **params) -> str:
         except (KeyError, IndexError, ValueError):
             return text
     return text
+
+
+# Metrik sözlüğü (glossary) girdileri — düz dize değil, alanlı sözlük (label/description/
+# range/caveat). Mevcut `metric_descriptions` sözlüğü evaluator içinde TR-only hard-code;
+# yeni girdiler buradan iki dilli gelir. (Eski girdilerin tamamını buraya taşımak ayrı bir
+# temizlik işi — bilinçli olarak kapsam dışı.)
+_METRIC_DESCRIPTIONS: dict[str, dict[str, dict]] = {
+    "pr_auc": {
+        "tr": {
+            "label": "PR-AUC (Precision-Recall AUC)",
+            "description": (
+                "Precision-Recall eğrisinin altında kalan alan. Dengesiz veride ASIL "
+                "performans metriğidir: 'yakaladığım pozitiflerin ne kadarı gerçekten "
+                "pozitif' sorusuna odaklanır ve devasa negatif kütleden etkilenmez."
+            ),
+            "range": "Taban = pozitif oranı (rastgele model), 1 = mükemmel",
+            "caveat": (
+                "ROC-AUC'un aksine rastgele tabanı 0.5 DEĞİLDİR; taban veri setinin "
+                "pozitif oranıdır. Mutlaka `pr_auc_baseline` ile birlikte okunmalıdır."
+            ),
+        },
+        "en": {
+            "label": "PR-AUC (Precision-Recall AUC)",
+            "description": (
+                "Area under the precision-recall curve. The metric that actually matters "
+                "on imbalanced data: it asks 'of the positives I flagged, how many are "
+                "real', and is not flattered by a huge negative mass."
+            ),
+            "range": "Baseline = positive rate (random model), 1 = perfect",
+            "caveat": (
+                "Unlike ROC-AUC, the random baseline is NOT 0.5 — it is the dataset's "
+                "positive rate. Always read it together with `pr_auc_baseline`."
+            ),
+        },
+    },
+    "pr_auc_baseline": {
+        "tr": {
+            "label": "PR-AUC Tabanı (Rastgele Model)",
+            "description": (
+                "Test setindeki pozitif oranı — rastgele tahmin eden bir modelin alacağı "
+                "PR-AUC. PR-AUC'u yorumlamak için referans noktası."
+            ),
+            "range": "0–1 (veri setinin pozitif oranı)",
+            "caveat": (
+                "Örnek: %0.17 fraud oranında rastgele model 0.0017 alır; 0.71'lik bir "
+                "PR-AUC vasat değil, tabanın ~400 katıdır."
+            ),
+        },
+        "en": {
+            "label": "PR-AUC Baseline (Random Model)",
+            "description": (
+                "The positive rate in the test set — the PR-AUC a random model would get. "
+                "The reference point for interpreting PR-AUC."
+            ),
+            "range": "0–1 (the dataset's positive rate)",
+            "caveat": (
+                "Example: at a 0.17% fraud rate a random model scores 0.0017; a PR-AUC of "
+                "0.71 is not mediocre, it is ~400x the baseline."
+            ),
+        },
+    },
+}
+
+
+def R_METRIC(key: str, lang: str) -> dict:
+    """Metrik sözlüğü girdisini (label/description/range/caveat) dile göre döndürür."""
+    entry = _METRIC_DESCRIPTIONS.get(key)
+    if entry is None:
+        return {"label": key, "description": ""}
+    return entry.get(lang) or entry.get("tr") or {"label": key, "description": ""}
 
 
 def freq_label(freq: str | None, lang: str) -> str:

@@ -35,8 +35,17 @@ def evaluate_quality_gate(state: dict) -> dict:
     # Düşük performans (classification)
     if "classification" in task:
         checks_performed.append("classification_performance")
-        auc = test_metrics.get("roc_auc", test_metrics.get("roc_auc_ovr", 0))
-        if auc < 0.60:
+        # METRİK YOK ≠ METRİK 0. Eskiden eksik ROC `0` sayılıyordu ve model mükemmel olsa bile
+        # "AUC 0.000 → çok düşük" FAIL'i basılıyordu. Ölçemediğimiz şey hakkında hüküm vermeyiz:
+        # metrik yoksa kontrolü ATLA ve bunu WARN olarak GÖRÜNÜR kıl (sessizce geçme de yok).
+        auc = test_metrics.get("roc_auc", test_metrics.get("roc_auc_ovr"))
+        if auc is None:
+            warnings.append({
+                "code": "auc_unavailable",
+                "message": R("auc_unavailable", lang),
+                "value": None,
+            })
+        elif auc < 0.60:
             failures.append({
                 "code": "low_auc",
                 "message": R("low_auc", lang, a=auc),
@@ -55,8 +64,10 @@ def evaluate_quality_gate(state: dict) -> dict:
             })
 
     # Ciddi overfitting
+    # Olcum belirsizse (CV skoru test skorunun bootstrap GA'sinin icinde — az pozitifli test seti)
+    # gap hicbir sey kanitlamiyor; gurultuyu FAIL/WARN'a cevirmek yanlis alarmdir. gap=0 → sessiz.
     checks_performed.append("overfitting")
-    gap = overfitting.get("gap", 0) or 0
+    gap = 0 if overfitting.get("status") == "inconclusive" else (overfitting.get("gap", 0) or 0)
     if gap > 0.20:
         failures.append({
             "code": "severe_overfitting",

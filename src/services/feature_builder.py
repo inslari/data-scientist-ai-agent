@@ -500,6 +500,24 @@ _RATIO_MAX_CARD_RATIO = 0.95    # ID-benzeri kaynak kapisi: nunique/n_rows > 0.9
                                 # (oranlar protected_high_card ile kardinaliteden MUAF; bu on-filtre
                                 #  yanlis-etiketli ID'nin orana sizmasini ENGELLER — LLM metadata hatasina dayaniklilik)
 
+# Payda guvenligi: paydanin KUTUP KUTLESI = min(P(b>0), P(b<0)) — azinlik isaretin payi.
+# Payda sifirin ICINDEN geciyorsa a/b'nin veri araliginda kutbu (pole) vardir: b=+e ve b=-e olan
+# iki neredeyse-ozdes satir ZIT sonsuzluklara firlar. Bunu winsorize ONARAMAZ — kirpma kuyrugu
+# keser ama SIRALAMAYI duzeltmez, oysa agac split'leri ve lineer katsayilar tam olarak siralamaya/
+# olcege dayanir. Tek-tarafli kucuk payda (hep pozitif, sifira yaklasan) ise agir kuyruklu ama
+# MONOTON'dur; winsorize onu gercekten onarir. Ayrim "payda kucuk mu" degil, "isaret degistiriyor mu".
+#
+# Esik winsorizer'in KENDI kuantili: kirpma q01/q99'da oldugu icin motor ancak o kadar kuyruk
+# kirlenmesini sogurabilir. Azinlik isaret kutlesi bunun ALTINDA ise kutbun firlattigi satirlar
+# zaten kirpilip gider (tek aykiri negatif deger feature'i oldurmez); USTUNDE ise kutup kirpmadan
+# sag cikip feature'i zehirler. Yani kapi tam olarak "bunu winsorizer yutabilir mi" sorusudur.
+#
+# Kural SADECE matematiksel bozuklugu hedefler; target'a/importance'a BAKMAZ, "bu feature ise
+# yaramaz" YARGISI ICERMEZ. Sifiri gecen kolon PAY olarak serbesttir — yalniz PAYDA olamaz.
+# Olculdu (4 veri seti, 48 aday kolon): kredi/churn/e-ticaret paydalarinin tumu 0.000; ULB'nin
+# V1-V28'i 0.380-0.498. Boslugun genisligi 0.38, her iki yonde sifir yanlis siniflama.
+_RATIO_DENOM_MAX_SIGN_MASS = _RATIO_WINSOR_Q
+
 
 def _detect_frequency(parsed: pd.Series, group_key: "pd.Series | None" = None) -> tuple[str, list[int]]:
     """Ardisik tarih farklarinin medyanindan veri sikligini ve dinamik lag pencerelerini turet.
@@ -1043,7 +1061,6 @@ def _detect_leakage(
 
     for col in list(df.columns):
         sem = meta.columns.get(col, {}).get("semantic_type", "") if meta is not None else ""
-
         # ── KESİN 1: Identifier semantic_type ──
         if sem == "identifier":
             df = df.drop(columns=[col], errors="ignore")
@@ -1761,9 +1778,10 @@ def _build_ratio_features(
 ) -> tuple[pd.DataFrame, list[str]]:
     """Deterministik oran (a/b) motoru — modelin yapamadigi olcek-carprazi sinyal.
     Yalniz ORIJINAL sayisal kolonlar; binary/sabit (nunique<3), ID-benzeri (nunique/n_rows>0.95
-    — DTYPE-FARKINDA: yalniz int/object'e uygulanir, float continuous MUAF), leaky kaynak ve
-    cok-sifirli PAYDA haric. TEK YON (ad-sirali a<b → a/b) → resiprokal patlamasi
-    yok. Payda kapisi + winsorize [q01,q99] → sifir-bolme/uc deger nötr. Cap _MAX_RATIO_FEATURES;
+    — DTYPE-FARKINDA: yalniz int/object'e uygulanir, float continuous MUAF), leaky kaynak, cok-sifirli
+    PAYDA ve SIFIRI GECEN PAYDA (kutup — bkz. _RATIO_DENOM_MAX_SIGN_MASS) haric. Sifiri gecen kolon
+    PAY olarak serbesttir. TEK YON (ad-sirali a<b → a/b) → resiprokal patlamasi
+    yok. Payda kapilari + winsorize [q01,q99] → sifir-bolme/uc deger nötr. Cap _MAX_RATIO_FEATURES;
     asilirsa normalize-varyans (yayilim) ile sirala, esitlikte ad. Donen kolonlar _detect_leakage'da
     protected_high_card'a eklenir (continuous → kardinalite kuralindan MUAF; korelasyon/leakage/
     select TAM uygulanir — flag'den farki budur). ID on-filtresi, bu kardinalite muafiyetinin
@@ -1802,12 +1820,21 @@ def _build_ratio_features(
         return df, []
 
     zero_frac = {c: float((pd.to_numeric(df[c], errors="coerce") == 0).mean()) for c in eligible}
+    # Kutup kutlesi: azinlik isaretin payi. >esik → payda sifirin icinden geciyor (bkz. sabit notu).
+    sign_mass = {}
+    for c in eligible:
+        s = pd.to_numeric(df[c], errors="coerce")
+        sign_mass[c] = float(min((s > 0).mean(), (s < 0).mean()))
 
     candidates: list[tuple[str, np.ndarray, float]] = []
     for i in range(len(eligible)):
         for j in range(i + 1, len(eligible)):
             a, b = eligible[i], eligible[j]            # ad-sirali: pay=a, payda=b (tek yon)
             if zero_frac[b] > _RATIO_DENOM_MAX_ZERO:    # cok-sifirli payda → ciftı atla
+                continue
+            if sign_mass[b] > _RATIO_DENOM_MAX_SIGN_MASS:   # payda sifiri geciyor → kutup, atla
+                logger.debug(f"[feature_eng] ratio atlandi: '{a}'/'{b}' — payda sifiri geciyor "
+                             f"(kutup kutlesi %{sign_mass[b]*100:.1f} > %{_RATIO_DENOM_MAX_SIGN_MASS*100:.0f})")
                 continue
             name = f"ratio_{a}_{b}"
             if name in df.columns:                      # isim cakisma guard (math/domain)

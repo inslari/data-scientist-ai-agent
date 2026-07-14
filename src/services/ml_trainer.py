@@ -217,8 +217,11 @@ def _extract_feature_importance(model: Any, feature_names: list[str]) -> dict:
         if arr is not None:
             imp = dict(zip(feature_names, arr.tolist()))
             return dict(sorted(imp.items(), key=lambda x: x[1], reverse=True))
-    except Exception:
-        pass
+    except Exception as e:
+        # Bos importance = target-lock leakage dedektorunun kontrol edecek hicbir seyi olmamasi
+        # (sessizce "temiz" der) + SHAP/rapor bolumlerinin bos kalmasi.
+        logger.warning(f"[automl] Feature importance cikarilamadi — leakage kontrolu ve importance "
+                       f"raporu bos kalacak: {type(e).__name__}: {e}")
     return {}
 
 
@@ -292,13 +295,46 @@ def _apply_heavy_model_guard(models: dict, n_train: int) -> tuple[dict, dict]:
 
 
 # Optuna tuning
+def _select_scoring(y: np.ndarray, is_binary: bool) -> tuple[str, str]:
+    """CV scoring metriğini sınıf dengesine göre RUNTIME'da seçer.
+
+    Aşırı dengesizlikte ROC-AUC yanıltıcıdır: negatif kütle o kadar büyüktür ki yanlış
+    pozitifler FPR'ı neredeyse hiç oynatmaz, ROC iyimser çıkar ve modelleri ayırt etmez.
+    Orada doğru soru "kaç pozitifi kullanılabilir bir kesinlikle yakalıyoruz" — yani
+    PR-AUC (average_precision).
+
+    Eşik `settings.PR_AUC_SCORING_THRESHOLD` (default %5) ve azınlık PAYINA (min/total)
+    bakar; veri setine özel bir kural yoktur. Dengeli/orta-dengesiz veride mevcut
+    roc_auc davranışı aynen korunur — ölçümde iki metrik orada zaten aynı modeli seçiyor.
+
+    Dönüş: (sklearn scoring adı, rapor/karşılaştırma için metrik adı)
+    """
+    if not is_binary:
+        return "roc_auc_ovr_weighted", "roc_auc_ovr"
+
+    _, counts = np.unique(y, return_counts=True)
+    minority_share = float(counts.min() / counts.sum())
+
+    if minority_share < settings.PR_AUC_SCORING_THRESHOLD:
+        logger.info(
+            f"[automl] Azınlık payı %{minority_share*100:.2f} < "
+            f"%{settings.PR_AUC_SCORING_THRESHOLD*100:.0f} → CV scoring: PR-AUC "
+            f"(average_precision). ROC-AUC bu dengesizlikte yanıltıcı."
+        )
+        return "average_precision", "pr_auc"
+
+    return "roc_auc", "roc_auc"
+
+
 def _tune_model_classification(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray, is_binary: bool, strong_regularization: bool = False, is_imbalanced: bool = False) -> Any:
     """Tunes the selected model using Optuna. If strong_regularization is True, shrinks the search space to prevent overfitting."""
     reg_msg = " (STRONG REGULARIZATION)" if strong_regularization else ""
     logger.info(f"\n[automl] {model_name} için Optuna hiperparametre optimizasyonu başlıyor{reg_msg} (15 sn limiti)...")
     
     cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
-    scoring = "roc_auc" if is_binary else "roc_auc_ovr_weighted"
+    # Optuna, model seçimiyle AYNI metriği optimize etmeli — yoksa seçilen model bir
+    # metriğe göre kazanıp başka bir metriğe göre tune edilir.
+    scoring, _ = _select_scoring(y_train, is_binary)
 
     def objective(trial):
         params = {}
@@ -1028,7 +1064,7 @@ def _run_classification(
             models = _get_classification_models_balanced(class_weights) if is_imbalanced else _get_classification_models()
  
     cv      = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    scoring = "roc_auc" if is_binary else "roc_auc_ovr_weighted"
+    scoring, cv_metric_name = _select_scoring(y_train, is_binary)
     results = {}
  
     for name, model in models.items():
@@ -1166,8 +1202,13 @@ def _run_classification(
         "recall_weighted":     round(float(recall_score(y_test, y_pred, average="weighted", zero_division=0)), 4),
         "task":                "binary_classification" if is_binary else "multiclass_classification",
         "all_model_scores":    {k: round(v["score"], 4) for k, v in results.items()},
-        "cv_roc_auc":          round(float(results[best_name]["score"]), 4),
-        "cv_roc_auc_std":      round(float(results[best_name]["std"]), 4),
+        # CV skoru artık her zaman ROC değil (aşırı dengesizlikte PR-AUC ile seçiyoruz).
+        # `cv_score` + `cv_scoring_metric` dürüst çift; hangi metrikle seçildiğini taşır.
+        # evaluator overfitting gap'i BU metriğe göre eşleştirir — yoksa CV(PR-AUC) ile
+        # test(ROC) kıyaslanır ve sahte "overfitting" çıkar.
+        "cv_score":            round(float(results[best_name]["score"]), 4),
+        "cv_score_std":        round(float(results[best_name]["std"]), 4),
+        "cv_scoring_metric":   cv_metric_name,
         "imbalance_handled":   is_imbalanced,
         "minority_ratio":      round(float(minority_ratio), 4),
         "smote_applied":       is_imbalanced,
@@ -1189,8 +1230,9 @@ def _run_classification(
                 metrics["roc_auc_ovr"] = round(float(
                     roc_auc_score(y_test, y_prob, multi_class="ovr", average="weighted")
                 ), 4)
-        except Exception:
-            pass
+        except Exception as e:
+            # Headline metrik sessizce kaybolmasin (asagida quality_gate 'eksik' olarak ele alir).
+            logger.warning(f"[automl] ROC-AUC hesaplanamadi: {type(e).__name__}: {e}")
  
     metrics["feature_importance"] = _extract_feature_importance(best_model, feature_names)
     metrics["heavy_model_guard"] = _guard_note

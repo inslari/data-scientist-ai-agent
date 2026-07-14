@@ -880,3 +880,318 @@ def run_deep_analysis(
                 continue
 
     return analysis
+
+
+# ═══════════════════════════════════════════════════════════
+#  PLAN HINTS — analist → feature_plan_node kanalı
+# ═══════════════════════════════════════════════════════════
+# Bu bölüm run_deep_analysis'ten AYRIDIR ve ANALYSIS_MODULES'e KAYITLI DEĞİLDİR.
+# Buradaki çıktı LLM feature planına akan TEK analist kanalıdır, dolayısıyla
+# leakage sınırı burada çizilir:
+#
+#   extract_plan_hints() HEDEFİ HİÇ GÖRMEZ — imzasında target parametresi YOKTUR.
+#   Hedef-farkındalıklı bir istatistik (target korelasyonu, grup ayrışması, feature
+#   önem sırası) üretmesi bu yüzden disipline değil, TASARIMA bağlı olarak imkânsızdır.
+#   Hedef kolonun kendisi çağıran tarafından exclude_columns ile dışarıda bırakılır,
+#   böylece redundant_pairs bir (feature, target) çifti dahi üretemez.
+#
+# Payload YALNIZCA kolon adı taşır — tek bir sayı bile taşımaz. Sebep: "şu kolon
+# target ile 0.83 korelasyonlu" bilgisi karar düzeyine indirgense bile ("target ile
+# en ilişkili 5 kolon") test etiketleriyle feature seçimi yapmak demektir; ROC'u
+# şişiren budur, sayının kendisi değil. Hedef-agnostik yapısal bulgular (sabit kolon,
+# çarpıklık, kardinalite, X-X redundancy) y'yi hiç kullanmadıkları için bu riski
+# taşımaz ve karar düzeyinde akabilir.
+#
+# DS ajanı bu ipuçlarını yalnızca DROP/TRANSFORM kararında kullanır; her sayı aşağıda
+# X_train'den yeniden hesaplanır (_select_features_tt, _select_univariate_tt).
+# Değişmezler tests/test_analysis_hints_leakage.py ile sabitlenmiştir.
+
+PLAN_HINT_NEAR_CONSTANT_SHARE   = 0.99   # baskın değer payı → "tek değerli sayılır"
+PLAN_HINT_HIGH_CARD_UNIQUE_RATE = 0.90   # unique/satır → one-hot anlamsız
+PLAN_HINT_HIGH_CARD_MIN_UNIQUE  = 50     # mutlak eşik (profile'daki "high" ile aynı)
+PLAN_HINT_HIGH_MISSING_RATE     = 0.40   # null oranı
+PLAN_HINT_SKEW                  = 1.00   # |skew(col)| → log adayı (df varken; gerçek çarpıklık)
+PLAN_HINT_SKEW_RATIO            = 0.20   # |mean - median| / std → yalnızca df YOKKEN vekil ölçü
+PLAN_HINT_OUTLIER_RATE          = 0.05   # IQR dışı satır oranı
+PLAN_HINT_REDUNDANT_CORR        = 0.95   # |corr(a,b)| → çiftten biri gereksiz
+PLAN_HINT_MAX_ROWS              = 50_000 # X-X korelasyonu için örneklem tavanı
+PLAN_HINT_MAX_ITEMS             = 25     # prompt şişmesin (liste başına)
+
+# Bu eşikler TEK KAYNAK: data_executor._generate_recommendations (rapor yolu) da
+# buradan okur. Aynı olguya iki farklı eşik (null %30 vs %40, outlier %1 vs %5)
+# uygulanması → aynı kolon bir yerde "sorunlu" diğerinde "temiz" görünürdü.
+
+_DATE_SUFFIXES = ("_date", "_at", "_time")
+_DATE_EXACT    = {"created_at", "updated_at", "timestamp", "birth_date", "order_date"}
+
+
+def is_date_like(col: str, dtype: str = "") -> bool:
+    """Tarih/zaman kolonu mu — dtype veya isim sezgiseli. Hedef-kör, satır görmez."""
+    d = (dtype or "").upper()
+    c = (col or "").lower()
+    return ("DATE" in d or "TIME" in d
+            or c in _DATE_EXACT
+            or any(c.endswith(s) for s in _DATE_SUFFIXES))
+
+
+def extract_plan_hints(
+    df: Optional[pd.DataFrame],
+    profile: dict,
+    exclude_columns: Optional[set[str]] = None,
+) -> dict:
+    """
+    feature_plan_node'a akacak HEDEF-KÖR, karar düzeyinde yapısal ipuçlarını çıkarır.
+
+    Bilinçli olarak target parametresi ALMAZ (bkz. yukarıdaki bölüm notu).
+
+    Args:
+        df: ham veri. VARSA tüm istatistikler BUNDAN hesaplanır — kilitli-holdout
+            ölçüm modunda buraya yalnızca train satırları gelir, dolayısıyla ipuçları
+            gerçekten train-only olur. None/boş ise istatistikler profile'dan alınır
+            (tüm veri) ve redundant_pairs boş kalır.
+        profile: DuckDBEngine.profile_table() çıktısı. Kolon TİPLERİ (sayısal/kategorik)
+            her hâlükârda buradan okunur — tip yapısaldır, satır bilgisi taşımaz.
+        exclude_columns: hiç bakılmayacak kolonlar — çağıran hedef kolonu (ve hedef
+            adaylarını) buraya koyar. Bu kolonlar hiçbir listede ve hiçbir çiftte
+            görünmez.
+
+    Returns:
+        Yalnızca kolon adı taşıyan (float/int İÇERMEYEN) dict:
+        {"generated_from", "target_aware": False, "constant_columns", "near_constant",
+         "high_cardinality", "high_missing", "skewed", "outlier_heavy", "redundant_pairs"}
+    """
+    excl = {c for c in (exclude_columns or set()) if c}
+    summary = profile.get("summary", {}) or {}
+    col_profiles: dict[str, dict] = profile.get("columns", {}) or {}
+    numeric_cols = [c for c in summary.get("numeric_columns", []) if c not in excl]
+    cat_cols     = [c for c in summary.get("categorical_columns", []) if c not in excl]
+
+    # Tarih/zaman kolonları: dtype'ı DATE/TIMESTAMP olanlar + isim sezgiseliyle
+    # yakalananlar (ör. VARCHAR tutulan 'transaction_time'). Plan yolunda gerçekten
+    # eksik olan tek sinyal buydu — LLM'in derived_features'ta karşılığı var
+    # (yıl/ay/gün/saat parçaları). Hedef-kör, sıfır sayı.
+    date_like = sorted({
+        c for c in col_profiles
+        if c not in excl and is_date_like(c, (col_profiles.get(c) or {}).get("dtype", ""))
+    })
+
+    sample = _hint_sample(df)
+    stats  = _column_stats(sample, profile, numeric_cols + cat_cols)
+
+    constant: list[str]      = []
+    near_constant: list[str] = []
+    high_card: list[str]     = []
+    high_missing: list[str]  = []
+    skewed: list[str]        = []
+    outlier_heavy: list[str] = []
+
+    for col in numeric_cols + cat_cols:
+        st = stats.get(col)
+        if col in excl or not st:
+            continue
+
+        # Sabit / tek değerli — hiç sinyal yok
+        if st["unique_count"] <= 1:
+            constant.append(col)
+            continue
+
+        # Neredeyse sabit: tek bir değer satırların ≥%99'unu kaplıyor
+        if st["top_share"] >= PLAN_HINT_NEAR_CONSTANT_SHARE:
+            near_constant.append(col)
+
+        if st["null_rate"] >= PLAN_HINT_HIGH_MISSING_RATE:
+            high_missing.append(col)
+
+        # Tarih kolonları kardinalite listesine GİRMEZ: metin tutulan bir timestamp
+        # ('transaction_time') hem "yüksek kardinaliteli → at" hem "tarih → parçala"
+        # diye görünürdü; LLM'e çelişkili iki emir gitmiş olurdu. Doğru olan parçalamak.
+        if col in cat_cols and col not in date_like:
+            if (st["unique_rate"] >= PLAN_HINT_HIGH_CARD_UNIQUE_RATE
+                    or st["unique_count"] > PLAN_HINT_HIGH_CARD_MIN_UNIQUE):
+                high_card.append(col)
+
+        if col in numeric_cols:
+            # Çarpıklık yalnızca SÜREKLİ kolonlar için anlamlı. Dengesiz bir 0/1 bayrağının
+            # skew'i doğal olarak >1 çıkar ama log(bayrak) saçmadır — binary/ikili kolonları
+            # ele, yoksa LLM'e anlamsız türetme önerisi gitmiş olur.
+            if (st["skew"] is not None and abs(st["skew"]) >= PLAN_HINT_SKEW
+                    and st["unique_count"] > 2):
+                skewed.append(col)
+            if st["outlier_rate"] >= PLAN_HINT_OUTLIER_RATE:
+                outlier_heavy.append(col)
+
+    redundant_pairs = _redundant_pairs(sample, numeric_cols)
+
+    def _cap(items: list) -> list:
+        return sorted(items)[:PLAN_HINT_MAX_ITEMS] if items and isinstance(items[0], str) else items[:PLAN_HINT_MAX_ITEMS]
+
+    return {
+        # Denetlenebilirlik: ipuçları hangi satırlardan üretildi. "full_data" =
+        # tüm veri (hedef-agnostik olduğu için ROC'u şişirmemesi beklenir),
+        # "train_only" = ölçüm modunda yeniden üretilmiş train partisyonu.
+        "generated_from":   "full_data",
+        "target_aware":     False,     # değişmez — testle sabitlenmiştir
+        "constant_columns": _cap(constant),
+        "near_constant":    _cap(near_constant),
+        "high_cardinality": _cap(high_card),
+        "high_missing":     _cap(high_missing),
+        "skewed":           _cap(skewed),
+        "outlier_heavy":    _cap(outlier_heavy),
+        "redundant_pairs":  _cap(redundant_pairs),
+        "date_like":        _cap(date_like),
+    }
+
+
+def _hint_sample(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Deterministik örneklem — ipuçları eşik kararı olduğu için tam tarama gereksiz."""
+    if df is None or df.empty:
+        return None
+    if len(df) > PLAN_HINT_MAX_ROWS:
+        return df.sample(n=PLAN_HINT_MAX_ROWS, random_state=42)
+    return df
+
+
+def _column_stats(
+    sample: Optional[pd.DataFrame], profile: dict, columns: list[str]
+) -> dict[str, dict]:
+    """
+    Eşik kararlarını besleyen kolon istatistikleri. Bu sayılar YALNIZCA İÇERİDE kalır;
+    dışarı çıkan payload sadece kolon adı taşır.
+
+    sample verilmişse istatistikler ONDAN hesaplanır. Ölçüm modunda (kilitli holdout)
+    sample = train partisyonu olduğu için ipuçları gerçekten train-only olur —
+    profiling_report tüm veriden geldiği hâlde test satırları hesaba girmez.
+    sample yoksa profile'a düşülür (tüm veri).
+    """
+    col_profiles: dict[str, dict] = profile.get("columns", {}) or {}
+    total_rows = (profile.get("shape", {}) or {}).get("rows", 0) or 0
+    stats: dict[str, dict] = {}
+
+    for col in columns:
+        cp = col_profiles.get(col) or {}
+        if cp.get("error"):
+            continue
+
+        if sample is not None and col in sample.columns:
+            s = sample[col]
+            n = max(len(s), 1)
+            uniq = int(s.nunique(dropna=True))
+            counts = s.value_counts(dropna=True)
+            num = pd.to_numeric(s, errors="coerce")
+            stats[col] = {
+                "unique_count": uniq,
+                "unique_rate":  uniq / n,
+                "null_rate":    float(s.isna().mean()),
+                "top_share":    float(counts.iloc[0] / n) if len(counts) else 0.0,
+                "skew":         _safe_float(num.skew()) if num.notna().any() else None,
+                "outlier_rate": _outlier_rate(num),
+            }
+            continue
+
+        # Fallback: profiling_report (tüm veri). |ortalama − medyan| / std yalnızca bir
+        # ÇARPIKLIK VEKİLİ — gerçek skew() kadar iyi değil (çift-tepeli kolonu çarpık
+        # sanabilir), o yüzden sadece df yokken kullanılır.
+        top_values = cp.get("top_values") or {}
+        uniq = int(cp.get("unique_count") or 0)
+        mean, median, std = cp.get("mean"), cp.get("median"), cp.get("std")
+        proxy_skew = None
+        if (uniq > 2 and all(isinstance(v, (int, float)) for v in (mean, median, std))
+                and std and std > 0):
+            ratio = abs(float(mean) - float(median)) / float(std)
+            # Vekili gerçek eşikle kıyaslanabilir ölçeğe taşı (Pearson: skew ≈ 3·oran).
+            proxy_skew = PLAN_HINT_SKEW if ratio >= PLAN_HINT_SKEW_RATIO else 0.0
+        stats[col] = {
+            "unique_count": uniq,
+            "unique_rate":  float(cp.get("unique_rate") or 0.0),
+            "null_rate":    float(cp.get("null_rate") or 0.0),
+            "top_share":    (max(top_values.values()) / total_rows) if (top_values and total_rows) else 0.0,
+            "skew":         proxy_skew,
+            "outlier_rate": float(cp.get("has_outliers") or 0.0),
+        }
+
+    return stats
+
+
+def _outlier_rate(num: pd.Series) -> float:
+    """IQR dışı satır oranı (profile'daki has_outliers ile aynı tanım)."""
+    try:
+        q1, q3 = float(num.quantile(0.25)), float(num.quantile(0.75))
+    except Exception:  # pragma: no cover - defensive
+        return 0.0
+    iqr = q3 - q1
+    if iqr <= 0:
+        return 0.0
+    return float(((num < q1 - 1.5 * iqr) | (num > q3 + 1.5 * iqr)).mean())
+
+
+def _redundant_pairs(sample: Optional[pd.DataFrame], numeric_cols: list[str]) -> list[list[str]]:
+    """
+    |corr(a, b)| ≥ eşik olan sayısal kolon ÇİFTLERİ (X-X; hedef zaten dışlanmış).
+
+    Katsayı döndürmez — yalnızca çift. "İkisinden biri gereksiz" kararı için yeterli;
+    hangisinin tutulacağını feature_builder X_train üzerinden yeniden hesaplar.
+    """
+    if sample is None:
+        return []
+    cols = [c for c in numeric_cols if c in sample.columns]
+    if len(cols) < 2:
+        return []
+
+    try:
+        corr = sample[cols].apply(pd.to_numeric, errors="coerce").corr(method="pearson")
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"[analysis_engine] redundant_pairs hesaplanamadı: {e}")
+        return []
+
+    pairs: list[list[str]] = []
+    for i, a in enumerate(cols):
+        for b in cols[i + 1:]:
+            v = _safe_float(corr.loc[a, b])
+            if v is not None and abs(v) >= PLAN_HINT_REDUNDANT_CORR:
+                pairs.append([a, b])
+    return pairs
+
+
+def format_plan_hints(hints: dict) -> str:
+    """
+    Hint dict'ini feature_plan prompt'una gömülecek metne çevirir.
+
+    Metin de sayı taşımaz — LLM'e yalnızca kolon adları ve ne yapabileceği gider.
+    Boş hint → boş string (prompt'a hiçbir şey eklenmez).
+    """
+    if not hints:
+        return ""
+
+    sections = [
+        ("constant_columns", "Constant / single-valued columns (no signal — drop them)"),
+        ("near_constant",    "Near-constant columns (one value dominates — drop them)"),
+        ("high_cardinality", "High-cardinality categorical columns (do NOT one-hot; drop or group them)"),
+        ("high_missing",     "Columns with heavy missingness (prefer dropping, or use them only as an indicator)"),
+        ("skewed",           "Skewed numeric columns (good candidates for a log(...) derived feature)"),
+        ("outlier_heavy",    "Outlier-heavy numeric columns (avoid raw products/ratios built on them)"),
+        ("date_like",        "Date/time columns (never feed them raw — derive parts such as year/month/day/hour, or a recency difference)"),
+    ]
+
+    lines: list[str] = []
+    for key, label in sections:
+        cols = hints.get(key) or []
+        if cols:
+            lines.append(f"- {label}: {', '.join(cols)}")
+
+    pairs = hints.get("redundant_pairs") or []
+    if pairs:
+        pair_txt = "; ".join(f"({a} ≈ {b})" for a, b in pairs)
+        lines.append(f"- Redundant column pairs (near-duplicate information — keep at most one of each pair): {pair_txt}")
+
+    if not lines:
+        return ""
+
+    return (
+        "\n\n📊 ANALYST HINTS (deterministic structural findings):\n"
+        + "\n".join(lines)
+        + "\n\nThese hints were computed WITHOUT looking at the target column — they contain NO "
+          "information about predictive power. Use them ONLY to drop columns or to choose "
+          "transformations (e.g. log for skewed columns). NEVER use them to rank, score or "
+          "\"keep\" features by how useful they look; feature selection is decided later on the "
+          "training split alone."
+    )

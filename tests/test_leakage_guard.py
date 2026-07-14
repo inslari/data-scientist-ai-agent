@@ -1,9 +1,12 @@
-"""Offline tests for the two autonomous leakage guards (no LLM/DB):
+"""Offline tests for the autonomous leakage guards (no LLM/DB):
 
 A) `_single_feature_target_lock` / `_detect_leakage` — catches NON-LINEAR single-feature
    target lock (e.g. ALERT_ID: -1 vs positive ids) that linear correlation misses.
 B) auto-feature own-goal fix — `_add_missing_indicators` / `_count_encode_tt` /
    `_groupby_deviation_tt` must NOT derive features from leaky/target/identifier columns.
+C) `detect_target_lock` — binned target-lock check must be immune to CLASS IMBALANCE
+   (a rare-event base rate must not by itself look like a lock) while still catching
+   a real lock, in both imbalanced and balanced data.
 """
 
 import unittest
@@ -20,6 +23,7 @@ from src.services.feature_builder import (
     _groupby_deviation_tt,
     _leakage_exclude_cols,
 )
+from src.services.leakage_detector import detect_target_lock
 from src.services.critic_advisor import _diagnose_suspicious_performance, advise
 
 
@@ -224,6 +228,108 @@ class SuspiciousPerformanceTest(unittest.TestCase):
         self.assertEqual(decision["next_node"], "feature_plan_node")
         self.assertEqual(decision["primary_type"], "suspicious_performance")
         self.assertIn("ALERT_ID", decision["forced_drops"])
+
+
+class TargetLockImbalanceTest(unittest.TestCase):
+    """`detect_target_lock` must measure the FEATURE, not the class imbalance.
+
+    The old rule flagged a bin whose majority-class share was >= 0.97. In a rare-event
+    problem (fraud at ~2%) every bin is trivially ~98% non-fraud, so features with zero
+    relationship to the target were reported as leakage. The check now scores a bin by
+    how far it moves a class BEYOND its global prior, so it stays honest at any base rate.
+    """
+
+    IMPORTANT = {"feat": 0.40}  # above the 0.05 importance gate
+
+    def _imbalanced(self, n=6000, rate=0.02, seed=0):
+        rng = np.random.default_rng(seed)
+        y = (rng.random(n) < rate).astype(int)
+        return rng, y
+
+    def test_noise_not_flagged_in_rare_event_data(self):
+        """A feature with NO relationship to a 2%-positive target must stay clean."""
+        rng, y = self._imbalanced()
+        X = pd.DataFrame({"feat": rng.normal(size=len(y))})
+        self.assertEqual(detect_target_lock(X, y, self.IMPORTANT), [])
+
+    def test_strong_but_legitimate_signal_not_flagged(self):
+        """A genuinely predictive feature is NOT a lock: it shifts the odds, it does not
+        make the outcome certain (fraud's `amount` / `account_age_days` pattern)."""
+        rng, y = self._imbalanced()
+        # positives skew high, but no bin gets anywhere near pure
+        feat = rng.normal(size=len(y)) + y * 1.5
+        X = pd.DataFrame({"feat": feat})
+        self.assertEqual(detect_target_lock(X, y, self.IMPORTANT), [])
+
+    def test_real_leak_still_caught_in_rare_event_data(self):
+        """A target-derived column must still be flagged despite the 2% base rate.
+
+        Uses a realistic sample size (bins of ~6k rows, like the fraud dataset): a bin
+        with zero positives is only strong evidence of a lock when the bin is big enough
+        for zero to be surprising. At small n the check deliberately stays silent — the
+        AUC-based `_single_feature_target_lock` guard covers that regime instead.
+        """
+        rng, y = self._imbalanced(n=60000)
+        X = pd.DataFrame({"feat": y + rng.normal(0, 0.05, len(y))})
+        found = detect_target_lock(X, y, self.IMPORTANT)
+        self.assertEqual([c["feature"] for c in found], ["feat"])
+        # Sample-size ceiling: a zero-positive bin of ~6k rows tops out near 0.97 —
+        # comfortably over the 0.95 gate, while legitimate features stay under 0.70.
+        self.assertGreaterEqual(found[0]["purity_gain"], 0.95)
+
+    def test_real_leak_caught_at_moderate_imbalance(self):
+        """15% positives: the leak makes a whole bin pure POSITIVE — unambiguous lock."""
+        rng = np.random.default_rng(7)
+        y = (rng.random(6000) < 0.15).astype(int)
+        X = pd.DataFrame({"feat": y + rng.normal(0, 0.05, len(y))})
+        found = detect_target_lock(X, y, self.IMPORTANT)
+        self.assertEqual([c["feature"] for c in found], ["feat"])
+
+    def test_small_bin_zero_positives_is_not_a_lock(self):
+        """Regression guard for the subtle failure the fix had to survive: in rare-event
+        data a merely-predictive feature empties its bottom bin of positives. Raw purity
+        reads 1.0 ('certain'), but with only ~12 expected positives per bin that is a
+        resolution limit, not determinism. Must NOT be reported as leakage."""
+        rng, y = self._imbalanced(n=6000, rate=0.02)
+        X = pd.DataFrame({"feat": rng.normal(size=len(y)) + y * 1.5})
+        self.assertEqual(detect_target_lock(X, y, self.IMPORTANT), [])
+
+    def test_balanced_data_lock_still_caught(self):
+        """Balanced target: the classic near-pure bin must still be reported.
+        Values are kept DISTINCT — identical values make qcut collapse bins and dilute
+        the lock, which would hide it from any binned check."""
+        rng = np.random.default_rng(1)
+        n = 6000
+        y = rng.integers(0, 2, n)
+        feat = rng.normal(size=n)
+        neg = np.flatnonzero(y == 0)
+        picked = neg[rng.random(neg.size) < 0.30]
+        feat[picked] = rng.uniform(5.0, 6.0, picked.size)  # top decile → all class 0
+        found = detect_target_lock(pd.DataFrame({"feat": feat}), y, self.IMPORTANT)
+        self.assertEqual([c["feature"] for c in found], ["feat"])
+
+    def test_low_importance_feature_is_ignored(self):
+        rng, y = self._imbalanced()
+        X = pd.DataFrame({"feat": y + rng.normal(0, 0.05, len(y))})
+        self.assertEqual(detect_target_lock(X, y, {"feat": 0.01}), [])
+
+    def test_single_class_target_is_noop(self):
+        """No uncertainty to lock → nothing to report (and no divide-by-zero)."""
+        rng = np.random.default_rng(2)
+        y = np.zeros(500, dtype=int)
+        X = pd.DataFrame({"feat": rng.normal(size=500)})
+        self.assertEqual(detect_target_lock(X, y, self.IMPORTANT), [])
+
+    def test_regression_branch_unaffected(self):
+        """Variance-collapse branch is already normalized by global std — untouched."""
+        rng = np.random.default_rng(3)
+        n = 3000
+        feat = rng.normal(size=n)
+        y = rng.normal(0, 10, n)
+        y[feat > np.quantile(feat, 0.9)] = 7.0  # variance collapses in the top decile
+        found = detect_target_lock(pd.DataFrame({"feat": feat}), y, self.IMPORTANT,
+                                   intent="regression")
+        self.assertEqual([c["feature"] for c in found], ["feat"])
 
 
 if __name__ == "__main__":
