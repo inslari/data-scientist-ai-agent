@@ -176,6 +176,18 @@ class Settings:
     #   düşük/güvenli default; env ile büyütülür (ör. 300000 → tam eğitim).
     MAX_TRAINING_ROWS: int = int(os.getenv("MAX_TRAINING_ROWS", "50000"))
 
+    # ── Dengesiz veride model seçim metriği ───────────────────────────────────
+    # PR_AUC_SCORING_THRESHOLD — azınlık sınıfının PAYI (min/total) bu eşiğin altına
+    #   düşerse binary classification'da CV scoring'i roc_auc yerine average_precision
+    #   (PR-AUC) olur. Gerekçe: aşırı dengesizlikte devasa negatif kütle FPR'ı ezer,
+    #   ROC iyimser ve ayırt etmez hale gelir; iş açısından anlamlı soru "kaç pozitifi
+    #   kullanılabilir kesinlikle yakalıyoruz", o da PR-AUC'tur.
+    #   Eşik ÖLÇÜMLE seçildi: referans veri setlerinde iki metrik ancak ~%5 altında
+    #   farklı model seçiyor (kredi %21.8 ve churn %20.4'te kazanan AYNI; e-ticaret
+    #   fraud %2.2 ve ULB %0.17'de DEĞİŞİYOR). %5 üstünde anahtarı çevirmek referans
+    #   skorları bedelsiz kaydırırdı.
+    PR_AUC_SCORING_THRESHOLD: float = float(os.getenv("PR_AUC_SCORING_THRESHOLD", "0.05"))
+
     # ── Büyük-N model guard ───────────────────────────────────────────────────
     # Eğitim satırı (n_train) bu eşiği aşınca ağır CPU-kilitli modeller roster'dan
     # kısılır: AdaBoost düşer (yavaş + boosting üçlüsünün gerisinde), RF/ExtraTrees
@@ -187,5 +199,38 @@ class Settings:
     HEAVY_MODEL_MAX_ROWS: int = int(os.getenv("HEAVY_MODEL_MAX_ROWS", "100000"))
     # Guard tetiklenince RF/ExtraTrees'in düşürüleceği ağaç sayısı (200→bu).
     HEAVY_MODEL_TREES: int = int(os.getenv("HEAVY_MODEL_TREES", "100"))
+
+    # ── Analist → feature_plan ipucu kanalı ───────────────────────────────────
+    # ENABLE_PLAN_HINTS — analysis_engine.extract_plan_hints() çıktısının feature
+    #   plan prompt'una akıp akmayacağı. Kapalıysa prompt birebir eski haline döner
+    #   (A/B ölçümünün "hints-off" kolu budur).
+    ENABLE_PLAN_HINTS: bool = os.getenv("ENABLE_PLAN_HINTS", "true").strip().lower() in ("1", "true", "yes", "on")
+    # ENABLE_LOCKED_HOLDOUT — ÖLÇÜM MODU (varsayılan kapalı). Açıkken ipuçları tüm
+    #   veriden değil, feature_builder'ın train partisyonu YENİDEN ÜRETİLEREK yalnızca
+    #   train satırlarından hesaplanır: aynı seed, aynı TEST_SIZE, hedefe göre stratify.
+    #   Test satırları analistin görüş alanına KİLİTLENİR (eğitimden çıkarılmaz →
+    #   eğitim verisi kaybı YOK, baseline kaymaz).
+    #   Kullanımı: aynı veri setini ENABLE_LOCKED_HOLDOUT=0/1 ile koştur, AYNI iç test
+    #   setindeki ROC'u karşılaştır. Fark ±0.005'i aşıyorsa ipucu kanalı test bilgisi
+    #   taşıyor demektir → sızıntı. Fark yoksa kanal temiz.
+    #   Sınır: yalnızca satır düzeyli planlarda (aggregation.required=False) split
+    #   birebir yeniden üretilebilir; plan agrege ediyorsa mod kendini devre dışı bırakır
+    #   ve generated_from="full_data" olarak işaretlenir (sessiz geçilmez, loglanır).
+    ENABLE_LOCKED_HOLDOUT: bool = os.getenv("ENABLE_LOCKED_HOLDOUT", "false").strip().lower() in ("1", "true", "yes", "on")
+
+    # ── Fairness / segment taşıyıcısı ─────────────────────────────────────────
+    # FAIRNESS_SEGMENT_MODE — split anında HAM hâlde snapshot'lanacak kolonlar:
+    #   "narrow" (varsayılan) → yalnızca demografik sezgiselin yakaladıkları
+    #       (age/sex/gender/race/... + db_intelligence semantic_type=demographic).
+    #       Bugünkü fairness davranışının kapsamı; state boyutu küçük kalır.
+    #   "wide"   → TÜM düşük kardinaliteli kategorikler. "Her segmentte performans"
+    #       analizini açar ama checkpoint payload'unu büyütür. Kod değişikliği
+    #       gerektirmez — yalnızca bu ayar.
+    FAIRNESS_SEGMENT_MODE: str = os.getenv("FAIRNESS_SEGMENT_MODE", "narrow").strip().lower()
+    # "wide" modda bir kategorik kolonun segment sayılması için üst kardinalite sınırı.
+    FAIRNESS_SEGMENT_MAX_CARDINALITY: int = int(os.getenv("FAIRNESS_SEGMENT_MAX_CARDINALITY", "10"))
+    # Bir grup için metrik HESAPLANMASININ alt sınırı. Altındaki gruplar rapordan
+    # SİLİNMEZ — görünür sebeple ("örneklem çok ince") listelenir. Sessiz atlama yok.
+    FAIRNESS_MIN_GROUP_SIZE: int = int(os.getenv("FAIRNESS_MIN_GROUP_SIZE", "5"))
 
 settings = Settings()

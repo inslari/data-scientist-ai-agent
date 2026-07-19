@@ -417,17 +417,22 @@ class DuckDBEngine:
                 }
 
                 if is_num:
+                    # SKEWNESS burada üretilir. Eskiden üretilmiyordu ama
+                    # _generate_recommendations onu okumaya çalışıyordu → çarpıklık
+                    # önerisi hiç çıkmıyordu (sessiz ölü dal). DuckDB'de maliyeti
+                    # ölçüldü: 300k×17'de ~0.01 sn.
                     stats = self.conn.execute(f"""
                         SELECT
                             MIN({safe_col}), MAX({safe_col}),
                             AVG({safe_col}), MEDIAN({safe_col}),
                             STDDEV({safe_col}),
                             PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {safe_col}),
-                            PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {safe_col})
+                            PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {safe_col}),
+                            SKEWNESS({safe_col})
                         FROM {safe}
                     """).fetchone()
                     if stats:
-                        mn,mx,avg,med,std,q1,q3 = stats
+                        mn,mx,avg,med,std,q1,q3,skew = stats
                         iqr = (q3 or 0) - (q1 or 0)
                         outlier_rate = 0.0
                         if iqr > 0:
@@ -442,6 +447,7 @@ class DuckDBEngine:
                             "mean": _sf(avg), "median": _sf(med),
                             "std": _sf(std), "q25": _sf(q1), "q75": _sf(q3),
                             "has_outliers": outlier_rate,
+                            "skewness": _sf(skew),
                         })
 
                 elif is_date:
@@ -472,6 +478,20 @@ class DuckDBEngine:
         # Tam satır sayısı
         count_row = self.conn.execute(f"SELECT COUNT(*) FROM {safe}").fetchone()
         total_rows = count_row[0] if count_row else 0
+
+        # Duplicate satır: GERÇEKTEN sayılır. Eskiden sabit 0 yazılıyordu ("DuckDB'de
+        # pahalı") — bu rapora "duplicate yok" diye yansıyıp YANLIŞ GÜVEN veriyordu,
+        # oysa hiç bakılmıyordu. Maliyet ölçüldü: 300k×17'de ~0.12 sn (columnar hash).
+        # Hesap başarısız olursa 0 yazıp geçmiyoruz — None ile "bilinmiyor" diyoruz.
+        try:
+            distinct_row = self.conn.execute(
+                f"SELECT COUNT(*) FROM (SELECT DISTINCT * FROM {safe})"
+            ).fetchone()
+            duplicate_rows = total_rows - (distinct_row[0] if distinct_row else total_rows)
+        except Exception as e:
+            logger.warning(f"[duckdb] '{safe}' duplicate sayımı başarısız: {e} — 'bilinmiyor' olarak işaretlendi.")
+            duplicate_rows = None
+
         numeric_cols   = [c for c,d in dtypes.items() if any(t in d.upper() for t in ("INT","FLOAT","DOUBLE","DECIMAL","REAL","BIGINT"))]
         categorical_cols = [c for c,d in dtypes.items() if "VARCHAR" in d.upper() or "TEXT" in d.upper()]
         datetime_cols  = [c for c,d in dtypes.items() if any(t in d.upper() for t in ("DATE","TIME","TIMESTAMP"))]
@@ -484,7 +504,7 @@ class DuckDBEngine:
                 "categorical_columns":categorical_cols,
                 "datetime_columns":   datetime_cols,
                 "missing_rate":       round(sum(cp.get("null_rate",0) for cp in col_profiles.values()) / max(len(col_profiles),1), 4),
-                "duplicate_rows":     0,  # DuckDB'de pahalı, skip
+                "duplicate_rows":     duplicate_rows,   # None = hesaplanamadı ("bilinmiyor"), 0 = gerçekten yok
             },
             "columns": col_profiles,
         }
@@ -588,7 +608,20 @@ def _merge_dataframes(
 
 
 # ── Recommendations (DuckDB profil çıktısından) ──────────────
+# Bu öneriler YALNIZCA RAPOR yoluna gider (report_generator._build_context → kullanıcı).
+# feature_plan'a AKMAZ — DS ajanına giden tek analist kanalı analysis_hints'tir
+# (bkz. analysis_engine.extract_plan_hints). Buradaki öneriler hedef-agnostiktir, ama
+# scaler/encoding seçimi gibi FE'nin zaten deterministik yaptığı kararları içerir;
+# plana akıtmak prompt gürültüsünden başka bir şey olmaz.
+#
+# Eşikler analysis_engine'deki PLAN_HINT_* sabitlerinden gelir — aynı olguya (yüksek
+# null, outlier, yüksek kardinalite, çarpıklık) iki farklı eşik uygulanmasın diye.
 def _generate_recommendations(profile: dict) -> list[str]:
+    from src.services.analysis_engine import (
+        PLAN_HINT_HIGH_MISSING_RATE, PLAN_HINT_OUTLIER_RATE, PLAN_HINT_SKEW,
+        PLAN_HINT_HIGH_CARD_UNIQUE_RATE, is_date_like,
+    )
+
     recs = []
     summary = profile.get("summary", {})
     numeric_cols = set(summary.get("numeric_columns", []))
@@ -596,27 +629,27 @@ def _generate_recommendations(profile: dict) -> list[str]:
 
     if missing_rate > 0.05:
         recs.append(f"Eksik değer imputation gerekli (missing_rate: %{missing_rate*100:.1f})")
-    if summary.get("duplicate_rows", 0) > 0:
-        recs.append(f"Duplicate satır temizlenmeli ({summary['duplicate_rows']} adet)")
 
-    DATE_SUFFIXES = ("_date","_at","_time")
-    DATE_EXACT = {"created_at","updated_at","timestamp","birth_date","order_date"}
-    OUTLIER_THRESHOLD = 0.01
+    # duplicate_rows: None = hesaplanamadı. Sessizce "yok" demiyoruz — kullanıcı
+    # duplicate olmadığını sanmasın diye bilinmediğini açıkça söylüyoruz.
+    dup = summary.get("duplicate_rows")
+    if dup is None:
+        recs.append("Duplicate satır sayısı hesaplanamadı — veri tekrarları kontrol edilmedi")
+    elif dup > 0:
+        recs.append(f"Duplicate satır temizlenmeli ({dup} adet)")
 
     for col, info in profile.get("columns", {}).items():
         if "error" in info: continue
         dtype       = info.get("dtype","").upper()
         col_lower   = col.lower()
         is_id       = col_lower.endswith("_id") or col_lower == "id"
-        is_date_col = ("DATE" in dtype or "TIME" in dtype or
-                       col_lower in DATE_EXACT or
-                       any(col_lower.endswith(s) for s in DATE_SUFFIXES))
+        is_date_col = is_date_like(col, dtype)
         is_monetary = any(k in col_lower for k in ["price","amount","cost","revenue"])
 
         outlier_rate = info.get("has_outliers", 0.0)
         if isinstance(outlier_rate, bool):
-            outlier_rate = 0.05 if outlier_rate else 0.0
-        has_outliers = outlier_rate > OUTLIER_THRESHOLD
+            outlier_rate = PLAN_HINT_OUTLIER_RATE if outlier_rate else 0.0
+        has_outliers = outlier_rate >= PLAN_HINT_OUTLIER_RATE
 
         null_rate    = info.get("null_rate", 0)
         unique_cnt   = info.get("unique_count", 0)
@@ -629,7 +662,7 @@ def _generate_recommendations(profile: dict) -> list[str]:
             recs.append(f"'{col}' sabit değerli — çıkarılmalı"); continue
         if is_date_col:
             recs.append(f"'{col}' tarih kolonu — yıl/ay/gün özelliklerine dönüştür"); continue
-        if null_rate > 0.3:
+        if null_rate >= PLAN_HINT_HIGH_MISSING_RATE:
             recs.append(f"'{col}' çok yüksek null (%{null_rate*100:.0f}) — drop veya agresif imputation"); continue
 
         if col in numeric_cols:
@@ -640,13 +673,15 @@ def _generate_recommendations(profile: dict) -> list[str]:
                 parts.append("parasal → StandardScaler")
             elif has_outliers:
                 parts.append(f"outlier %{outlier_rate*100:.1f} → RobustScaler/IQR capping")
+            # Çarpıklık ikili/0-1 bayraklarda anlamsız (dengesiz bir bayrağın skew'i
+            # doğal olarak >1 çıkar ama log(bayrak) saçmadır) — analysis_hints ile aynı kural.
             skew = info.get("skewness")
-            if skew is not None and abs(skew) > 1:
+            if skew is not None and abs(skew) >= PLAN_HINT_SKEW and unique_cnt > 2:
                 parts.append(f"çarpık (skew={skew:.2f}) → log/sqrt transform")
             if parts:
                 recs.append(f"'{col}': {' | '.join(parts)}")
         elif "VARCHAR" in dtype or "TEXT" in dtype:
-            if unique_rate > 0.95:
+            if unique_rate >= PLAN_HINT_HIGH_CARD_UNIQUE_RATE:
                 recs.append(f"'{col}' neredeyse unique → drop/hash encoding")
             elif cardinality == "high":
                 recs.append(f"'{col}' yüksek kardinalite ({unique_cnt}) → target encoding")

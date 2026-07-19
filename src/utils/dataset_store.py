@@ -85,6 +85,42 @@ def dump_y(y_train, y_test, *, tag: str = "y") -> dict:
     return out
 
 
+def dump_raw_test(raw_test: pd.DataFrame, *, tag: str = "") -> str | None:
+    """HAM test partisyonunu (encode/scale ÖNCESİ) parquet'e yazar; yolu döndürür.
+
+    Yazılamazsa None → çağıran sessizce değil, görünür sebeple devam eder.
+
+    TİPLER KORUNUR — astype(str) YAPILMAZ. Fairness'a kategorik değer yeterdi ama
+    hata analizi HAM SAYISAL değer istiyor ("hatalı vakalarda 42 saat"); string'e
+    çevirmek tam da kurtarmaya çalıştığımız bilgiyi yok ederdi. Kategorik değerler
+    okuma tarafında string'e çevrilir (fairness'ın ihtiyacı orada).
+
+    index=False bilinçli: hizalama POZİSYONEL'dir (satır sırası X_test ile birebir).
+    Split sonrası transform'lar yalnızca kolon ekler/düşürür, satır sırasını
+    değiştirmez — bu değişmez testlerle sabitlenmiştir.
+    """
+    _ensure_dir()
+    path = f"{_SPLIT_DIR}/{(tag + '_') if tag else ''}{uuid.uuid4().hex}_rawtest.parquet"
+    try:
+        raw_test.to_parquet(path, index=False)
+        return path
+    except Exception as e:
+        logger.warning(f"[dataset_store] ham test taşıyıcısı diske yazılamadı: {e}")
+        return None
+
+
+def load_raw_test(state: dict) -> pd.DataFrame | None:
+    """Ham test taşıyıcısını okur. Yoksa None (tüketici görünür sebeple atlar)."""
+    path = state.get("raw_test_path")
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception as e:
+        logger.warning(f"[dataset_store] ham test taşıyıcısı '{path}' okunamadı: {e}")
+        return None
+
+
 def _load_records(state: dict, path_key: str, inline_key: str) -> list:
     """X için: parquet yolundan records listesi döndürür; yoksa state'teki inline
     listeye düşer (geri-uyum). Aşağı akış kodu `pd.DataFrame(raw)` ve `if not raw`

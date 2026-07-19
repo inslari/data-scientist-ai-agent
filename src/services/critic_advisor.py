@@ -32,6 +32,12 @@ def _primary_metric(task: str, test_metrics: dict) -> float:
 # Teşhis fonksiyonları — her biri severity'li bir dict döner (veya None)
 # ─────────────────────────────────────────────────────────────
 def _diagnose_overfitting(overfitting: dict) -> dict | None:
+    # Olcum belirsizse (CV skoru test skorunun bootstrap GA'sinin icinde — ornegin az pozitifli
+    # test seti) gap bir sey KANITLAMIYOR: gurultuye bakip modeli basitlestirmek, gercek sinyali
+    # kovalamak degil piyangoya oynamaktir. Verdict `inconclusive` ise retry/regularization YOK.
+    if overfitting.get("status") == "inconclusive":
+        return None
+
     gap = overfitting.get("gap", 0) or 0
     if gap > 0.30:
         sev = 10

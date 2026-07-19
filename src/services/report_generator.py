@@ -41,6 +41,30 @@ from src.core.report_i18n import (
     freq_label,
     split_label,
 )
+from src.core.report_schema import (
+    ORDER_HEADER,
+    ORDER_LEGACY_PROSE,
+    ORDER_STATUS,
+    ORDER_TIMESERIES,
+    ReportSection,
+    render_report,
+    sections_to_dicts,
+)
+from src.services.report_sections import (
+    build_assessment_section,
+    build_data_quality_section,
+    build_error_analysis_section,
+    build_fairness_section,
+    build_features_section,
+    build_generalization_section,
+    build_leakage_section,
+    build_performance_section,
+    build_recommendations_section,
+    build_relations_section,
+    build_section_prose,
+    build_summary_section,
+    build_synthesis_prose,
+)
 from src.domains import get_active_pack
 from src.domains.base import MerchantContext
 from src.domains.schemas import MerchantAnalysis
@@ -98,45 +122,75 @@ def _plainify_rec(rec: str) -> str:
     return f"{left.strip()} → {eff}"
 
 
+def _build_status_section(state: AgentState, lang: str = "tr") -> str:
+    """quality_gate durum rozeti + Karar + FAIL/WARN — DETERMİNİSTİK render.
+
+    Eskiden bu blok context'e konup LLM'den "VERBATIM kopyala" diye istenirdi.
+    İki şekilde birden kırılıyordu:
+      1. LLM satırın önüne boş bir '## ' başlığı koyuyordu (talimat "H1 yapma"
+         diyordu, o da H2 yapıyordu) → her raporda görünür artık.
+      2. quality_gate HİÇ YOKKEN rozeti UYDURUYORDU — ölçüldü: "✅ Durum: Model
+         güvenilir" yazdı; hem uydurma hem prompt'un açıkça yasakladığı
+         ("güvenilir" deme) iddia.
+    Talimatı sertleştirmek işe yaramadı (denendi). Rozet zaten deterministik bir
+    veriden geliyor → LLM'e hiç sorulmaz, kod basar. Fairness'taki ders: kuralı
+    yasak olarak değil, YAPI olarak kur.
+
+    quality_gate yoksa "" döner → bölüm hiç görünmez (uydurulamaz da).
+    """
+    qg = state.get("quality_gate") or {}
+    if not qg:
+        return ""
+
+    lines: list[str] = []
+    badge = {
+        "pass": R("badge_pass", lang),
+        "warn": R("badge_warn", lang),
+        "fail": R("badge_fail", lang),
+    }.get(qg.get("status"), "")
+
+    if badge:
+        lines.append(f"**{badge}**")
+        lines.append("")
+    summary = qg.get("summary", "")
+    if summary:
+        lines.append(f"**{R('decision', lang)}:** {summary}")
+        lines.append("")
+
+    for key, header in (("failures", "fail_header"), ("warnings", "warn_header")):
+        items = qg.get(key) or []
+        if items:
+            lines.append(f"## {R(header, lang)}")
+            for it in items:
+                lines.append(f"- {it['message']}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
 def _build_context(state: AgentState, lang: str = "tr") -> str:
     """Formats all state outputs into a structured text block for the LLM.
 
-    Çıktıya VERBATIM kopyalanan parçalar (status rozeti, Karar, FAIL/WARN) ``lang``
-    diline lokalize edilir; geri kalan etiketler LLM girdisidir (yeniden yazılır).
+    Bu blok tamamen LLM GİRDİSİDİR — hiçbir parçası çıktıya birebir kopyalanmaz.
+    Durum rozeti/Karar/FAIL/WARN artık _build_status_section ile deterministik
+    basılıyor; buraya yalnızca LLM özetinde bağlam olarak kullansın diye girer.
     """
     lines: list[str] = []
     intent = state.get("intent", "unknown")
 
-    # quality gate
+    # quality gate — YALNIZCA bağlam. Çıktıya kopyalanması İSTENMİYOR (prompt bunu
+    # açıkça yasaklar); rozetin kendisi montajda deterministik basılıyor.
     qg = state.get("quality_gate") or {}
     if qg:
-        summary = qg.get("summary", "")
-
-        # Durum rozeti — H1 DEĞİL; deterministik başlığın altında küçük durum satırı.
-        # Kategorik "güvenilir/üretime alınmamalı" iddiası yok, sadece durum işareti.
-        badge = {
-            "pass": R("badge_pass", lang),
-            "warn": R("badge_warn", lang),
-            "fail": R("badge_fail", lang),
-        }.get(qg.get("status"), "")
-
-        if badge:
-            lines.append(f"**{badge}**\n")
-        lines.append(f"**{R('decision', lang)}:** {summary}\n")
-
-        failures = qg.get("failures", [])
-        if failures:
-            lines.append(f"## {R('fail_header', lang)}")
-            for f in failures:
-                lines.append(f"  - {f['message']}")
-            lines.append("")
-
-        warnings = qg.get("warnings", [])
-        if warnings:
-            lines.append(f"## {R('warn_header', lang)}")
-            for w in warnings:
-                lines.append(f"  - {w['message']}")
-            lines.append("")
+        lines.append(
+            f"## Kalite Kapısı (BAĞLAM — bu satırları rapora KOPYALAMA, sistem basıyor)\n"
+            f"- Durum: {qg.get('status', '?')}\n"
+            f"- Karar: {qg.get('summary', '')}"
+        )
+        for key, label in (("failures", "Kritik sorun"), ("warnings", "Uyarı")):
+            for it in qg.get(key) or []:
+                lines.append(f"  - [{label}] {it['message']}")
+        lines.append("")
 
     # user query
     lines.append(f"## Kullanıcı Sorusu\n{state.get('user_query', 'Belirtilmemiş')}\n")
@@ -206,37 +260,12 @@ def _build_context(state: AgentState, lang: str = "tr") -> str:
             )
             lines.append("")
 
-    # domain leakage
-    domain_leakage = state.get("domain_leakage_report", {})
-    if domain_leakage:
-        concerns = domain_leakage.get("concerns", [])
-        assessment = domain_leakage.get("overall_assessment", "")
-        
-        if concerns:
-            lines.append("\n## Leakage Suphesi (Domain Analizi)")
-            lines.append(f"Genel degerlendirme: {assessment}\n")
-            for c in concerns:
-                severity_marker = {
-                    "high": "[YUKSEK SUPHE]",
-                    "medium": "[ORTA SUPHE]",
-                    "low": "[DUSUK SUPHE]",
-                }.get(c.get("confidence", "low"), "[SUPHE]")
-                lines.append(
-                    f"  {severity_marker} '{c.get('column_name')}' "
-                    f"({c.get('relationship_type')}): {c.get('reasoning')}"
-                )
-            lines.append("")
-            
-            # high confidence drop info
-            high_dropped = [c for c in concerns if c.get("confidence") == "high"]
-            if high_dropped:
-                cols = [c['column_name'] for c in high_dropped]
-                lines.append(f"**OTOMATIK DROP EDILDI (high confidence leakage):** {', '.join(cols)}")
-                lines.append("Bu feature'lar otomatik olarak modelden cikarildi. Asagidaki metrikler bu feature'lar olmadan egitilen modeli yansitir — yani gercek performans, leakage'li sahte yuksek skor degil.\n")
-                
-        elif assessment:
-            lines.append(f"\n## Leakage Kontrolu\n{assessment}\n")
-    
+    # domain leakage ARTIK bu context'te DEĞİL: katmanlı Sızıntı & Riskler bölümü
+    # (build_leakage_section) üç dedektörü — domain / target_lock / importance —
+    # kalem bazında ayrıştırıp otomatik-drop bilgisiyle birlikte sunuyor. Burada
+    # ayrıca basmak aynı bulguyu iki farklı çerçeveyle tekrarlardı. LLM'e leakage
+    # yazMAMASI söylenir (prompt: bölüm sistem tarafından eklenir).
+
     # task-specific evaluation
     ev = state.get("evaluation_report", {})
     metrics = state.get("metrics", {})
@@ -314,37 +343,40 @@ def _build_context(state: AgentState, lang: str = "tr") -> str:
             for k, v in metrics.items():
                 if k not in ("per_class_report", "feature_importance", "task", "all_model_scores"):
                     lines.append(f"  - {k}: {v}")
-            all_scores = metrics.get("all_model_scores", {})
-            if all_scores:
-                lines.append("- Tüm model skorları:")
-                for m, s in sorted(all_scores.items(), key=lambda x: x[1], reverse=True):
-                    lines.append(f"    {m}: {s:.4f}")
+            # all_model_scores ARTIK burada değil: katmanlı Model Performansı
+            # bölümünün "Denenen diğer modeller" alt bölümünde, her skorun neye
+            # göre (CV) ölçüldüğü etiketli hâlde veriliyor.
             lines.append("")
 
         if ev:
+            # NOT: confidence_intervals, error_analysis, shap_importance ve
+            # feature_importance_summary BİLEREK okunmuyor — hepsi artık katmanlı
+            # bölümlerin (performans / hata / etkili özellikler / sızıntı) kanıt
+            # katmanında, kendi provenance etiketleriyle.
             test_m = ev.get("test_metrics", {})
             ovf = ev.get("overfitting", {})
             cal = ev.get("calibration", {})
-            ci = ev.get("confidence_intervals", {})
             rel = ev.get("reliability_score", {})
-            shap = ev.get("shap_importance", {})
-            err = ev.get("error_analysis", {})
-            fi_sum = ev.get("feature_importance_summary", {})
             opt_thresh = ev.get("optimal_threshold")
 
-            lines.append("## Evaluation Sonuçları\n### Test Metrikleri")
+            # Test metrikleri BAĞLAM olarak kalır (Özet "model ne kadar iyi"
+            # sorusunu, Zayıf Yönler ise CV−Test farkını bunlar olmadan yanıtlayamaz)
+            # ama PERFORMANS BÖLÜMÜ artık LLM'in değil: katmanlı bölüm olarak
+            # (build_performance_section) kanıt/aralık/confusion ile birlikte
+            # üretiliyor. Status rozeti deseni: sayıyı göster, yazma işini alma.
+            lines.append(
+                "## Evaluation Sonuçları\n### Test Metrikleri\n"
+                "  (BAĞLAM — bu satırları rapora KOPYALAMA ve bir 'Model Performansı'\n"
+                "   bölümü YAZMA; sistem o bölümü kanıtlarıyla birlikte kendisi ekliyor.\n"
+                "   Burada yalnızca Özet'in ve genelleme değerlendirmesinin tutarlı\n"
+                "   olabilmesi için gösteriliyor.)"
+            )
             for k, v in test_m.items():
                 lines.append(f"  - {k}: {v}")
 
-            if ci:
-                lines.append(
-                    "\n### Güven Aralığı (%95)\n"
-                    "  (skorun tekrarlı örneklemeyle ne kadar oynadığı — dar aralık = sonuç güvenilir/kararlı)"
-                )
-                for metric, vals in ci.items():
-                    lines.append(f"  - {metric}: {vals['mean']} [{vals['lower']} — {vals['upper']}]")
-            else:
-                lines.append("\n*Bootstrap güven aralığı bu çalışmada hesaplanmadı (yetersiz veri veya zaman aşımı).*")
+            # Güven aralıkları ARTIK bu context'te değil: katmanlı Model Performansı
+            # bölümünde her metriğin YANINDA basılıyor. Burada bırakmak aynı aralığın
+            # iki yerde, biri kanıtsız iki kez anlatılmasına yol açardı.
 
             disp_s, test_s, ovf_label = _overfitting_scores(ovf)
             if ovf and disp_s is not None:
@@ -382,56 +414,25 @@ def _build_context(state: AgentState, lang: str = "tr") -> str:
             else:
                 lines.append("\n*Kalibrasyon analizi bu çalışmada uygulanmadı (regresyon veya çok sınıflı modelde geçerli değil).*")
 
-            if err:
-                conf = err.get("confidence_analysis", {})
-                lines.append(
-                    f"\n### Hata Analizi\n"
-                    f"  - Hatalı tahmin: {err.get('n_errors')}/{err.get('n_total')} ({err.get('error_rate', 0)*100:.2f}%)\n"
-                    f"  - Yüksek güven hatası: {conf.get('high_confidence_errors', 0)} adet ({conf.get('high_confidence_errors_pct', 0)}%)"
-                )
-                feat_diff = err.get("feature_distribution_diff", {})
-                if feat_diff:
-                    lines.append(
-                        "  - Hatalı vakaların doğru vakalardan en çok ayrıştığı özellikler "
-                        "(fark büyüklüğü — Cohen's d: 0.2 küçük, 0.5 orta, 0.8 büyük fark):"
-                    )
-                    for feat, info in list(feat_diff.items())[:3]:
-                        lines.append(f"      {humanize_feature(feat, lang)}: fark={info['cohens_d']} ({info['effect_magnitude']})")
+            # Hata analizi ARTIK bu context'te değil: katmanlı bölüm olarak ayrı
+            # üretiliyor (build_error_analysis_section). Burada bırakmak aynı bulgunun
+            # iki yerde iki farklı çerçeveyle anlatılmasına yol açardı — üstelik
+            # buradaki ölçekli değerler ("fark=0.37") kanıt katmanının ham değerleriyle
+            # ("hatalı vakalarda 42 saat") çelişirdi.
 
-            if shap and shap.get("top5_shap_features"):
-                lines.append(
-                    "\n### Modelin Kararında En Etkili Özellikler\n"
-                    "  (her özelliğin tahmine katkı payı — SHAP yöntemiyle hesaplandı)"
-                )
-                for feat, pct in list(shap.get("top5_shap_features", {}).items())[:5]:
-                    lines.append(f"  - {humanize_feature(feat, lang)}: %{pct}")
-            else:
-                lines.append("\n*SHAP açıklanabilirlik analizi bu çalışmada hesaplanmadı.*")
+            # Etkili Özellikler (SHAP + feature_importance) ve Sızıntı & Riskler
+            # (leakage_suspects + target_lock + domain) ARTIK bu context'te DEĞİL:
+            # katmanlı bölümler olarak ayrı üretiliyor (build_features_section /
+            # build_leakage_section). SHAP'ı test_set, importance'ı model_internal
+            # provenance'ıyla AYRI sunuyorlar; üç leakage dedektörü kalem bazında
+            # ayrıştırılıyor. Burada bırakmak ikisini de iki farklı yerde iki farklı
+            # çerçeveyle anlatırdı.
 
-            if fi_sum:
-                lines.append(
-                    f"\n### Feature Importance\n"
-                    f"  - Top 5 toplam katki: %{fi_sum.get('top5_total_contribution_pct')}\n"
-                    f"  - Onemsiz feature: {fi_sum.get('insignificant_features_count', 0)} adet"
-                )
-                
-                # Importance-based leakage uyarisi
-                suspects = fi_sum.get("leakage_suspects", [])
-                if suspects:
-                    lines.append("\n### Leakage Suphesi (Feature Importance)")
-                    for s in suspects:
-                        severity_emoji = "[YUKSEK]" if s["severity"] == "high" else "[ORTA]"
-                        lines.append(f"  {severity_emoji} {s['column']}: {s['reason']}")
-
-            bias = ev.get("bias_analysis", {})
-            if bias:
-                lines.append("\n### Bias & Fairness Analizi")
-                for base_col, cols in bias.items():
-                    lines.append(f"  - Grup: {base_col}")
-                    for col, metrics in cols.items():
-                        lines.append(f"    - {col}: FPR={metrics.get('fpr', 0):.3f}, FNR={metrics.get('fnr', 0):.3f}")
-            else:
-                lines.append("\n*Adalet/yanlılık analizi bu veri setinde uygulanmadı (demografik etiket yok).*")
+            # Fairness ARTIK bu context'te değil: katmanlı bölüm olarak ayrı üretilip
+            # (build_fairness_section) rapora enjekte ediliyor. Buraya bir özet koymak
+            # aynı bulgunun iki farklı yerde iki farklı çerçeveyle anlatılmasına yol
+            # açardı. LLM'e fairness'ı YAZMAMASI söylenir (prompt: bölüm sistem
+            # tarafından eklenir).
 
             if opt_thresh:
                 lines.append(
@@ -706,51 +707,72 @@ def generate_report(state: AgentState) -> dict:
 
     prompt = R("human_intro", lang, q=user_query, ctx=context)
 
-    logger.info("[report] LLM'den rapor üretiliyor...")
-    try:
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=prompt),
-        ])
-        report_text = response.content
-        if isinstance(report_text, list):
-            report_text = "".join([str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in report_text])
-        elif not isinstance(report_text, str):
-            report_text = str(report_text)
+    # ── Kanıt-dayalı katmanlı bölümler (her biri kendi verisinden) ──────────
+    # Bunlar önce kurulur; sentez bölümleri (Özet/Güçlü-Zayıf/Öneriler) bunların
+    # DIGEST'ini girdi alır — üstte olmayan bir sayı taşıyamasınlar diye.
+    evidence_sections = [
+        build_section_prose(build_data_quality_section(state, lang), lang),
+        build_section_prose(build_relations_section(state, lang), lang),
+        build_section_prose(build_performance_section(state, lang), lang),
+        build_section_prose(build_generalization_section(state, lang), lang),
+        build_section_prose(build_error_analysis_section(state, lang), lang),
+        build_section_prose(build_features_section(state, lang), lang),
+        build_section_prose(build_leakage_section(state, lang), lang),
+        build_section_prose(build_fairness_section(state, lang), lang),
+    ]
 
-        # Deterministik başlık + meta satırını en üste ekle (LLM başlık üretmiyor).
-        # Zaman serisi özeti yalnızca modality=timeseries iken araya girer (tabular'da "").
-        report_text = (
-            _build_report_header(state, lang) + "\n"
-            + _build_timeseries_section(state, lang)
-            + report_text.lstrip()
-        )
+    is_supervised = intent in _SUPERVISED_INTENTS
 
-    except Exception as e:
-        logger.error(f"[report] LLM hatası: {e}")
-        # create fallback report if llm fails
-        report_text = _generate_fallback_report(state, lang)
+    # ── Sentez bölümleri (supervised) VEYA blob (clustering/anomaly) ─────────
+    # Supervised'da tüm sentez bölümleri katmanlı yapıya taşındı → blob'a gerek yok
+    # (legacy_prose = ""). Clustering/anomaly'de o bölümler henüz taşınmadığı için
+    # blob hâlâ birincil anlatı: LLM çağrısı orada kalır.
+    synthesis_sections: list[ReportSection] = []
+    legacy_prose = ""
+    if is_supervised:
+        synthesis_sections = [
+            build_synthesis_prose(build_summary_section(state), evidence_sections, state, lang),
+            build_synthesis_prose(build_assessment_section(state), evidence_sections, state, lang),
+            build_synthesis_prose(build_recommendations_section(state), evidence_sections, state, lang),
+        ]
+    else:
+        logger.info("[report] LLM'den rapor üretiliyor (blob — clustering/anomaly)...")
+        try:
+            response = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=prompt),
+            ])
+            prose = response.content
+            if isinstance(prose, list):
+                prose = "".join([str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in prose])
+            elif not isinstance(prose, str):
+                prose = str(prose)
+            legacy_prose = prose.lstrip()
+        except Exception as e:
+            logger.error(f"[report] LLM hatası: {e}")
+            legacy_prose = _generate_fallback_report(state, lang)
 
-    # Veri kalitesi 'degraded' (bazı satır karantinaya alındı ama modele devam
-    # edildi) → başarılı raporun sonuna görünür not düş. Kullanıcı kaç satırın
-    # neden atlandığını görsün ("herkes anlasın" vaadi).
-    if state.get("data_quality_status") == "degraded":
-        _q = (state.get("data_quality_report", {}) or {}).get("quarantine", {}) or {}
-        if _q.get("rows", 0) > 0:
-            report_text += R("dq_degraded_note", lang, n=_q.get("rows", 0))
+    # ── Montaj ───────────────────────────────────────────────────────────────
+    # Rapor ORDER'a göre dizilen bölümlerden kurulur (bkz. report_schema.ORDER_*).
+    # legacy_prose YALNIZCA clustering/anomaly'de doludur; supervised'da boş string
+    # (geçerli ham taşıyıcı → hiçbir şey basmaz). Blob supervised için tamamen boşaldı.
+    layered_sections = [*evidence_sections, *synthesis_sections]
+    assembly = [
+        ReportSection(id="header", title="", order=ORDER_HEADER,
+                      raw_markdown=_build_report_header(state, lang)),
+        ReportSection(id="timeseries", title="", order=ORDER_TIMESERIES,
+                      raw_markdown=_build_timeseries_section(state, lang)),
+        ReportSection(id="status", title="", order=ORDER_STATUS,
+                      raw_markdown=_build_status_section(state, lang)),
+        ReportSection(id="legacy_prose", title="", order=ORDER_LEGACY_PROSE,
+                      raw_markdown=legacy_prose),
+        *layered_sections,
+    ]
+    report_text = render_report(assembly, lang)
 
-    # Training cap örneklemesi (MAX_TRAINING_ROWS aşıldı) → görünür not (sessiz değil).
-    _samp = (state.get("feature_report", {}) or {}).get("sampling", {}) or {}
-    if _samp.get("sampled"):
-        if _samp.get("method") == "stratified":
-            report_text += R("sampling_note_stratified", lang,
-                             orig=_samp.get("original_rows", 0), n=_samp.get("sampled_rows", 0),
-                             before=_samp.get("minority_pct_before", "?"),
-                             after=_samp.get("minority_pct_after", "?"), cap=_samp.get("cap", 0))
-        else:
-            report_text += R("sampling_note_random", lang,
-                             orig=_samp.get("original_rows", 0), n=_samp.get("sampled_rows", 0),
-                             cap=_samp.get("cap", 0))
+    # NOT: 'degraded' karantina uyarısı ve örnekleme notu ARTIK burada append
+    # EDİLMİYOR — ikisi de katmanlı Veri Kalitesi bölümünün (build_data_quality_section)
+    # kanıt/disclaimer katmanında. Burada tekrar basmak çift gösterirdi.
 
     # Büyük-N model guard (roster kısıldı) → görünür not (sessiz değil).
     _guard = state.get("heavy_model_guard", {}) or {}
@@ -772,23 +794,28 @@ def generate_report(state: AgentState) -> dict:
     return {
         **state,
         "report": report_text,
+        "report_sections": sections_to_dicts(layered_sections),
         "current_step": "report_node",
     }
 
 
 # fallback report (llm failes)
 def _generate_fallback_report(state: AgentState, lang: str = "tr") -> str:
-    """LLM çağrısı başarısız olursa state verilerinden doğrudan rapor üretir.
+    """LLM çağrısı başarısız olursa state verilerinden rapor GÖVDESİNİ üretir.
+
+    Yalnızca gövde döner: H1 başlık, zaman serisi özeti ve katmanlı bölümler
+    (fairness vb.) MONTAJ tarafından eklenir (bkz. generate_report). Bu fonksiyon
+    blob'un yerini aldığı için onunla aynı kapsamda kalmalı — yoksa fallback
+    yolunda başlık/bölüm İKİ KEZ basılır.
 
     Tüm yapısal başlık/etiketler ``lang`` diline lokalizedir (report_i18n).
     """
+    # NOT: test_metrics / confidence_intervals / error_analysis / shap_importance
+    # BİLEREK okunmuyor — hepsi katmanlı bölümlerin kanıt katmanında ve montajla
+    # eklenir (LLM'den bağımsız çalıştıkları için fallback yolunda da basılırlar).
     ev = state.get("evaluation_report", {})
-    test_m = ev.get("test_metrics", {})
     ovf = ev.get("overfitting", {})
     rel = ev.get("reliability_score", {})
-    shap = ev.get("shap_importance", {})
-    ci = ev.get("confidence_intervals", {})
-    err = ev.get("error_analysis", {})
     cal = ev.get("calibration", {})
     model_name = state.get("model_name", "unknown")
     intent = state.get("intent", "unknown")
@@ -797,34 +824,17 @@ def _generate_fallback_report(state: AgentState, lang: str = "tr") -> str:
     grade = rel.get("grade", "?")
     score = rel.get("score", 0)
 
-    ts_section = _build_timeseries_section(state, lang)
+    # Performans metrikleri / güven aralıkları / eksik-metrik uyarısı ARTIK burada
+    # DEĞİL: katmanlı Model Performansı bölümü LLM'den bağımsız çalışır (kanıtı kod
+    # kurar), dolayısıyla fallback yolunda da montaj tarafından eklenir. Burada
+    # bırakmak aynı metrikleri iki kez, biri kanıtsız bastırırdı.
     lines = [
-        _build_report_header(state, lang).rstrip("\n"),
-        "",
-    ]
-    if ts_section:
-        lines += [ts_section.rstrip("\n"), ""]
-    lines += [
         R("fb_h1", lang),
         f"- {R('fb_analysis_type', lang)}: **{intent}**",
         f"- {R('fb_tables', lang)}: {', '.join(tables)}",
         f"- {R('fb_best_model', lang)}: **{model_name}**",
         f"- {R('fb_overall_rel', lang)}: **{score}/100 (Grade: {grade})**",
-        "",
-        R("fb_h2", lang),
-        f"| {R('fb_metric', lang)} | {R('fb_value', lang)} |",
-        f"|--------|-------|",
     ]
-
-    for k, v in test_m.items():
-        lines.append(f"| {k} | {v} |")
-
-    if ci:
-        lines += ["", R("fb_ci", lang)]
-        for metric, vals in ci.items():
-            lines.append(f"- **{metric}**: {vals['mean']} [{vals['lower']} — {vals['upper']}]")
-    else:
-        lines.append(f"\n{R('fb_no_ci', lang)}")
 
     disp_s, test_s, ovf_label = _overfitting_scores(ovf)
     if ovf and disp_s is not None:
@@ -851,33 +861,13 @@ def _generate_fallback_report(state: AgentState, lang: str = "tr") -> str:
     else:
         lines.append(f"\n{R('fb_no_cal', lang)}")
 
-    if shap and shap.get("top5_shap_features"):
-        lines += ["", R("fb_h5", lang)]
-        for feat, pct in shap.get("top5_shap_features", {}).items():
-            lines.append(f"- **{feat}**: %{pct}")
-    else:
-        lines.append(f"\n{R('fb_no_shap', lang)}")
+    # Etkili Özellikler (SHAP) ve Sızıntı & Riskler burada YOK: katmanlı bölüm
+    # olarak montajda ekleniyorlar. İkisi de LLM'den bağımsız çalışır (kanıtı kod
+    # kurar), yani fallback yolunda da basılırlar — burada bırakmak çift olurdu.
 
-    if err:
-        conf = err.get("confidence_analysis", {})
-        hce = conf.get("high_confidence_errors", 0)
-        suffix = R("fb_count_suffix", lang)
-        lines += [
-            "",
-            R("fb_h6", lang),
-            f"- {R('fb_total_err', lang)}: {err.get('n_errors')}/{err.get('n_total')} ({err.get('error_rate', 0)*100:.2f}%)",
-            f"- {R('fb_high_conf_err', lang)}: {hce}" + (f" {suffix}" if suffix else ""),
-        ]
-
-    bias = ev.get("bias_analysis", {})
-    if bias:
-        lines += ["", R("fb_h7", lang)]
-        for base_col, cols in bias.items():
-            lines.append(f"- **{R('fb_group', lang)}: {base_col}**")
-            for col, metrics in cols.items():
-                lines.append(f"  - {col}: FPR={metrics.get('fpr', 0):.3f}, FNR={metrics.get('fnr', 0):.3f}")
-    else:
-        lines.append(f"\n{R('fb_no_bias', lang)}")
+    # Hata analizi / Fairness / Veri İlişkileri de aynı şekilde burada YOK:
+    # katmanlı bölüm olarak montajda ekleniyorlar (LLM çökse de kanıt katmanı
+    # prose'suz render edilir). Buraya kopya koymak bölümleri iki kez basardı.
 
     opt_thresh = ev.get("optimal_threshold")
     if opt_thresh:

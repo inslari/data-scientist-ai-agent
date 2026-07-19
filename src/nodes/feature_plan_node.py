@@ -1,12 +1,17 @@
 from src.core.nodes import node
 import os
+from pathlib import Path
+
+import pandas as pd
 from dotenv import load_dotenv
 
 from ..state import AgentState
+from ..core.config import settings
 from ..core.llm import get_llm
 from ..core.prompt_loader import create_chat_prompt
 from ..core.structured import invoke_structured
 from ..schemas.feature_plan_schemas import FeaturePlan
+from ..services.analysis_engine import extract_plan_hints, format_plan_hints
 from ..domains import get_active_pack
 from ..domains.base import MerchantContext, trim_doc
 from ..domains.schemas import MerchantAnalysis
@@ -105,6 +110,15 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
     except Exception as e:  # pragma: no cover - defensive
         logger.warning(f"[feature_plan] Domain pack feature ipucu başarısız ({e}); atlanıyor.")
 
+    # Analist ipuçları (hedef-kör yapısal bulgular). Hedef kolon ve hedef adayları
+    # extract_plan_hints'e HİÇ girmez → target-farkındalıklı ipucu üretilemez.
+    analysis_hints = _build_analysis_hints(state)
+    analysis_hint = format_plan_hints(analysis_hints) if settings.ENABLE_PLAN_HINTS else ""
+    if analysis_hint:
+        _counts = {k: len(v) for k, v in analysis_hints.items() if isinstance(v, list) and v}
+        logger.info(f"[feature_plan] Analist ipuçları eklendi "
+                    f"(kaynak={analysis_hints.get('generated_from')}): {_counts}")
+
     # Per-data-group domain document (dataset context) — pack'ten bağımsız enjekte edilir
     domain_doc = ""
     doc_text = trim_doc(state.get("domain_doc"), max_chars=4000)
@@ -124,6 +138,7 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
         "target_hint": target_hint,
         "retry_context": retry_context,
         "leakage_hint": leakage_hint,
+        "analysis_hint": analysis_hint,
         "domain_hint": domain_hint,
         "domain_doc": domain_doc,
     })
@@ -154,10 +169,118 @@ Yukarıdaki sorunları çözmek için FARKLI bir feature engineering stratejisi 
     logger.info(f"[feature_plan] Data split    : {plan.use_data_split_for_label}")
     logger.info(f"[feature_plan] Neden         : {plan.reasoning}")
 
+    # Kilitli-holdout ölçüm modunun sınırı: train partisyonunu SATIR düzeyinde yeniden
+    # ürettik. Plan agrege ediyorsa (satır → müşteri/ürün) feature_builder'ın gerçek
+    # split'i agregasyon SONRASI yapılır; satır düzeyli partisyonumuz onunla birebir
+    # örtüşmez. Garanti yaklaşıklaşır — sessiz geçmiyoruz, işaretliyoruz.
+    if analysis_hints.get("generated_from") == "train_only" and plan.aggregation.required:
+        analysis_hints["generated_from"] = "train_only_approx"
+        logger.warning("[feature_plan] KILITLI-HOLDOUT: plan agrege ediyor "
+                       f"(level={plan.aggregation.level}) — satır düzeyli train partisyonu "
+                       "gerçek split'le birebir örtüşmüyor, train-only garantisi YAKLAŞIK.")
+
     return {
         "feature_plan": plan.model_dump(),
+        "analysis_hints": analysis_hints,
         "current_step": "feature_plan_node",
     }
+
+
+# Analist ipucu kanalı
+def _build_analysis_hints(state: AgentState) -> dict:
+    """
+    Hedef-kör yapısal ipuçlarını üretir (analysis_engine.extract_plan_hints).
+
+    Buradaki iki iş bilinçli olarak AYRI tutulur:
+      1. SATIR SEÇİMİ (bu fonksiyon) — kilitli-holdout modunda train partisyonunu
+         yeniden üretmek için hedefi stratify anahtarı olarak kullanabilir.
+      2. İSTATİSTİK HESABI (extract_plan_hints) — hedefi HİÇ görmez.
+    Hedef kolon df'ten düşürülür ve exclude_columns'a da konur; ipucu üreticisi onu
+    hiçbir şekilde göremez.
+    """
+    profiling_report = state.get("profiling_report") or {}
+    if not profiling_report.get("columns"):
+        return {}
+
+    exclude = _target_candidates(state)
+
+    df = None
+    try:
+        data_path = state.get("data_path", "")
+        if data_path and Path(data_path).exists():
+            df = pd.read_parquet(data_path)
+            if settings.ENABLE_LOCKED_HOLDOUT:
+                df, carved = _train_partition(df, state)
+            else:
+                carved = False
+            # Hedefi tamamen görüş alanından çıkar (redundant_pairs bir
+            # (feature, target) çifti dahi üretemesin).
+            df = df.drop(columns=[c for c in exclude if c in df.columns], errors="ignore")
+        else:
+            carved = False
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"[feature_plan] Analist ipuçları: veri okunamadı ({e}); "
+                       "yalnızca profiling'ten üretiliyor.")
+        df, carved = None, False
+
+    hints = extract_plan_hints(df, profiling_report, exclude_columns=exclude)
+    if hints and carved:
+        hints["generated_from"] = "train_only"
+    return hints
+
+
+def _target_candidates(state: AgentState) -> set[str]:
+    """Hedef kolon + tüm hedef adayları — ipucu üreticisinin göremeyeceği kolonlar."""
+    cands: set[str] = set()
+
+    target_def = state.get("target_definition") or {}
+    if target_def.get("column_name"):
+        cands.add(target_def["column_name"])
+    if state.get("target_col"):
+        cands.add(state["target_col"])
+
+    for col in (state.get("db_intelligence") or {}).get("columns", []):
+        if col.get("semantic_type") == "target" and col.get("column_name"):
+            cands.add(col["column_name"])
+
+    return cands
+
+
+def _train_partition(df: "pd.DataFrame", state: AgentState) -> tuple["pd.DataFrame", bool]:
+    """
+    ÖLÇÜM MODU: feature_builder'ın train partisyonunu yeniden üretir (aynı TEST_SIZE,
+    aynı seed, sınıflandırmada hedefe göre stratify) ve YALNIZCA train satırlarını
+    döndürür. Test satırları analistin görüş alanına kilitlenir.
+
+    Eğitim verisi kaybı YOK — satırlar yalnızca ipucu hesabından çıkarılır, modelden
+    değil. Bu yüzden baseline kaymaz ve iki kol (holdout açık/kapalı) AYNI iç test
+    setinde doğrudan karşılaştırılabilir.
+
+    Returns: (df, carved) — carved=False ise partisyon üretilemedi, tüm veri döner.
+    """
+    from sklearn.model_selection import train_test_split
+    from src.services.feature_builder import TEST_SIZE
+
+    target_col = (state.get("target_definition") or {}).get("column_name") or state.get("target_col")
+    if not target_col or target_col not in df.columns:
+        logger.warning("[feature_plan] KILITLI-HOLDOUT: hedef kolon bilinmiyor — "
+                       "train partisyonu üretilemedi, ipuçları TÜM veriden.")
+        return df, False
+
+    # feature_builder hedefi boş satırlarla eğitmez; partisyonun hizalı olması için
+    # aynı satırları burada da düşür.
+    df = df[df[target_col].notna()]
+    stratify = df[target_col] if state.get("intent") == "classification" else None
+    try:
+        train_df, _ = train_test_split(
+            df, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED, stratify=stratify
+        )
+    except ValueError:
+        train_df, _ = train_test_split(df, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED)
+
+    logger.info(f"[feature_plan] KILITLI-HOLDOUT açık: ipuçları yalnızca train "
+                f"partisyonundan ({len(train_df):,}/{len(df):,} satır); test satırları kilitli.")
+    return train_df, True
 
 
 def _build_db_summary(db_intelligence: dict) -> str:

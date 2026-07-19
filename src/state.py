@@ -42,6 +42,10 @@ class AgentState(TypedDict, total=False):
 
     # Feature Plan output
     feature_plan: dict               # Feature engineering plan from LLM
+    # Analist → feature_plan kanalı: HEDEF-KÖR yapısal ipuçları (yalnızca kolon adı,
+    # sıfır istatistik). analysis_engine.extract_plan_hints() üretir; target-farkındalıklı
+    # hiçbir bulgu (korelasyon skoru, feature önem sırası) bu kanaldan AKMAZ.
+    analysis_hints: dict             # {generated_from, target_aware, constant_columns, ...}
 
     # Execution Node output
     data_path: str
@@ -74,7 +78,27 @@ class AgentState(TypedDict, total=False):
     optimal_threshold: float         # Youden's J optimal decision threshold
 
     # Report Node output
-    report: str                      # Final markdown report
+    report: str                      # Final markdown report — report_sections'tan RENDER edilir
+    # Katmanlı raporun YAPISAL kaynağı (src/core/report_schema.py). Her bölüm
+    # headline/explanation (LLM yazar) + evidence/status/not_computed_reason (kod
+    # doldurur, LLM dokunamaz) taşır. 'report' bundan üretilir; mevcut UI 'report'u
+    # okumaya devam eder (kırılma yok).
+    report_sections: list[dict]
+
+    # HAM test taşıyıcısı: split ANINDA, encode/scale ÖNCESİ alınan test
+    # partisyonunun test satırlarına POZİSYONEL hizalı tam snapshot'ı. X_test
+    # encode+scale edilmiş olduğu için ham değer orada YOKTUR ve dump_split
+    # index=False yazdığı için ham satıra geri join edilemez — bu taşıyıcı o
+    # boşluğu kapatır. İki tüketici: fairness (ham kategorik gruplar) ve hata
+    # analizi (ham sayısal değerler — "hatalı vakalarda 42 saat, doğrularda 17").
+    raw_test_path: str               # data/splits/*_rawtest.parquet
+    raw_test_meta: dict              # {segment_columns, carried_columns, mode, skipped, n_rows, reason}
+
+    # Veri İlişkileri özeti (src/services/relations.py). Split ANINDA, gerçek train
+    # partisyonundan, encode/scale ÖNCESİ hesaplanır → generated_from="train_only"
+    # yapısal bir olgudur, iddia değil. Unsupervised dalda holdout yok →
+    # "full_data_descriptive". report_sections katmanlı bölüme çevirir.
+    relations_report: dict
 
     # SQL Query Node output
     sql_query_raw: str               # SQL Query 

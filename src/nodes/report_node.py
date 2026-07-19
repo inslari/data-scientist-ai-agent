@@ -18,11 +18,14 @@ def report_node(state: AgentState) -> AgentState:
     if result.get("error"):
         return {
             "report": result.get("report", ""),
+            "report_sections": result.get("report_sections", []),
             "error": result["error"],
             "current_step": "report_node",
         }
-        
+
     return {
         "report": result.get("report", ""),
+        # Katmanlı raporun yapısal kaynağı — 'report' bundan render edildi.
+        "report_sections": result.get("report_sections", []),
         "current_step": "report_node",
     }

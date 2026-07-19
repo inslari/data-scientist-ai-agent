@@ -41,5 +41,12 @@ def feature_engineering_node(state: AgentState) -> AgentState:
         "target_name": result.get("target_name"),
         "feature_report": result.get("feature_report"),
         "target_definition": result.get("target_definition", state.get("target_definition")),
+        # Fairness segment taşıyıcısı: ham grup değerlerinin test satırlarına hizalı
+        # snapshot'ı (yol) + hangi kolonların neden taşınmadığı (meta).
+        # Ham test taşıyıcısı (fairness + hata analizi okur) — yol + meta.
+        "raw_test_path": result.get("raw_test_path", ""),
+        "raw_test_meta": result.get("raw_test_meta", {}),
+        # Veri İlişkileri özeti — split anında gerçek train partisyonundan hesaplandı.
+        "relations_report": result.get("relations_report", {}),
         "current_step": "feature_engineering_node",
     })

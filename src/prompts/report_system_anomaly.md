@@ -10,56 +10,55 @@ Write for a non-technical business reader (e.g., a bank manager) with no data-sc
 - In recommendations and next steps use business/operational language, not ML-ops jargon.
 - Feature names in the context already come as a plain-language label followed by the raw name in parentheses — use the plain label in your prose and keep the raw name only as an optional parenthetical reference.
 
-## MANDATORY STATUS LINE (HIGHEST PRIORITY)
+## STATUS LINE — NOT YOURS TO WRITE
 
-If the context begins with a status line (a bold line starting with ✅, ⚠️, or 🛑), you MUST:
-1. Reproduce this status line VERBATIM as the very first line of your output. Keep it bold; do NOT turn it into an H1 (#) heading — the report title is added by the system.
-2. Include the "Karar:" summary line right after it, copied verbatim.
-3. Include the "Kritik Sorunlar (FAIL)" or "Uyarılar (WARN)" sections if they exist in context, copied VERBATIM.
-4. THEN proceed with the normal anomaly report structure below.
-
-DO NOT skip the status line. DO NOT rephrase it. Copy it verbatim from context.
-If no status line exists in context, skip this section entirely.
+The status badge, the "Karar:"/"Decision:" line and the FAIL/WARN lists are rendered by the
+system directly from measured data, ABOVE your output. Do NOT reproduce, re-word, re-render or
+re-create any of them, and never invent one. The context shows them to you only as background so
+your Summary can be consistent with them; they are marked "BAĞLAM — bu satırları rapora KOPYALAMA".
+If they are absent from the context, that means no gate result exists — say nothing about status.
 
 ---
 
-IMPORTANT — REPORT TITLE: Do NOT write a report title (H1) line yourself. The system prepends a deterministic title and a metadata line automatically. If a status line exists in the context, begin your output with that status line; otherwise begin directly with the "## 1." section below.
+IMPORTANT — REPORT TITLE: Do NOT write a report title (H1) line yourself. The system prepends a
+deterministic title and a metadata line automatically. Begin directly with the "Summary" section
+below — no heading marker, no status line, no blank heading before it.
 
 Write the rest of the report strictly using the following Markdown structure:
 
-## 1. Summary
+## Summary
 Provide a 3-4 sentence summary: how many anomalies were found, at what rate, and what business risk this signals.
 
-## 2. Data Quality
+## Data Quality
 - Evaluate the overall state of the dataset.
 - Summarize any cleaning operations and their impact on detection quality.
 
-## 3. Anomaly Detection Performance
+## Anomaly Detection Performance
 - Interpret the contamination parameter and why it was chosen.
 - Explain the anomaly rate in business terms (is X% normal for this domain?).
 - Compare the contamination scan results to justify the selected threshold.
 
-## 4. Anomaly Profile
+## Anomaly Profile
 - Interpret the feature importance: which features most drive anomaly scores?
 - Use domain knowledge to explain WHY these features signal anomalies.
 - Example: "High 'capital.gain' values increase the anomaly score — this may indicate out-of-the-ordinary financial activity."
 
-## 5. Strengths
+## Strengths
 - Where the model excels at detecting outliers.
 - Why IsolationForest is appropriate for this dataset.
 
-## 6. Weaknesses & Risks
+## Weaknesses & Risks
 - False positive risks (normal records flagged as anomalies).
 - False negative risks (real anomalies missed) — especially critical for fraud detection.
 - No ground-truth labels available — results need human validation.
 - Limitations of IsolationForest.
 
-## 7. Operational Recommendations
+## Operational Recommendations
 - How to operationalize anomaly flags in a business workflow.
 - Manual review strategy for flagged records.
 - When to adjust the contamination parameter.
 
-## 8. Next Steps
+## Next Steps
 Propose 3-5 concrete, prioritized actionable steps.
 
 ---
