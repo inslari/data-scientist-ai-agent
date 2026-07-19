@@ -67,22 +67,33 @@ class MetricsUnavailableIsExplainedTest(unittest.TestCase):
         self.assertIn("predict_proba", R("eval_no_probabilities", "tr"))
         self.assertIn("ROC-AUC", R("eval_no_probabilities", "en"))
 
-    def test_fallback_report_prints_the_reason(self):
-        from src.services.report_generator import _generate_fallback_report
+    def test_report_prints_the_reason(self):
+        """Eksik metrik BOŞ KART değil, açık neden.
+
+        Bu güvence FALLBACK GÖVDESİNDEN katmanlı Model Performansı bölümüne taşındı
+        (metrikler blob'dan çıkarken). Yer değişti, ilke değişmedi — üstelik güçlendi:
+        bölüm LLM'den bağımsız üretildiği için hem normal hem fallback yolunda basılır,
+        artık her etkilenen metriği tek tek sebebiyle sayar (eskiden tek satırdı).
+        """
+        from src.core.report_schema import render_section
+        from src.services.report_sections import build_performance_section
         state = {
-            "report_language": "tr",
-            "model_name": "rf",
             "intent": "classification",
-            "relevant_tables": ["t"],
             "evaluation_report": {
                 "test_metrics": {"accuracy": 0.97},
                 "metrics_unavailable": {"reason": "predict_proba_failed",
-                                        "detail": "AttributeError: no predict_proba"},
+                                        "detail": "AttributeError: no predict_proba",
+                                        "affected": ["roc_auc", "pr_auc"]},
                 "reliability_score": {"grade": "B", "score": 70},
             },
+            "feature_report": {"n_test": 1000},
         }
-        report = _generate_fallback_report(state, "tr")
-        self.assertIn("hesaplanamadı", report)
+        md = render_section(build_performance_section(state, "tr"), "tr")
+        self.assertIn("predict_proba", md)
+        self.assertIn("roc_auc", md)
+        # Sessiz sıfır yasağı: yok olan metrik 0 diye de, iyi haber diye de sunulamaz
+        self.assertNotIn("0.000", md)
+        self.assertIn("iyi olduğu anlamına", md)
 
     def test_auc_unavailable_warning_is_localised(self):
         tr = [w["message"] for w in _gate({"accuracy": 0.9}, "tr")["warnings"]

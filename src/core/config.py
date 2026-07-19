@@ -218,4 +218,19 @@ class Settings:
     #   ve generated_from="full_data" olarak işaretlenir (sessiz geçilmez, loglanır).
     ENABLE_LOCKED_HOLDOUT: bool = os.getenv("ENABLE_LOCKED_HOLDOUT", "false").strip().lower() in ("1", "true", "yes", "on")
 
+    # ── Fairness / segment taşıyıcısı ─────────────────────────────────────────
+    # FAIRNESS_SEGMENT_MODE — split anında HAM hâlde snapshot'lanacak kolonlar:
+    #   "narrow" (varsayılan) → yalnızca demografik sezgiselin yakaladıkları
+    #       (age/sex/gender/race/... + db_intelligence semantic_type=demographic).
+    #       Bugünkü fairness davranışının kapsamı; state boyutu küçük kalır.
+    #   "wide"   → TÜM düşük kardinaliteli kategorikler. "Her segmentte performans"
+    #       analizini açar ama checkpoint payload'unu büyütür. Kod değişikliği
+    #       gerektirmez — yalnızca bu ayar.
+    FAIRNESS_SEGMENT_MODE: str = os.getenv("FAIRNESS_SEGMENT_MODE", "narrow").strip().lower()
+    # "wide" modda bir kategorik kolonun segment sayılması için üst kardinalite sınırı.
+    FAIRNESS_SEGMENT_MAX_CARDINALITY: int = int(os.getenv("FAIRNESS_SEGMENT_MAX_CARDINALITY", "10"))
+    # Bir grup için metrik HESAPLANMASININ alt sınırı. Altındaki gruplar rapordan
+    # SİLİNMEZ — görünür sebeple ("örneklem çok ince") listelenir. Sessiz atlama yok.
+    FAIRNESS_MIN_GROUP_SIZE: int = int(os.getenv("FAIRNESS_MIN_GROUP_SIZE", "5"))
+
 settings = Settings()

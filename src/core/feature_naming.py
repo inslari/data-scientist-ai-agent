@@ -129,3 +129,34 @@ def humanize_feature(name: str, lang: str = "tr") -> str:
     if not name or label == name:
         return name
     return f"{label} ({name})"
+
+
+# ── Türetilmiş feature tanıma ────────────────────────────────────────────────
+# Motorun/reçetelerin/LLM planının ÜRETTİĞİ feature'lar ile HAM veri kolonlarını
+# ayırır. Yukarıdaki humanize desenleriyle aynı konvansiyon + math türevleri
+# (LLM planı `age_log` gibi adlar üretebilir; financial reçetesi `log_{c}`).
+# Kullanım: fairness segment aday seçimi — türetilmiş sayısallar demografik GRUP
+# değildir, aday havuzuna (ve "ölçülemedi" listesine) hiç girmemelidir.
+_DERIVED_PATTERNS = (
+    r"lag_\d+_.+", r"roll\d+_(mean|std)_.+",
+    r"(dev|zdev|grpstd)_.+_by_.+",
+    r"is_zero_.+", r"was_missing_.+",
+    r"(count|sum|avg|max|std|fav)_.+",
+    r"ratio_.+_[^_]+",
+    r"(log1p|log|sqrt)_.+",                                  # prefix math (reçete)
+    r".+_(isna|diversity|log1p|log|squared|sqrt|zscore)",    # suffix (LLM planı vb.)
+)
+_DERIVED_RE = re.compile(r"^(?:" + "|".join(_DERIVED_PATTERNS) + r")$")
+_ENGINE_FIXED = frozenset({"spend_recent", "spend_old", "spend_trend"})
+
+
+def is_derived_feature(name: str) -> bool:
+    """Kolon motorun ÜRETTİĞİ bir feature mı (ham veri kolonu DEĞİL)?
+
+    Desen-tabanlı, dataset-agnostik (feature_builder + reçete + LLM-planı
+    konvansiyonları). Segment aday seçiminde türetilmiş kolonları (ratio_, _log,
+    is_zero_ ...) elemek için — bunlar demografik grup değildir.
+    """
+    if not name or not isinstance(name, str):
+        return False
+    return name in _ENGINE_FIXED or bool(_DERIVED_RE.match(name))

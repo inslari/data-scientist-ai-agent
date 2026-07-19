@@ -109,17 +109,17 @@ _STRINGS: dict[str, dict[str, str]] = {
     },
 
     # ---- report_generator: fallback rapor (LLM hata verirse — verbatim çıktı) ----
-    "fb_h1": {"tr": "## 1. Yönetici Özeti", "en": "## 1. Executive Summary"},
+    "fb_h1": {"tr": "## Yönetici Özeti", "en": "## Executive Summary"},
     "fb_analysis_type": {"tr": "Analiz tipi", "en": "Analysis type"},
     "fb_tables": {"tr": "Kullanılan tablolar", "en": "Tables used"},
     "fb_best_model": {"tr": "En iyi model", "en": "Best model"},
     "fb_overall_rel": {"tr": "Genel güvenilirlik", "en": "Overall reliability"},
-    "fb_h2": {"tr": "## 2. Model Performansı", "en": "## 2. Model Performance"},
-    "fb_metric": {"tr": "Metrik", "en": "Metric"},
-    "fb_value": {"tr": "Değer", "en": "Value"},
-    "fb_ci": {"tr": "### Bootstrap Güven Aralıkları (%95)", "en": "### Bootstrap Confidence Intervals (95%)"},
-    "fb_no_ci": {"tr": "*Bootstrap güven aralığı bu çalışmada hesaplanmadı.*", "en": "*Bootstrap confidence intervals were not computed in this run.*"},
-    "fb_h3": {"tr": "## 3. Overfitting Analizi", "en": "## 3. Overfitting Analysis"},
+    # NOT: fb_h2/fb_metric/fb_value/fb_ci/fb_no_ci KALDIRILDI. Fallback artık
+    # performans metriklerini ve güven aralıklarını basmıyor — katmanlı Model
+    # Performansı bölümü LLM'den bağımsız çalıştığı için fallback yolunda da
+    # montajla eklenir. Buraya "## Model Performansı" başlığını geri koymak
+    # raporda İKİ performans bölümü demektir.
+    "fb_h3": {"tr": "## Overfitting Analizi", "en": "## Overfitting Analysis"},
     "fb_gap": {"tr": "Fark", "en": "Gap"},
     "fb_status": {"tr": "Durum", "en": "Status"},
     "fb_resub_note": {
@@ -127,28 +127,29 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "Note: Train (resubstitution) {tr} — a memorization score, not a generalization indicator.",
     },
     "fb_no_ovf": {"tr": "*Overfitting analizi bu çalışmada uygulanmadı.*", "en": "*Overfitting analysis was not performed in this run.*"},
-    "fb_h4": {"tr": "## 4. Kalibrasyon", "en": "## 4. Calibration"},
+    "fb_h4": {"tr": "## Kalibrasyon", "en": "## Calibration"},
     "fb_brier": {"tr": "Brier Score", "en": "Brier Score"},
     "fb_well_cal": {"tr": "İyi kalibre", "en": "Well-calibrated"},
     "fb_no_cal": {"tr": "*Kalibrasyon analizi bu çalışmada uygulanmadı.*", "en": "*Calibration analysis was not performed in this run.*"},
-    "fb_h5": {"tr": "## 5. En Etkili Özellikler (SHAP)", "en": "## 5. Most Influential Features (SHAP)"},
-    "fb_no_shap": {"tr": "*SHAP açıklanabilirlik analizi bu çalışmada hesaplanmadı.*", "en": "*SHAP explainability analysis was not computed in this run.*"},
-    "fb_h6": {"tr": "## 6. Hata Analizi", "en": "## 6. Error Analysis"},
+    # NOT: fb_h5 / fb_no_shap KALDIRILDI. Etkili Özellikler artık katmanlı bölüm
+    # (build_features_section); SHAP'ı test_set, iç önemi model_internal etiketiyle
+    # kendisi basıyor. "## En Etkili Özellikler (SHAP)" başlığını burada tutmak
+    # fallback yolunda İKİNCİ bir özellik bölümüne zemin olurdu.
+    "fb_h6": {"tr": "## Hata Analizi", "en": "## Error Analysis"},
     "fb_total_err": {"tr": "Toplam hata", "en": "Total errors"},
     "fb_high_conf_err": {"tr": "Yüksek güven hatası", "en": "High-confidence errors"},
     "fb_count_suffix": {"tr": "adet", "en": ""},
-    "fb_h7": {"tr": "## 7. Bias & Fairness Analizi", "en": "## 7. Bias & Fairness Analysis"},
-    "fb_group": {"tr": "Grup", "en": "Group"},
-    "fb_no_bias": {
-        "tr": "*Adalet/yanlılık analizi bu veri setinde uygulanmadı (demografik etiket yok).*",
-        "en": "*Fairness/bias analysis was not performed on this dataset (no demographic labels).*",
-    },
-    "fb_h8": {"tr": "## 8. Operasyonel Öneri", "en": "## 8. Operational Recommendation"},
+    # fb_h7 / fb_group / fb_no_bias KALDIRILDI: fairness artık katmanlı bölüm olarak
+    # (src/services/report_sections.py) üretiliyor ve kendi başlığını/metnini taşıyor.
+    # Eski "demografik etiket yok" cümlesi de yanıltıcıydı — atlamanın SEBEBİ artık
+    # ölçüm anında belirlenip taşınıyor (tek değerli kolon, ince örneklem, yüksek
+    # kardinalite, hizalama hatası...), tek bir sabit cümleye indirgenmiyor.
+    "fb_h8": {"tr": "## Operasyonel Öneri", "en": "## Operational Recommendation"},
     "fb_threshold": {
         "tr": "- Varsayılan 0.5 yerine **{t}** threshold'u kullanmak recall'u artırır.",
         "en": "- Using a threshold of **{t}** instead of the default 0.5 improves recall.",
     },
-    "fb_h9": {"tr": "## 9. Güvenilirlik", "en": "## 9. Reliability"},
+    "fb_h9": {"tr": "## Güvenilirlik", "en": "## Reliability"},
     "fb_score": {"tr": "Skor", "en": "Score"},
 
     # ---- report_generator: pipeline hata raporları ----
@@ -354,6 +355,121 @@ _STRINGS: dict[str, dict[str, str]] = {
         "tr": "Model güçlü performans gösteriyor. Dağıtımdan önce bağımsız doğrulama ve sürekli izleme önerilir.",
         "en": "The model shows strong performance. Independent validation and continuous monitoring are recommended before deployment.",
     },
+
+    # ---- SERVİS KATMANI SEBEPLERİ (kod → R_REASON) ─────────────────────────
+    # Bu dizeler EVALUATION ANINDA üretilir (fairness/segment_carrier/evaluator),
+    # rapor dilinden ÖNCE. Servis serbest-metin Türkçe basmasın diye artık dil-nötr
+    # bir KOD ({"code","params"}) taşır; rapor katmanı render anında R_REASON ile
+    # doğru dile çevirir. "Deterministik string tek yerden" ilkesi (bkz. modül başlığı).
+    # ── fairness: grup metriği tanımsızlık nedenleri ──
+    "fr_fpr_undefined": {
+        "tr": "bu grupta gerçek negatif vaka yok",
+        "en": "no actual negative cases in this group",
+    },
+    "fr_fnr_undefined": {
+        "tr": "bu grupta gerçek pozitif vaka yok",
+        "en": "no actual positive cases in this group",
+    },
+    "fr_diff_undefined": {
+        "tr": "karşılaştırma için gerekli vaka türü gruplardan birinde yok",
+        "en": "one of the groups lacks the case type needed for the comparison",
+    },
+    "fr_di_undef_zero": {
+        "tr": "referans grupta hiç pozitif tahmin yok — oran tanımsız (payda 0)",
+        "en": "the reference group has no positive predictions — the ratio is undefined (denominator 0)",
+    },
+    "fr_di_undef_other": {
+        "tr": "seçim oranı hesaplanamadı",
+        "en": "selection rate could not be computed",
+    },
+    "fr_brr_undef_zero": {
+        "tr": "referans grupta hiç gerçek pozitif yok — oran tanımsız (payda 0)",
+        "en": "the reference group has no actual positives — the ratio is undefined (denominator 0)",
+    },
+    "fr_brr_undef_other": {
+        "tr": "taban oranı hesaplanamadı",
+        "en": "base rate could not be computed",
+    },
+    # ── fairness: analiz/segment/grup atlama nedenleri ──
+    "fr_no_carrier": {
+        "tr": "segment taşıyıcısı bulunamadı",
+        "en": "no segment carrier was found",
+    },
+    "fr_no_rows": {
+        "tr": "test setinde satır yok",
+        "en": "no rows in the test set",
+    },
+    "fr_misaligned": {
+        "tr": "segment taşıyıcısı ({s} satır) test seti ({t} satır) ile hizalanmıyor — yanlış gruba metrik atfetmemek için analiz yapılmadı",
+        "en": "the segment carrier ({s} rows) does not align with the test set ({t} rows) — analysis was skipped to avoid attributing metrics to the wrong group",
+    },
+    "fr_multiclass": {
+        "tr": "çok sınıflı hedef ({n} sınıf) — seçim oranı ve yanlış alarm/kaçırma oranları ikili hedef için tanımlıdır",
+        "en": "multi-class target ({n} classes) — selection rate and false-alarm/miss rates are defined for a binary target",
+    },
+    "fr_thin_group": {
+        "tr": "örneklem çok ince (n={n} < {min}) — bu grup için ölçüm yapılsaydı sayı gürültüden ayırt edilemezdi",
+        "en": "sample too thin (n={n} < {min}) — a measurement for this group would be indistinguishable from noise",
+    },
+    "fr_no_groups": {
+        "tr": "hiçbir grup ölçüm için yeterli örnekleme sahip değil",
+        "en": "no group has a large enough sample to be measured",
+    },
+    # ── feature_builder: unsupervised dalda fairness taşıyıcısı tanımsız ──
+    "seg_unsupervised": {
+        "tr": ("denetimsiz analizde (kümeleme/anomali) ayrı bir test seti ve gerçek "
+               "etiket yok — grup başına performans karşılaştırması tanımsız"),
+        "en": ("in unsupervised analysis (clustering/anomaly) there is no separate test "
+               "set with true labels — group-wise performance comparison is undefined"),
+    },
+    # ── segment_carrier: aday kolon eleme + kapsam boş nedenleri ──
+    "seg_skip_card_unreadable": {
+        "tr": "kardinalite okunamadı ({e})",
+        "en": "cardinality could not be read ({e})",
+    },
+    "seg_skip_single_value": {
+        "tr": "tek değerli — karşılaştırılacak grup yok",
+        "en": "single-valued — no group to compare",
+    },
+    "seg_skip_high_card": {
+        "tr": "çok fazla farklı değer ({n} > {max}) — grup başına örneklem anlamlı bir karşılaştırma için fazla incelirdi",
+        "en": "too many distinct values ({n} > {max}) — the per-group sample would be too thin for a meaningful comparison",
+    },
+    "seg_empty_partition": {
+        "tr": "test partisyonu boş",
+        "en": "the test partition is empty",
+    },
+    "seg_no_demo_narrow": {
+        "tr": "veri setinde demografik/segment kolonu bulunamadı",
+        "en": "no demographic/segment column was found in the dataset",
+    },
+    "seg_no_demo_broad": {
+        "tr": "veri setinde düşük kardinaliteli kategorik kolon bulunamadı",
+        "en": "no low-cardinality categorical column was found in the dataset",
+    },
+    # ── evaluator: hata analizinde ham karşılık yok ──
+    "raw_unavailable_derived": {
+        "tr": "bu özellik modelleme sırasında türetildi (ham karşılığı yok) — değerler modelin çalıştığı ölçekte",
+        "en": "this feature was derived during modeling (no raw equivalent) — values are on the scale the model operates in",
+    },
+    # ── feature_builder: segment taşıyıcısı diske yazılamadı ──
+    "seg_write_failed": {
+        "tr": "ham test taşıyıcısı diske yazılamadı",
+        "en": "the raw test carrier could not be written to disk",
+    },
+    # ── relations: ilişki hesaplanamadı nedenleri ──
+    "rel_train_empty": {
+        "tr": "eğitim partisyonu boş — ilişki hesaplanamadı",
+        "en": "the training partition is empty — relationships could not be computed",
+    },
+    "rel_target_failed": {
+        "tr": "hedefle ilişkiler hesaplanamadı ({e})",
+        "en": "relationships with the target could not be computed ({e})",
+    },
+    "rel_no_target": {
+        "tr": "hedef sütun yok — yalnızca sütunlar arası ilişkiler hesaplandı",
+        "en": "no target column — only column-to-column relationships were computed",
+    },
 }
 
 
@@ -372,6 +488,26 @@ def R(key: str, lang: str, **params) -> str:
         except (KeyError, IndexError, ValueError):
             return text
     return text
+
+
+def R_REASON(reason, lang: str) -> str:
+    """Bir SEBEP taşıyıcısını lokalize metne çevirir. Boş sebep → boş string.
+
+    Servis katmanı (fairness/segment_carrier/evaluator) sebebi rapor dilinden ÖNCE
+    üretir; bu yüzden serbest Türkçe metin yerine dil-nötr bir KOD taşır:
+        {"code": "fr_multiclass", "params": {"n": 3}}
+    Rapor katmanı render anında (dil bilinir) bunu R() ile çevirir. Truthiness
+    korunur: boş sebep "" (falsy), dolu sebep dolu dict (truthy) — mevcut
+    ``if reason:`` kontrolleri değişmeden çalışır.
+
+    Geriye dönük: düz string gelirse aynen döndürülür (henüz kodlanmamış sebepler
+    sessizce bozulmasın; migrasyon tamamlandığında yalnız "" ve dict kalır).
+    """
+    if not reason:
+        return ""
+    if isinstance(reason, dict) and "code" in reason:
+        return R(reason["code"], lang, **(reason.get("params") or {}))
+    return str(reason)
 
 
 # Metrik sözlüğü (glossary) girdileri — düz dize değil, alanlı sözlük (label/description/

@@ -70,6 +70,7 @@ def _evaluate_classification(
     feature_names: list[str],
     cv_score: float | None = None,
     cv_metric: str = "roc_auc",
+    raw_test: pd.DataFrame | None = None,
 ) -> dict:
     """Comprehensive evaluation for binary and multiclass classification."""
     is_binary = len(np.unique(y_test)) == 2
@@ -332,6 +333,7 @@ def _evaluate_classification(
     evaluation["error_analysis"] = _analyze_errors(
         y_test, y_pred_test, X_test, feature_names,
         y_prob=y_prob_test[:, 1] if (is_binary and y_prob_test is not None) else None,
+        raw_test=raw_test,
     )
 
     # SHAP values
@@ -982,6 +984,7 @@ def _analyze_errors(
     X_test: pd.DataFrame,
     feature_names: list[str],
     y_prob: np.ndarray | None = None,
+    raw_test: pd.DataFrame | None = None,
 ) -> dict:
     """
     Deep dive into misclassified samples:
@@ -1017,11 +1020,24 @@ def _analyze_errors(
         }
 
     # Feature distribution difference between correct and incorrect samples - Cohen's d
+    #
+    # HAM DEĞER: X_test ölçeklenmiştir (StandardScaler/RobustScaler) — oradaki
+    # ortalama "0.37" gibi bir sayıdır, kullanıcıya "42 saat" diye anlatılamaz.
+    # raw_test taşıyıcısı split anındaki HAM test partisyonunu POZİSYONEL hizalı
+    # tutar; ham karşılığı olan kolonlarda ortalamalar ORADAN okunur. Cohen's d
+    # ölçekten bağımsız olduğu için iki kaynakta da aynıdır.
     X_errors = X_test[errors]
     X_correct = X_test[~errors]
+    raw_num = None
+    if raw_test is not None and len(raw_test) == len(X_test):
+        raw_num = raw_test.select_dtypes(include="number")
+
     feature_diff = {}
+    # numeric_cols[:15] KALDIRILDI: ilk 15 kolonla sınırlıydı, sonra "en çok
+    # ayrışan" diye top-10 sunuluyordu. 50 feature'lı bir veri setinde 35 feature
+    # hiç bakılmadan eleniyordu — sessiz kırpma. Hesap ucuz (ortalama/std), tümü taranır.
     numeric_cols = X_test.select_dtypes(include="number").columns.tolist()
-    for col in numeric_cols[:15]:
+    for col in numeric_cols:
         mean_err = float(X_errors[col].mean())
         mean_cor = float(X_correct[col].mean())
         std_err = float(X_errors[col].std())
@@ -1041,80 +1057,46 @@ def _analyze_errors(
                 else "medium" if cohens_d >= 0.5
                 else "small"
             )
-            feature_diff[col] = {
+            entry = {
+                # Ölçekli değerler — modelin gördüğü uzay. Kullanıcıya GÖSTERİLMEZ,
+                # yalnızca ham karşılığı olmayan kolonlar için geriye kalan bilgidir.
                 "mean_in_errors": round(mean_err, 4),
                 "mean_in_correct": round(mean_cor, 4),
                 "cohens_d": round(cohens_d, 4),
                 "effect_magnitude": magnitude,
+                "raw_available": False,
+                "raw_unavailable_reason": "",
             }
+            # HAM karşılık: yalnızca split anında var olan kolonlarda mümkün.
+            # One-hot dummy'ler (workclass_Private) split SONRASI üretildiği için
+            # taşıyıcıda yoktur → sessizce ölçekli değer sunmak yerine sebep taşınır.
+            if raw_num is not None and col in raw_num.columns:
+                r_err = float(raw_num.loc[errors, col].mean())
+                r_cor = float(raw_num.loc[~errors, col].mean())
+                entry.update({
+                    "mean_in_errors_raw": round(r_err, 4),
+                    "mean_in_correct_raw": round(r_cor, 4),
+                    "raw_available": True,
+                })
+            else:
+                entry["raw_unavailable_reason"] = {"code": "raw_unavailable_derived"}
+            feature_diff[col] = entry
 
     if feature_diff:
         result["feature_distribution_diff"] = dict(
             sorted(feature_diff.items(), key=lambda x: x[1]["cohens_d"], reverse=True)[:10]
         )
+        result["n_features_examined"] = len(numeric_cols)
 
     return result
 
 # Bias Detection
-def _analyze_bias(y_true: np.ndarray, y_pred: np.ndarray, X_test: pd.DataFrame, db_intelligence: dict, intent: str) -> dict:
-    """
-    Calculates Disparate Impact and performance differences over demographic features (gender, age, etc.).
-    """
-    demographic_keywords = ["age", "sex", "gender", "race", "ethnicity", "marital", "country", "nativity"]
-    demographic_bases = [
-        col["column_name"] for col in db_intelligence.get("columns", [])
-        if col.get("semantic_type") == "demographic" or any(k in col["column_name"].lower() for k in demographic_keywords)
-    ]
-    if not demographic_bases:
-        return {}
-        
-    bias_results = {}
-    for base_col in demographic_bases:
-        # Find all encoded columns related to this base column (e.g. gender_Male, gender_Female)
-        related_cols = [c for c in X_test.columns if c.startswith(base_col)]
-        if not related_cols:
-            continue
-            
-        col_bias = {}
-        for col in related_cols:
-            if X_test[col].nunique() == 2:
-                mask_1 = (X_test[col] > 0.5).to_numpy()
-                mask_0 = ~mask_1
-                
-                if mask_1.sum() < 5 or mask_0.sum() < 5:
-                    continue
-                    
-                if "classification" in intent:
-                    acc_1 = float(accuracy_score(y_true[mask_1], y_pred[mask_1]))
-                    acc_0 = float(accuracy_score(y_true[mask_0], y_pred[mask_0]))
-                    
-                    # Positive rate (Disparate Impact)
-                    pos_rate_1 = float(np.mean(y_pred[mask_1] == 1)) if len(np.unique(y_true))==2 else None
-                    pos_rate_0 = float(np.mean(y_pred[mask_0] == 1)) if len(np.unique(y_true))==2 else None
-                    
-                    disparate_impact = None
-                    if pos_rate_0 and pos_rate_0 > 0 and pos_rate_1 is not None:
-                        disparate_impact = pos_rate_1 / pos_rate_0
-                        
-                    col_bias[col] = {
-                        "accuracy_group_1": round(acc_1, 4),
-                        "accuracy_group_0": round(acc_0, 4),
-                        "accuracy_diff": round(abs(acc_1 - acc_0), 4),
-                        "disparate_impact": round(disparate_impact, 4) if disparate_impact else None
-                    }
-                elif "regression" in intent:
-                    rmse_1 = float(np.sqrt(mean_squared_error(y_true[mask_1], y_pred[mask_1])))
-                    rmse_0 = float(np.sqrt(mean_squared_error(y_true[mask_0], y_pred[mask_0])))
-                    
-                    col_bias[col] = {
-                        "rmse_group_1": round(rmse_1, 4),
-                        "rmse_group_0": round(rmse_0, 4),
-                        "rmse_diff": round(abs(rmse_1 - rmse_0), 4)
-                    }
-        if col_bias:
-            bias_results[base_col] = col_bias
-            
-    return bias_results
+# NOT: eski _analyze_bias KALDIRILDI. Encode+scale edilmiş X_test üzerinde
+# çalışıyordu ve dört sessiz hata taşıyordu (ölçeklenmiş one-hot'ta boşalan grup
+# maskesi, drop_first kurbanı görünmeyen kategori, DI=0.0'ın falsy ile
+# "hesaplanmadı"ya düşmesi, hiç üretilmeyen FPR/FNR'nin raporda 0 görünmesi).
+# Yerine src/services/fairness.py geldi: HAM segment değerleri (segment_carrier)
+# üzerinde çalışır, her atlamayı görünür sebeple raporlar, hüküm vermez.
 
 # Reliability Score
 def _compute_reliability_score(evaluation: dict) -> dict:
@@ -1330,6 +1312,11 @@ def evaluate_model(state: AgentState) -> dict:
     # overfitting üretir).
     cv_metric_cls = _m.get("cv_scoring_metric", "roc_auc")
 
+    # HAM test taşıyıcısı — bir kez okunur, iki tüketiciye verilir:
+    # hata analizi (ham sayısal ortalamalar) ve fairness (ham kategorik gruplar).
+    from src.utils.dataset_store import load_raw_test
+    raw_test = load_raw_test(state)
+
     # Evaluation regarding task type
     if intent == "regression":
         # NOT (Faz 4): _evaluate_regression artık target-lock sızıntı kontrolünü
@@ -1346,7 +1333,7 @@ def evaluate_model(state: AgentState) -> dict:
     else:
         evaluation_report = _evaluate_classification(
             model, X_train, y_train, X_test, y_test, feature_names,
-            cv_score=cv_score_cls, cv_metric=cv_metric_cls,
+            cv_score=cv_score_cls, cv_metric=cv_metric_cls, raw_test=raw_test,
         )
 
     # Model name and feature plan
@@ -1354,12 +1341,18 @@ def evaluate_model(state: AgentState) -> dict:
     evaluation_report["analysis_summary"] = feature_report.get("analysis_summary",
                                             state.get("feature_plan", {}).get("analysis_summary", ""))
 
-    # Bias analysis
+    # Fairness analizi — HAM segment değerleri üzerinden (bkz. src/services/fairness.py).
+    # Sonuç HER ZAMAN yazılır: analiz yapılamadıysa bile status="not_computed" +
+    # reason taşır. Eskiden boş dict dönüp bölüm sessizce kayboluyordu.
     if intent in ("classification", "regression"):
-        db_intelligence = state.get("db_intelligence", {})
-        bias_report = _analyze_bias(y_test, model.predict(X_test), X_test, db_intelligence, intent)
-        if bias_report:
-            evaluation_report["bias_analysis"] = bias_report
+        from src.services.fairness import analyze_fairness
+        evaluation_report["fairness"] = analyze_fairness(
+            y_test,
+            model.predict(X_test),
+            raw_test,
+            state.get("raw_test_meta", {}) or {},
+            intent,
+        )
 
     # Metric explanations for UI
     lang = normalize_lang(state.get("report_language"))
@@ -1565,12 +1558,23 @@ def evaluate_model(state: AgentState) -> dict:
     for factor in reliability.get("factors", []):
         logger.info(f"  ✓ {factor}")
         
-    bias = evaluation_report.get("bias_analysis", {})
-    if bias:
-        logger.info("\n[evaluation] Bias Tespiti (Demografik):")
-        for base_col, cols in bias.items():
-            for c, info in cols.items():
-                logger.info(f"  {c}: Diff={info.get('accuracy_diff', info.get('rmse_diff'))} | Disparate Impact={info.get('disparate_impact', 'N/A')}")
+    fair = evaluation_report.get("fairness", {})
+    if fair:
+        if fair.get("status") != "ok":
+            logger.info(f"\n[evaluation] Fairness: hesaplanmadı — {fair.get('reason')}")
+        else:
+            logger.info(f"\n[evaluation] Fairness ({fair.get('mode')} segment modu):")
+            for col, seg in (fair.get("segments") or {}).items():
+                cmps = (seg.get("comparisons") or {}).get("groups", {})
+                ref = (seg.get("comparisons") or {}).get("reference_group")
+                logger.info(f"  {col} (referans grup: {ref}):")
+                for g, c in cmps.items():
+                    logger.info(
+                        f"    {g}: FPR farkı={c.get('fpr_diff')} | FNR farkı={c.get('fnr_diff')} | "
+                        f"DI={c.get('disparate_impact')} | taban oranı oranı={c.get('base_rate_ratio')}"
+                    )
+                for g, reason in (seg.get("skipped_groups") or {}).items():
+                    logger.info(f"    {g}: ATLANDI — {reason}")
 
     # Log to Experiment Tracker
     try:

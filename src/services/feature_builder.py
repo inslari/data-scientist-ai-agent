@@ -2135,7 +2135,28 @@ def build_features(state: dict) -> dict:
     # 14. Train/test split
     split_imbalanced = 0
     univariate_dropped: list[str] = []   # denetimli univariate seçim (yalnızca supervised dalda dolar)
+    # Fairness segment taşıyıcısı — yalnızca supervised dalda dolar. Unsupervised'da
+    # holdout/y_test yok, dolayısıyla grup başına performans karşılaştırması TANIMSIZ.
+    # Sessizce boş bırakmak yerine SEBEBİ taşınır (rapor "uygulanmadı çünkü ..." der).
+    _seg_df = None
+    # SEBEP dil-nötr KOD taşır (rapor render anında R_REASON ile çevirir) — servis
+    # katmanı ham Türkçe basmaz (kod-nötrlük ilkesi; bkz. report_i18n başlığı).
+    segment_meta: dict = {
+        "segment_columns": [], "carried_columns": [], "mode": "", "skipped": {}, "n_rows": 0,
+        "reason": {"code": "seg_unsupervised"},
+    }
+    # Veri İlişkileri: supervised dalda gerçek train partisyonundan (train_only),
+    # unsupervised'da holdout OLMADIĞI için tüm veriden (full_data_descriptive).
+    # Etiket her iki durumda da hesabın fiilen geçtiği satırları söyler.
+    relations_report: dict = {}
     if intent in ("clustering","anomaly_detection"):
+        # İlişkiler HAM df'ten, encode/scale'den ÖNCE. Holdout olmadığı için hesap
+        # tüm veriden geçer → "full_data_descriptive": rapor bunu tanımlayıcı olarak
+        # sunar, tahmine dönük bir bulgu gibi DEĞİL.
+        from src.services.relations import compute_relations
+        relations_report = compute_relations(
+            df, None, "", generated_from="full_data_descriptive",
+        )
         # Unsupervised: holdout yok → transform'lar TÜM veriye fit edilir (kümeleme
         # için doğru/istenen davranış; target sızıntısı kavramı zaten yok). Eski
         # tekil-df siblingleri burada aynen kullanılır.
@@ -2193,6 +2214,25 @@ def build_features(state: dict) -> dict:
         # Split sonrası kopyala: aşağıdaki transform'lar kolon-atamaları yapar;
         # iloc/train_test_split dilimleri üzerinde SettingWithCopy uyarısını önler.
         X_train, X_test = X_train.copy(), X_test.copy()
+
+        # ── Fairness segment taşıyıcısı — HAM hâlde, encode/scale'den ÖNCE ──
+        # Buradan sonraki her transform kolonları encode/scale ediyor; ham
+        # demografik değer bir daha erişilebilir olmayacak. Snapshot X_test ile
+        # POZİSYONEL hizalı: aşağıdaki transform'lar satır eklemez/çıkarmaz.
+        from src.services.segment_carrier import build_raw_test_carrier
+        _seg_df, segment_meta = build_raw_test_carrier(
+            X_test, state.get("db_intelligence", {}) or {},
+            exclude=disallowed | leakage_exclude | {target_name},
+        )
+
+        # ── Veri İlişkileri — AYNI KANCA, aynı sebep ──
+        # Hesap GERÇEK train partisyonundan geçer → "train_only" provenance'ı bir
+        # iddia değil, yapısal olgu. Rapor anında split'i yeniden üretmek zaman
+        # serisi/agrege planlarda sessizce farklı satırlar verirdi (bkz. relations.py).
+        from src.services.relations import compute_relations
+        relations_report = compute_relations(
+            X_train, y_train, target_name, generated_from="train_only",
+        )
 
         # ── (2) SONRA TRANSFORM — istatistik YALNIZCA X_train'den, X_test'e uygula ──
         # Grandmaster feature aileleri: count-encoding + groupby-deviation. ENCODE
@@ -2268,9 +2308,21 @@ def build_features(state: dict) -> dict:
 
     # Ağır split dizilerini diske yaz; state'te yalnızca dosya yolu taşı
     # (checkpoint payload şişmesini önler). Yazma başarısız olursa inline'a düş.
-    from src.utils.dataset_store import dump_split
+    from src.utils.dataset_store import dump_split, dump_raw_test
     split_paths = dump_split(X_train, X_test, y_train, y_test, tag=f"p{state.get('project_id', '')}")
     out: dict = {"feature_report": feature_report, "error": None, **split_paths}
+
+    # Ham test taşıyıcısını diske yaz (state'te yalnızca yol — checkpoint şişmesin).
+    # Yazma başarısızsa taşıyıcı YOK sayılır ama sebep meta'da kalır → fairness ve
+    # hata analizi "hesaplanamadı çünkü ..." diyebilir, sessiz 0 dönmez.
+    raw_path = None
+    if _seg_df is not None and len(_seg_df):
+        raw_path = dump_raw_test(_seg_df, tag=f"p{state.get('project_id', '')}")
+        if raw_path is None:
+            segment_meta["reason"] = {"code": "seg_write_failed"}
+    out["raw_test_path"] = raw_path or ""
+    out["raw_test_meta"] = segment_meta
+    out["relations_report"] = relations_report
     if not split_paths.get("X_train_path"):   # disk yazımı kısmen/tamamen başarısız → inline fallback
         out["X_train"] = X_train.to_dict(orient="records")
         out["X_test"]  = X_test.to_dict(orient="records")
