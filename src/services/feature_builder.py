@@ -207,57 +207,104 @@ def _load_data(state: dict) -> pd.DataFrame:
 def _normalize_column_names(
     df: "pd.DataFrame",
     table_names: list[str] | None = None,
-) -> "pd.DataFrame":
+) -> "tuple[pd.DataFrame, list[dict]]":
     """
-    Multi-table join sonrası oluşan suffix'leri temizler.
+    Multi-table join sonrası oluşan suffix'leri temizler — ama SESSİZ VERİ KAYBI ASLA.
 
-    Örnek: is_fraud_transactions → is_fraud
+    Örnek: is_fraud_transactions → is_fraud   (aynı değerli join-duplicate)
             merchant_name_merchants → merchant_name
 
-    Mantık:
-    - Suffix'siz kolon mevcutsa → suffix'li kolonu sil (duplicate)
-    - Suffix'siz kolon yoksa   → suffix'i kaldır
+    Kural (SIRA-BAĞIMSIZ, deterministik — karar iterasyon sırasına değil hedef +
+    değer-eşitliğine dayanır; aynı veri, farklı kolon sırası → aynı çıktı):
+    - Suffix strip'i MEVCUT bir kolonla aynı ada düşerse:
+        · değerler BİREBİR AYNI (df[col].equals) → gerçek join-duplicate, güvenle düş
+        · değerler FARKLI → ÇARPIŞMA: silme, orijinal adı koru, collisions'a kaydet
+      equals dtype-KATI: int64 vs float64 (aynı sayılar) → "aynı değil" → ikisi de
+      tutulur; NaN aynı konumda eşit sayılır. İlke: ŞÜPHE VARSA KORU.
+    - Strip sonucu boş hedef (o ada kolon yok):
+        · explicit (tablo adları biliniyor) + TEK kaynak → güvenli rename
+        · explicit + ÇOKLU kaynak aynı hedefe → çarpışma, hiçbirini rename etme
+        · fallback (tablo adı yok) → SPEKÜLATİF RENAME YOK. '_number'/'_score' gerçek
+          tablo son eki olmayabilir (products_number ≠ products tablosu); ismi mangle
+          etme, orijinal korunur. Fallback yalnız değeri-doğrulanmış duplicate'i düşürür.
+
+    Dönüş: (df, collisions). Çarpışmalar rapora taşınır (feature_report.
+    normalization_collisions → Faz 2 deterministik risk/WARN listesi) — log yetmez,
+    kullanıcının veri-kalitesi sinyalini görmesi gerek.
     """
+    collisions: list[dict] = []
     if table_names:
+        explicit = True
         suffixes = [f"_{t}" for t in table_names]
     else:
-        # Fallback: detect suffix automatically
-        import re
-        suffixes_set: set[str] = set()
+        explicit = False
+        suffix_set: set[str] = set()
         for col in df.columns:
             parts = col.rsplit("_", 1)
             if len(parts) == 2 and len(parts[1]) >= 3:
-                suffixes_set.add(f"_{parts[1]}")
-        suffixes = list(suffixes_set)
+                suffix_set.add(f"_{parts[1]}")
+        suffixes = list(suffix_set)
 
     if not suffixes:
-        return df
+        return df, collisions
 
-    rename_map: dict[str, str] = {}
-    drop_cols: list[str] = []
     existing = set(df.columns)
+    suffixes_sorted = sorted(suffixes, key=len, reverse=True)
 
+    # Her kolon → EN UZUN eşleşen suffix strip'i (kolon başına tek deterministik hedef)
+    clean_of: dict[str, str] = {}
     for col in df.columns:
-        for suffix in sorted(suffixes, key=len, reverse=True):
+        for suffix in suffixes_sorted:
             if col.endswith(suffix) and len(col) > len(suffix):
-                clean = col[: -len(suffix)]
-                if clean in existing:
-                    # delete duplicate
-                    drop_cols.append(col)
-                elif clean not in rename_map.values():
-                    rename_map[col] = clean
+                clean_of[col] = col[: -len(suffix)]
                 break
+
+    # Hedefe göre grupla → çoklu-çarpışma ve sıra-bağımsızlık burada çözülür
+    from collections import defaultdict
+    by_target: dict[str, list[str]] = defaultdict(list)
+    for col, clean in clean_of.items():
+        by_target[clean].append(col)
+
+    drop_cols: list[str] = []
+    rename_map: dict[str, str] = {}
+    for clean in sorted(by_target):                 # deterministik hedef sırası
+        srcs = sorted(by_target[clean])             # deterministik kaynak sırası
+        if clean in existing:
+            dups  = [c for c in srcs if df[c].equals(df[clean])]   # birebir → join-dup
+            diffs = [c for c in srcs if c not in dups]             # farklı → çarpışma
+            drop_cols.extend(dups)
+            if diffs:
+                collisions.append({
+                    "normalized_name": clean,
+                    "kept_columns": sorted([clean, *diffs]),
+                    "dropped_duplicates": sorted(dups),
+                    "issue": "normalization_name_collision",
+                })
+        elif explicit and len(srcs) == 1:
+            rename_map[srcs[0]] = clean            # güvenli: hedef boş, tek kaynak
+        elif explicit and len(srcs) > 1:
+            collisions.append({                    # çoklu kaynak tek hedefe → rename etme
+                "normalized_name": clean,
+                "kept_columns": srcs,
+                "dropped_duplicates": [],
+                "issue": "normalization_name_collision",
+            })
+        # fallback + boş hedef → hiçbir şey yapma (orijinal adlar korunur)
 
     if drop_cols:
         df = df.drop(columns=drop_cols)
-        logger.info(f"[feature_eng] Duplicate suffix kolonlar silindi: "
-              f"{drop_cols[:5]}{'...' if len(drop_cols) > 5 else ''}")
+        logger.info(f"[feature_eng] Değeri birebir-aynı duplicate suffix kolonlar silindi: "
+              f"{sorted(drop_cols)[:5]}{'...' if len(drop_cols) > 5 else ''}")
     if rename_map:
         df = df.rename(columns=rename_map)
         logger.info(f"[feature_eng] {len(rename_map)} kolon suffix temizlendi "
-              f"(örnek: {list(rename_map.items())[:3]})")
+              f"(örnek: {sorted(rename_map.items())[:3]})")
+    if collisions:
+        logger.warning(f"[feature_eng] Normalizasyon ÇARPIŞMASI ({len(collisions)}): farklı-değerli "
+              f"kolonlar aynı normalize adına düşüyor → orijinal adlar KORUNDU (sessiz kayıp yok); "
+              f"rapora taşınıyor: {[c['normalized_name'] for c in collisions]}")
 
-    return df
+    return df, collisions
 
 
 # Cleaning
@@ -1708,13 +1755,27 @@ def _target_distribution(y_arr, intent: str) -> "tuple[dict | None, dict | None]
 
 def _build_zero_missing_flags(
     df: pd.DataFrame, original_cols: set, intent: str, aggregated: bool,
+    force_zero_cols: "set | None" = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """DOKUNUS 2: is_zero (orijinal sayisal kolon) + was_missing (DOKUNUS 1 tasiyicisi)
     flag'lerini PLAIN INT olarak uret. Kapsam disi/aggregation/aday yok → tasiyicilari
     temizleyip cik. Yayginlik kapisi %1-%99 (dogum-aninda); global cap _MAX_DERIVED_FLAGS,
     asilirsa deterministik sirala (dengelilik min(p,1-p) desc, esitlikte ad asc). Yalnizca
     ORIJINAL kolonlar (turetilmis feature'in flag'i olmasin); isim cakisma guard'i.
-    Tasiyicilar burada df'ten kaldirilir (gated-out olanlar encode/scale'e sizmaz)."""
+    Tasiyicilar burada df'ten kaldirilir (gated-out olanlar encode/scale'e sizmaz).
+
+    force_zero_cols (INVARIANT): oran motorunun payda olarak kullandigi, SIFIR iceren
+    kolonlar. Bu kolonlarin is_zero flag'i prevalence kapisindan VE global cap'ten MUAF
+    uretilir — cunku oran sentinel'den aritilirken (bkz. _finalize_ratio_features_tt)
+    sifir-payda bilgisi flag'de DURMALI, yoksa bilgi tamamen silinir. Dinamik: kolon
+    adina bakmaz, oran motorunun bildirdigi paydalari alir.
+
+    DIKKAT — invariant URETIMI garanti eder, HAYATTA KALMAYI degil: flag burada mutlaka
+    olusur; ama downstream _select_univariate_tt/_detect_leakage_tt zayif-ongoruli flag'i
+    dusurebilir (or. churn'de is_zero_tenure churn 0.23 vs 0.20 → selection eledi). Bu
+    SESSIZ kayip degil, mesru bir selection karari (feature ise yaramiyorsa gider). Amac:
+    bilginin sessizce oran sentinel'ine gomulup kaybolmasini onlemek, kalıcı tutmak degil."""
+    force_zero_cols = force_zero_cols or set()
     carriers = [c for c in df.columns if c.startswith(_DERIVED_FLAG_PREFIX)]
 
     # Kapsam disi (yalniz classif/reg/clustering) VEYA aggregation yolu → flag uretme
@@ -1737,17 +1798,35 @@ def _build_zero_missing_flags(
         if _FLAG_MIN_PREVALENCE <= p <= _FLAG_MAX_PREVALENCE:
             candidates.append((name, s, min(p, 1.0 - p)))
 
-    # is_zero — yalnizca ORIJINAL sayisal kolonlar (math/domain/lag/date turevleri haric)
+    # is_zero — yalnizca ORIJINAL sayisal kolonlar (math/domain/lag/date turevleri haric).
+    # force_zero_cols'daki kolonlar (oran paydalari) prevalence kapisindan MUAF ve
+    # cap-korumali → sifir-payda bilgisi flag'de her zaman durur (invariant).
+    forced_added: list[tuple[str, np.ndarray]] = []
     for col in df.select_dtypes(include="number").columns:
         if col.startswith(_DERIVED_FLAG_PREFIX) or col not in original_cols:
             continue
         name = f"is_zero_{col}"
         if name in df.columns:
             continue
-        s = (pd.to_numeric(df[col], errors="coerce").to_numpy() == 0).astype(int)
+        num = pd.to_numeric(df[col], errors="coerce")
+        s = (num.to_numpy() == 0).astype(int)
         if not s.any() or s.all():        # sifir hic gorulmemis / hepsi sifir → bilgi yok
             continue
+        # #10 — BINARY KOLONDA is_zero URETME: 2-degerli kolonda is_zero = orijinalin
+        # BIREBIR yeniden kodlamasi (is_zero = 1 - col/k, corr -1.0) → yeni bilgi yok,
+        # garantili kopya (credit_card ↔ is_zero_credit_card). force_zero (Faz 0 invariant)
+        # OLSA BILE uretme: invariant "sifir bilgisi MEVCUT olsun" der, "yeni kolon" degil;
+        # binary'de bilgi zaten KORUNAN orijinal kolonda tam (oran motoru paydayi dusurmez)
+        # → invariant saglanmis say, kopya uretme. 3+ degerli kolonda is_zero bir COARSENING'dir
+        # (hangi sifir-disi deger oldugunu atar) → ayri sinyal tasiyabilir, KORUNUR.
+        # (nunique==1 sabit kolon buraya hic ulasmaz: yukarida s.all()/not s.any() eler;
+        #  ayrica low-variance drop onu zaten dusurur — sessiz kayip yok.)
+        if num.dropna().nunique() <= 2:
+            continue
         p = float(s.mean())
+        if col in force_zero_cols:        # INVARIANT: prevalence kapisini atla, cap'ten muaf
+            forced_added.append((name, s))
+            continue
         if _FLAG_MIN_PREVALENCE <= p <= _FLAG_MAX_PREVALENCE:
             candidates.append((name, s, min(p, 1.0 - p)))
 
@@ -1755,27 +1834,35 @@ def _build_zero_missing_flags(
     if carriers:
         df = df.drop(columns=carriers, errors="ignore")
 
-    if not candidates:
+    if not candidates and not forced_added:
         return df, []
 
     candidates.sort(key=lambda t: (-t[2], t[0]))   # deterministik: dengelilik desc, ad asc
-    if len(candidates) > _MAX_DERIVED_FLAGS:
-        logger.info(f"[feature_eng] zero/missing flag: {len(candidates)} aday > cap "
-                    f"{_MAX_DERIVED_FLAGS} → kirpildi")
-        candidates = candidates[:_MAX_DERIVED_FLAGS]
+    # Cap forced'lari SAYMAZ: normal adaylar kalan slot'a sigar, forced'lar her zaman eklenir.
+    cap_normal = max(0, _MAX_DERIVED_FLAGS - len(forced_added))
+    if len(candidates) > cap_normal:
+        logger.info(f"[feature_eng] zero/missing flag: {len(candidates)} normal aday > kalan slot "
+                    f"{cap_normal} (forced={len(forced_added)}) → kirpildi")
+        candidates = candidates[:cap_normal]
 
     added: list[str] = []
+    for name, s in forced_added:          # invariant flag'ler once (cap-muaf)
+        df[name] = s
+        added.append(name)
     for name, s, _ in candidates:
         df[name] = s
         added.append(name)
     logger.info(f"[feature_eng] zero/missing flag uretildi ({len(added)}): {added}")
+    if forced_added:
+        logger.info(f"[feature_eng] zero/missing flag: invariant (sifir-payda) forced flag'ler: "
+                    f"{[n for n, _ in forced_added]}")
     return df, added
 
 
 def _build_ratio_features(
     df: pd.DataFrame, original_cols: set, meta: "ColumnMetadata",
     intent: str, aggregated: bool, leaky_cols_high: set,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, list[str], set, dict]:
     """Deterministik oran (a/b) motoru — modelin yapamadigi olcek-carprazi sinyal.
     Yalniz ORIJINAL sayisal kolonlar; binary/sabit (nunique<3), ID-benzeri (nunique/n_rows>0.95
     — DTYPE-FARKINDA: yalniz int/object'e uygulanir, float continuous MUAF), leaky kaynak, cok-sifirli
@@ -1789,7 +1876,7 @@ def _build_ratio_features(
     if intent.strip().lower() not in _FLAG_INTENTS or aggregated:
         if aggregated:
             logger.info("[feature_eng] ratio feature: aggregation yolu → atlandi (orijinal kolonlar gruplandi)")
-        return df, []
+        return df, [], set(), {}
 
     # Aday: orijinal sayisal, leaky/flag/turetilmis degil
     n_rows = len(df)
@@ -1817,7 +1904,7 @@ def _build_ratio_features(
         and _passes_id_guard(c)              # ID-benzeri haric — yalniz int/object (float MUAF)
     )
     if len(eligible) < 2:
-        return df, []
+        return df, [], set(), {}
 
     zero_frac = {c: float((pd.to_numeric(df[c], errors="coerce") == 0).mean()) for c in eligible}
     # Kutup kutlesi: azinlik isaretin payi. >esik → payda sifirin icinden geciyor (bkz. sabit notu).
@@ -1826,7 +1913,12 @@ def _build_ratio_features(
         s = pd.to_numeric(df[c], errors="coerce")
         sign_mass[c] = float(min((s > 0).mean(), (s < 0).mean()))
 
-    candidates: list[tuple[str, np.ndarray, float]] = []
+    # HAM oran (a/b) — winsor sinirlari + impute median SPLIT SONRASI train'e fit edilir
+    # (bkz. _finalize_ratio_features_tt). Burada yalniz row-wise bolme + inf/NaN normalize:
+    # bolme deterministik/leakage-safe, ama kuantil/median cross-row ISTATISTIK → train-only.
+    # NaN = payda-sifir (inf→NaN) ∪ kaynak-missing; ikisi de split sonrasi dagilim-ici impute
+    # ile temizlenir (out-of-range 0.0 sentinel YOK). Siralama/cap RAW sonlu degerlerden.
+    candidates: list[tuple[str, np.ndarray, float, str, str]] = []
     for i in range(len(eligible)):
         for j in range(i + 1, len(eligible)):
             a, b = eligible[i], eligible[j]            # ad-sirali: pay=a, payda=b (tek yon)
@@ -1839,19 +1931,27 @@ def _build_ratio_features(
             name = f"ratio_{a}_{b}"
             if name in df.columns:                      # isim cakisma guard (math/domain)
                 continue
-            r = pd.to_numeric(df[a], errors="coerce") / pd.to_numeric(df[b], errors="coerce")
-            r = r.replace([np.inf, -np.inf], np.nan)
-            lo, hi = r.quantile(_RATIO_WINSOR_Q), r.quantile(1.0 - _RATIO_WINSOR_Q)
-            r = r.clip(lo, hi).fillna(0.0)
-            arr = r.to_numpy(dtype="float64")
-            vmin, vmax = float(np.nanmin(arr)), float(np.nanmax(arr))
-            if not np.isfinite(vmin) or vmax == vmin:    # sabit oran → bilgi yok
+            num = pd.to_numeric(df[a], errors="coerce")
+            den = pd.to_numeric(df[b], errors="coerce")
+            r = (num / den).replace([np.inf, -np.inf], np.nan)   # payda-sifir → inf → NaN
+            finite = r[np.isfinite(r)]
+            if finite.nunique() < 2:                     # sabit/degersiz oran → bilgi yok
                 continue
-            score = float(np.nanvar((arr - vmin) / (vmax - vmin)))   # olcek-bagimsiz yayilim
-            candidates.append((name, arr, score))
+            # Izlenebilirlik (Addition #3): NaN'in iki kaynagini ayri say — impute ikisini de
+            # dagilim-ici doldurur, ama log hangi mekanizmanin kac satir urettigini gosterir.
+            n_zero_denom = int((den == 0).sum())
+            n_src_missing = int((num.isna() | den.isna()).sum())
+            if n_zero_denom or n_src_missing:
+                logger.debug(f"[feature_eng] ratio '{name}': tanimsiz satir — "
+                             f"payda-sifir={n_zero_denom}, kaynak-missing={n_src_missing} "
+                             f"(split sonrasi train-median ile impute)")
+            fmin, fmax = float(finite.min()), float(finite.max())
+            # olcek-bagimsiz yayilim (RAW sonlu deger — sentinel/impute yok, siralama icin)
+            score = float((((finite - fmin) / (fmax - fmin)).var())) if fmax > fmin else 0.0
+            candidates.append((name, r.to_numpy(dtype="float64"), score, a, b))
 
     if not candidates:
-        return df, []
+        return df, [], set(), {}
 
     candidates.sort(key=lambda t: (-t[2], t[0]))   # deterministik: yayilim desc, ad asc
     if len(candidates) > _MAX_RATIO_FEATURES:
@@ -1860,11 +1960,77 @@ def _build_ratio_features(
         candidates = candidates[:_MAX_RATIO_FEATURES]
 
     added: list[str] = []
-    for name, arr, _ in candidates:
-        df[name] = arr
+    denom_zero_cols: set = set()   # sifir iceren + fiilen kullanilan payda → is_zero flag GARANTI
+    ratio_meta: dict[str, tuple[str, str]] = {}   # {ratio_kolon: (pay, payda)} → etiket bundan kurulur
+    for name, arr, _, num_name, denom in candidates:
+        df[name] = arr                       # HAM oran (NaN korunur; winsor/impute split sonrasi)
         added.append(name)
+        ratio_meta[name] = (num_name, denom)   # string-parse belirsizligine karsi kesin kaynak
+        if zero_frac.get(denom, 0.0) > 0.0:
+            denom_zero_cols.add(denom)
     logger.info(f"[feature_eng] ratio feature uretildi ({len(added)}): {added}")
-    return df, added
+    if denom_zero_cols:
+        logger.info(f"[feature_eng] ratio: sifir-payda kolonlari → is_zero flag garanti "
+                    f"(invariant): {sorted(denom_zero_cols)}")
+    return df, added, denom_zero_cols, ratio_meta
+
+
+def _fit_ratio_stats(frame: pd.DataFrame, cols: list[str]) -> dict:
+    """Oran kolonlari icin winsor sinirlari (q01,q99) + impute median'i YALNIZCA
+    verilen cerceveden (supervised: X_train) ogren — sklearn transformer disiplini.
+    Sonlu degerler uzerinden; train'de sonlu deger yoksa kolon None ile isaretlenir
+    (transform drop eder). Median winsorlanmis dagilimdan → dagilim-ici, out-of-range
+    0.0 sentinel URETMEZ (eski fillna(0.0) bug'inin koku)."""
+    stats: dict = {}
+    for c in cols:
+        if c not in frame.columns:
+            continue
+        s = pd.to_numeric(frame[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        finite = s[np.isfinite(s)]
+        if finite.empty:
+            stats[c] = None    # train'de hic sonlu deger yok → uygulanamaz (drop sinyali)
+            continue
+        lo = float(finite.quantile(_RATIO_WINSOR_Q))
+        hi = float(finite.quantile(1.0 - _RATIO_WINSOR_Q))
+        med = float(finite.clip(lo, hi).median())   # dagilim-ici impute degeri
+        stats[c] = (lo, hi, med)
+    return stats
+
+
+def _apply_ratio_stats(frame: pd.DataFrame, stats: dict) -> pd.DataFrame:
+    """_fit_ratio_stats sonuclarini uygula: clip [lo,hi] + NaN→train-median. NaN iki
+    kaynagi da (payda-sifir ∪ kaynak-missing) ayni dagilim-ici deger ile dolar → gizli
+    sentinel yok. None istatistik → kolonu dusur (train'de sonlu deger yoktu)."""
+    drop_cols = [c for c, st in stats.items() if st is None and c in frame.columns]
+    if drop_cols:
+        frame = frame.drop(columns=drop_cols)
+        logger.info(f"[feature_eng] ratio finalize: train'de sonlu deger yok → dusuruldu: {drop_cols}")
+    for c, st in stats.items():
+        if st is None or c not in frame.columns:
+            continue
+        lo, hi, med = st
+        s = pd.to_numeric(frame[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        frame[c] = s.clip(lo, hi).fillna(med)
+    return frame
+
+
+def _finalize_ratio_features_tt(
+    X_train: pd.DataFrame, X_test: pd.DataFrame, cols: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Oran kolonlarini train'e FIT, train+test'e TRANSFORM et (leakage-safe). Winsor
+    sinirlari ve impute median X_train'den; X_test yalniz transform gorur."""
+    if not cols:
+        return X_train, X_test
+    stats = _fit_ratio_stats(X_train, cols)
+    return _apply_ratio_stats(X_train, stats), _apply_ratio_stats(X_test, stats)
+
+
+def _finalize_ratio_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Tek-cerceve varyant (unsupervised: holdout yok → tum df'ye fit+transform;
+    kumeleme icin dogru davranis, target sizintisi kavrami zaten yok)."""
+    if not cols:
+        return df
+    return _apply_ratio_stats(df, _fit_ratio_stats(df, cols))
 
 
 def build_features(state: dict) -> dict:
@@ -1919,9 +2085,11 @@ def build_features(state: dict) -> dict:
 
     logger.info(f"[feature_eng] Veri: {len(df):,} satır × {len(df.columns)} kolon")
 
-    # Multi-table join suffix'lerini temizle
+    # Multi-table join suffix'lerini temizle. Çarpışmalar (farklı-değerli iki kolonun
+    # aynı normalize adına düşmesi) rapora taşınır → sessiz veri kaybı asla (Faz 0.5).
     all_tables = [t["table_name"] for t in db_intelligence.get("tables", [])]
-    df = _normalize_column_names(df, table_names=all_tables if all_tables else None)
+    df, normalization_collisions = _normalize_column_names(
+        df, table_names=all_tables if all_tables else None)
     logger.info(f"[feature_eng] Normalizasyon sonrasi: {len(df.columns)} kolon")
 
     # Critic'ten gelen drop_features uygula
@@ -2113,11 +2281,15 @@ def build_features(state: dict) -> dict:
     # was_missing artik uretilmiyor: arkadasin _add_missing_indicators (_isna) ayni
     # sinyali own-goal korumasiyla uretiyor (carrier yok → _build_zero_missing_flags
     # yalniz is_zero dondurur). Ratio = orijinal sayisal cift (a/b, tek yon); leaky_cols_high
-    # + ID-benzeri kaynak dislanir. Ikisi de split-oncesi feature-construction (arkadasin
-    # _count_encode/_groupby_deviation'i da bu altitude'da) → split sonrasi _tt zinciri isler.
-    df, derived_flag_cols = _build_zero_missing_flags(df, original_cols, intent, aggregated)
-    df, ratio_feature_cols = _build_ratio_features(
+    # + ID-benzeri kaynak dislanir. RATIO ONCE calisir → flag motoruna "sifir-payda"
+    # setini bildirir; bu paydalarin is_zero flag'i garanti uretilir (invariant). Boylece
+    # oran split sonrasi sentinel'den aritilirken (bkz. _finalize_ratio_features_tt)
+    # sifir-payda bilgisi flag'de dururur. HAM oran degerleri (winsor/impute YOK) split
+    # sonrasi train'e fit edilir; burada yalniz row-wise bolme + selection yapilir.
+    df, ratio_feature_cols, ratio_denom_zero_cols, ratio_feature_meta = _build_ratio_features(
         df, original_cols, meta, intent, aggregated, leaky_cols_high)
+    df, derived_flag_cols = _build_zero_missing_flags(
+        df, original_cols, intent, aggregated, force_zero_cols=ratio_denom_zero_cols)
 
     # ── LEAKAGE-SAFE SIRA (GRANDMASTER DİSİPLİNİ) ────────────────
     # Encoder/scaler/feature-selection/sizinti tespiti İSTATİSTİK öğrenir (target
@@ -2160,6 +2332,9 @@ def build_features(state: dict) -> dict:
         # Unsupervised: holdout yok → transform'lar TÜM veriye fit edilir (kümeleme
         # için doğru/istenen davranış; target sızıntısı kavramı zaten yok). Eski
         # tekil-df siblingleri burada aynen kullanılır.
+        # Oran finalize (winsor+impute) burada tüm df'ye fit+transform — sentinel yok.
+        df = _finalize_ratio_features(df, ratio_feature_cols)
+        ratio_feature_cols = [c for c in ratio_feature_cols if c in df.columns]
         df = _encode_categorical(df, y)
         df = _scale_features(df, meta.get_outlier_cols())
         df = _select_features(df)
@@ -2214,6 +2389,16 @@ def build_features(state: dict) -> dict:
         # Split sonrası kopyala: aşağıdaki transform'lar kolon-atamaları yapar;
         # iloc/train_test_split dilimleri üzerinde SettingWithCopy uyarısını önler.
         X_train, X_test = X_train.copy(), X_test.copy()
+
+        # ── Oran finalize: winsor sınırları + impute median YALNIZCA X_train'den ──
+        # (sklearn transformer disiplini). HAM oran kolonları (a/b, NaN korunmuş) burada
+        # clip[q01,q99] + NaN→train-median görür; payda-sıfır ∪ kaynak-missing aynı
+        # dağılım-içi değere iner → gizli 0.0 sentinel YOK. Encode/scale/relations'tan
+        # ÖNCE: hepsi temiz sonlu değer görür, kuantiller test'ten sızmaz.
+        X_train, X_test = _finalize_ratio_features_tt(X_train, X_test, ratio_feature_cols)
+        _dropped_ratio = set(ratio_feature_cols) - set(X_train.columns)
+        ratio_feature_cols = [c for c in ratio_feature_cols if c in X_train.columns]
+        ts_protected_cols -= _dropped_ratio   # finalize'ta düşen oranı korumadan çıkar
 
         # ── Fairness segment taşıyıcısı — HAM hâlde, encode/scale'den ÖNCE ──
         # Buradan sonraki her transform kolonları encode/scale ediyor; ham
@@ -2298,12 +2483,21 @@ def build_features(state: dict) -> dict:
         "domain_features":          [c for c in domain_feature_cols if c in X_train.columns],
         "derived_flags":            [c for c in derived_flag_cols if c in X_train.columns],
         "ratio_features":           [c for c in ratio_feature_cols if c in X_train.columns],
+        # Ratio etiket metadata'sı {kolon: (pay, payda)} — humanize_feature string-parse
+        # belirsizliği yerine buradan kesin etiket kurar (Faz 1 #4). X_train'e GÖRE
+        # FİLTRELENMEZ: bir lookup tablosudur, "hayatta kalan" listesi değil. relations
+        # selection'dan ÖNCE hesaplandığı için orada düşmüş ratio'lar da geçer; hepsini
+        # tutmak her bölümde AYNI etiketi garanti eder (aksi halde biri humanize biri ham).
+        "ratio_feature_meta":       {k: list(v) for k, v in ratio_feature_meta.items()},
         "auto_features":            [c for c in auto_feature_cols if c in X_train.columns],
         "timeseries_lag":           ts_lag_info,
         "split_strategy":           split_strategy,
         "split_imbalanced_entities": split_imbalanced,
         # Training cap örnekleme bilgisi (sessiz değil → rapora yansır)
         "sampling":                 sampling_meta,
+        # Normalizasyon çarpışmaları (farklı-değerli kolonlar aynı ada düşüyor) →
+        # deterministik veri-kalitesi sinyali; Faz 2 risk/WARN listesi tüketir.
+        "normalization_collisions": normalization_collisions,
     }
 
     # Ağır split dizilerini diske yaz; state'te yalnızca dosya yolu taşı

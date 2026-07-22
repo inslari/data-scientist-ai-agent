@@ -312,9 +312,12 @@ def test_diger_modeller_CV_etiketiyle_geliyor():
     )
     sec = build_performance_section(st, "tr")
     cmp = next(s for s in sec.subsections if s.id == "performance_model_comparison")
-    assert [e.value for e in cmp.evidence] == [0.92, 0.90, 0.86], "skora göre sıralı değil"
+    # Faz 3 #4 istisnası: değer 4-haneli STRING (3.–4. hane modelleri ayırır), skora göre sıralı
+    assert [e.value for e in cmp.evidence] == ["0.9200", "0.9000", "0.8600"], "skora göre sıralı 4-hane değil"
     assert "← seçilen" in cmp.evidence[0].label
     assert all(e.provenance == "cv" for e in cmp.evidence), "CV skoru test seti sanılıyor"
+    # Faz 3 #3: tekrar eden satır notu gitti, açıklama bir kez başta
+    assert all(not e.note for e in cmp.evidence) and "çapraz doğrulama" in (cmp.explanation or "").lower()
 
 
 # ── 8. Abartma dedektörü ─────────────────────────────────────────────────────

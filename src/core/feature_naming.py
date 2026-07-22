@@ -60,9 +60,24 @@ def _clean(col: str, lang: str) -> str:
     return label if label != col else col.replace("_", " ")
 
 
-def humanize_feature_label(name: str, lang: str = "tr") -> str:
+def _clean_ratio_operand(col: str, lang: str) -> str:
+    """Ratio pay/payda etiketi: türetilmiş bir feature'sa humanize; DÜZ kolonsa çok-kelimeli
+    adı TİRE ile birleştir (products_number → products-number). Böylece 'age to products-number
+    ratio' okunur ve pay/payda sınırı görünür (boşluk olsa 'age to products number' belirsizleşir)."""
+    if is_derived_feature(col):
+        return humanize_feature_label(col, lang)
+    return col.replace("_", "-")
+
+
+def humanize_feature_label(name: str, lang: str = "tr", ratio_meta: dict | None = None) -> str:
     """Feature ismini sade karşılığına çevirir (ham isim EKLENMEZ).
-    Kural eşleşmezse alt çizgileri boşluğa çevirir (ham casing korunur)."""
+    Kural eşleşmezse alt çizgileri boşluğa çevirir (ham casing korunur).
+
+    ratio_meta: {ratio_kolon_adı: (pay, payda)} — oran motorunun ÜRETİM anında bildiği
+    pay/payda. ratio_{a}_{b} adı string-parse ile BELİRSİZ (ratio_age_products_number:
+    age/products_number mi, age_products/number mi?). Metadata varsa ondan kurulur; yoksa
+    yalnız belirsizlik YOKSA (tam 2 token) parse edilir — belirsizse TAHMİN EDİLMEZ, ham ad
+    gösterilir (sessiz yanlış etiket YOK)."""
     lang = _norm_lang(lang)
     if not name or not isinstance(name, str):
         return name
@@ -105,10 +120,16 @@ def humanize_feature_label(name: str, lang: str = "tr") -> str:
     if m:
         return tpl(m.group(1), col=_clean(m.group(2), lang))
 
-    # ratio_{a}_{b} — son alt çizgiden böl (payda = son token)
-    m = re.match(r"^ratio_(.+)_([^_]+)$", name)
-    if m:
-        return tpl("ratio", a=_clean(m.group(1), lang), b=_clean(m.group(2), lang))
+    # ratio_{a}_{b} — pay/payda üretimde ayrı biliniyor; string-parse BELİRSİZ.
+    if name.startswith("ratio_"):
+        if ratio_meta and name in ratio_meta:
+            a, b = ratio_meta[name]                          # metadata → kesin
+            return tpl("ratio", a=_clean_ratio_operand(a, lang), b=_clean_ratio_operand(b, lang))
+        toks = name[len("ratio_"):].split("_")
+        if len(toks) == 2:                                   # belirsizlik yok → güvenli parse
+            return tpl("ratio", a=_clean_ratio_operand(toks[0], lang),
+                       b=_clean_ratio_operand(toks[1], lang))
+        return name   # >2 token + metadata yok → BELİRSİZ, tahmin etme (ham ad)
 
     # {col}_isna / {col}_diversity (suffix)
     m = re.match(r"^(.+)_isna$", name)
@@ -122,10 +143,11 @@ def humanize_feature_label(name: str, lang: str = "tr") -> str:
     return name.replace("_", " ")
 
 
-def humanize_feature(name: str, lang: str = "tr") -> str:
+def humanize_feature(name: str, lang: str = "tr", ratio_meta: dict | None = None) -> str:
     """Rapor gösterimi: 'Sade etiket (ham_isim)'. Ham isim uzman için parantezde
-    kalır. Kural eşleşmediyse (etiket ham ile aynıysa) parantez eklenmez."""
-    label = humanize_feature_label(name, lang)
+    kalır. Kural eşleşmediyse (etiket ham ile aynıysa) parantez eklenmez.
+    ratio_meta oran etiketini üretim metadata'sından kurar (bkz. humanize_feature_label)."""
+    label = humanize_feature_label(name, lang, ratio_meta)
     if not name or label == name:
         return name
     return f"{label} ({name})"

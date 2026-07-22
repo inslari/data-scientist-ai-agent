@@ -34,8 +34,8 @@ def _ratios(df: pd.DataFrame, drop: list[str], gate: bool = True) -> list[str]:
     original = set(df.columns)
     limit = fb._RATIO_DENOM_MAX_SIGN_MASS if gate else 1.0
     with patch.object(fb, "_RATIO_DENOM_MAX_SIGN_MASS", limit):
-        _, added = _build_ratio_features(df, original, None, "classification",
-                                         aggregated=False, leaky_cols_high=set())
+        _, added, _, _ = _build_ratio_features(df, original, None, "classification",
+                                            aggregated=False, leaky_cols_high=set())
     return added
 
 
@@ -116,8 +116,8 @@ class ProductionPowerPreservedTest(unittest.TestCase):
             original = set(df.columns)
             limit = fb._RATIO_DENOM_MAX_SIGN_MASS if gate else 1.0
             with patch.object(fb, "_RATIO_DENOM_MAX_SIGN_MASS", limit):
-                out, added = _build_ratio_features(df, original, None, "classification",
-                                                   aggregated=False, leaky_cols_high=set())
+                out, added, _, _ = _build_ratio_features(df, original, None, "classification",
+                                                      aggregated=False, leaky_cols_high=set())
             X = out.select_dtypes(include="number").fillna(0.0)
             m = RandomForestClassifier(n_estimators=120, random_state=0, n_jobs=-1).fit(X, y)
             imp = pd.Series(m.feature_importances_, index=X.columns)

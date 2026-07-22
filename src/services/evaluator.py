@@ -60,6 +60,75 @@ warnings.filterwarnings("ignore")
 
 OVERFITTING_THRESHOLD = 0.05
 
+
+def _top_decile_lift(y_true: np.ndarray, prob_pos: np.ndarray, decile: float = 0.10) -> dict:
+    """Top-decile lift — EŞİKTEN BAĞIMSIZ sıralama metriği (olasılıklardan, eşik seçimi YOK).
+    En riskli %`decile` içindeki gerçek pozitiflerin, tüm pozitiflere oranı / decile.
+    Baseline (rastgele)=1.0×. Tavan (mükemmel sıralama)=min(1/decile, 1/prevalence): pozitiflerin
+    tümü decile'a sığabilirse capture 1.0'da tıkanır → sade 1/prevalence ulaşılamaz tavan verir.
+    positive=1. n_top raporda sample_size → düşük-n'de 'ince ölçüm' damgası (Evidence.reliable)."""
+    y = np.asarray(y_true)
+    nt = len(y)
+    n_top = max(1, int(round(decile * nt)))
+    top_idx = np.argsort(-np.asarray(prob_pos))[:n_top]
+    total_pos = int((y == 1).sum())
+    pos_in_top = int((y[top_idx] == 1).sum())
+    prevalence = (total_pos / nt) if nt else 0.0
+    capture = (pos_in_top / total_pos) if total_pos else 0.0
+    lift = (capture / decile) if decile else 0.0
+    ceiling = min(1.0 / decile, 1.0 / prevalence) if prevalence > 0 else None
+    return {
+        "decile": decile, "n_top": n_top, "positives_in_top": pos_in_top,
+        "total_positives": total_pos, "prevalence": round(prevalence, 4),
+        "capture": round(capture, 4), "lift": round(lift, 4),
+        "baseline": 1.0, "ceiling": round(ceiling, 2) if ceiling else None,
+    }
+
+
+def _compute_class_balance(y_test: np.ndarray) -> dict:
+    """Sınıf dağılımı + KADEMELİ dengesizlik seviyesi (deterministik, y_test'ten).
+
+    Eşik SABİT SAYI DEĞİL, üniform paydan (1/n_classes) türer → multi-class'ta
+    kendiliğinden çalışır, sihirli 0.4 yok:
+      severe     : minority_rate < uniform/20      (binary 0.025)  → ROC yanıltıcı, PR-AUC birincil
+      imbalanced : minority_rate < 0.5 × uniform   (binary 0.25)   → azınlık recall'ına dikkat
+      balanced   : aksi
+    İLGİ SINIFI pozitif-öncelikli (ÖRNEKLEMDEN BAĞIMSIZ, kararlı): binary'de pozitif =
+    en yüksek label (classes_sorted[1], evaluator konvansiyonu). Pozitif ≠ azınlık ise
+    İKİSİ de raporlanır (sessizce birini seçme — belirsizlikte tahmin etme kuralı).
+    Multi-class'ta tek 'pozitif' yok → interest_classes boş (per-class alt bölümü kapsar).
+    """
+    labels = sorted(np.unique(y_test).tolist())
+    n = int(len(y_test))
+    counts = {lab: int((y_test == lab).sum()) for lab in labels}
+    dist = {lab: round(counts[lab] / n, 4) for lab in labels} if n else {}
+    n_classes = len(labels)
+    # Deterministik azınlık/çoğunluk (eşitlikte en küçük label — sıra-bağımsız)
+    minority = min(labels, key=lambda l: (counts[l], l)) if labels else None
+    majority = max(labels, key=lambda l: (counts[l], -l)) if labels else None
+    minority_rate = dist.get(minority, 0.0)
+    uniform = 1.0 / n_classes if n_classes else 1.0
+    if n_classes >= 2 and minority_rate < uniform / 20:
+        level = "severe"
+    elif n_classes >= 2 and minority_rate < 0.5 * uniform:
+        level = "imbalanced"
+    else:
+        level = "balanced"
+    # İlgi sınıfı: binary'de pozitif = en yüksek label (kararlı). Pozitif≠azınlık → ikisi de.
+    if n_classes == 2:
+        positive = labels[1]
+        interest = [positive] if positive == minority else [positive, minority]
+    else:
+        positive = None
+        interest = []
+    return {
+        "n_classes": n_classes, "distribution": dist, "counts": counts,
+        "minority_class": minority, "minority_rate": minority_rate,
+        "majority_class": majority, "majority_rate": dist.get(majority, 0.0),
+        "level": level, "positive_class": positive, "interest_classes": interest,
+    }
+
+
 # Classification Evaluation
 def _evaluate_classification(
     model: Any,
@@ -71,8 +140,14 @@ def _evaluate_classification(
     cv_score: float | None = None,
     cv_metric: str = "roc_auc",
     raw_test: pd.DataFrame | None = None,
+    threshold: float = 0.5,
+    threshold_provenance: dict | None = None,
 ) -> dict:
-    """Comprehensive evaluation for binary and multiclass classification."""
+    """Comprehensive evaluation for binary and multiclass classification.
+
+    threshold: sınıflandırma eşiği — ml_trainer'da OOF F1-max ile LEAKAGE-FREE seçilir.
+    Bu fonksiyon eşiği YALNIZ TÜKETİR, y_test'ten HESAPLAMAZ → test-optimize sızıntısı
+    yapısal olarak imkânsız. Yoksa dürüst varsayılan 0.5 (test-optimize'a ASLA düşmez)."""
     is_binary = len(np.unique(y_test)) == 2
 
     # ── Tahminler ────────────────────────────────────────────────
@@ -93,35 +168,22 @@ def _evaluate_classification(
         logger.warning(f"[evaluation] predict_proba basarisiz — olasilik-tabanli metrikler "
                        f"(ROC/PR-AUC/kalibrasyon/threshold) hesaplanamayacak: {prob_error}")
 
-    # Optimal Threshold Calculation
+    # ── Eşik: ml_trainer'dan gelen OOF F1-max eşiği (LEAKAGE-FREE) — burada YALNIZ UYGULANIR ──
+    # Eski precision_recall_curve(y_test,...) test-optimize sızıntısı KALDIRILDI. roc_curve
+    # yalnız EĞRİ gösterimi için (fpr/tpr, eşikten bağımsız); eşik seçimi için DEĞİL.
+    optimal_threshold = round(float(threshold), 4) if threshold is not None else 0.5
     roc_curve_data = None
     if is_binary and y_prob_test is not None:
         try:
             fpr, tpr, thresholds = roc_curve(y_test, y_prob_test[:, 1])
-            # Optimal threshold (Youden's J statistic - Eskiden buradaydi, yorum satiri yapildi)
-            # j_scores = tpr - fpr
-            # optimal_idx = int(np.argmax(j_scores))
-            # optimal_threshold = round(float(thresholds[optimal_idx]), 4)
-
-            # Optimal threshold: F1 Skorunu maksimize ederek secelim (Dengesiz veriler icin daha iyi)
-            precision, recall, pr_thresholds = precision_recall_curve(y_test, y_prob_test[:, 1])
-
-            num = 2 * recall * precision
-            den = recall + precision
-            f1_scores = np.divide(num, den, out=np.zeros_like(num), where=(den!=0))
-
-            best_pr_idx = int(np.argmax(f1_scores[:-1]))
-            optimal_threshold = round(float(pr_thresholds[best_pr_idx]), 4)
-
-            # ROC curve uzerindeki karsilik gelen index'i bulalim (UI grafiklerinde gostermek icin)
             optimal_idx = int(np.argmin(np.abs(thresholds - optimal_threshold)))
-            # Update predictions based on optimal threshold for better recall
+            # Tahminleri OOF eşiğiyle üret — TEST + TRAIN ikisi de aynı dürüst eşik (çift-yanlış yok).
             classes = np.unique(y_test)
             if len(classes) == 2 and np.issubdtype(classes.dtype, np.number):
                 y_pred_test = (y_prob_test[:, 1] >= optimal_threshold).astype(classes.dtype)
                 if y_prob_train is not None:
                     y_pred_train = (y_prob_train[:, 1] >= optimal_threshold).astype(classes.dtype)
-            
+
             roc_curve_data = {
                 "fpr": [round(float(x), 4) for x in fpr[::max(1, len(fpr) // 20)]],
                 "tpr": [round(float(x), 4) for x in tpr[::max(1, len(tpr) // 20)]],
@@ -145,6 +207,65 @@ def _evaluate_classification(
         "recall_weighted": round(float(recall_score(y_test, y_pred_test, average="weighted", zero_division=0)), 4),
         "mcc": round(float(matthews_corrcoef(y_test, y_pred_test)), 4),
     }
+
+    # Kullanılan eşik + provenance (Grup C rapora yazacak: değer + kaynak + n).
+    evaluation["threshold"] = {
+        "value": optimal_threshold,
+        "provenance": threshold_provenance or {"value": optimal_threshold, "source": "default_0.5"},
+    }
+
+    # Sınıf dengesi + baseline'lar (deterministik, y_test'ten — modelden bağımsız).
+    class_balance = _compute_class_balance(y_test)
+    evaluation["class_balance"] = class_balance
+    # #5 accuracy baseline: hep çoğunluk sınıfını diyen modelin doğruluğu (majority_rate).
+    test_metrics["accuracy_baseline"] = class_balance["majority_rate"]
+
+    # ── Eşik TAKASI (Grup C): SEÇİM OOF eğrisinden (ml_trainer, threshold_provenance),
+    # ÖLÇÜM burada TEST'te — "seç OOF'ta, ölç test'te" ilkesi (bkz. ml_trainer _oof_f1_range).
+    # F1 düz-aralığının İKİ ucunu karakterize eder (yüksek-recall / yüksek-precision); okuyucu
+    # hangi yöne ne kadar yer olduğunu görür, KARARI biz vermeyiz. positive=1.
+    _prov = threshold_provenance or {}
+    _lo, _hi = _prov.get("flat_lo_thr"), _prov.get("flat_hi_thr")
+    if is_binary and y_prob_test is not None and _lo is not None and _hi is not None:
+        def _rp(thr: float) -> dict:
+            yp = (y_prob_test[:, 1] >= thr).astype(int)
+            return {"threshold": round(float(thr), 4),
+                    "recall": round(float(recall_score(y_test, yp, pos_label=1, zero_division=0)), 4),
+                    "precision": round(float(precision_score(y_test, yp, pos_label=1, zero_division=0)), 4),
+                    "f1": round(float(f1_score(y_test, yp, pos_label=1, zero_division=0)), 4)}
+        evaluation["threshold_tradeoff"] = {
+            "chosen": _rp(optimal_threshold),
+            "high_recall": _rp(_lo),        # düşük eşik ucu
+            "high_precision": _rp(_hi),     # yüksek eşik ucu
+            "flat_tolerance": _prov.get("flat_tolerance"),
+            "provenance": {"selected_on": "oof_cv_curve", "measured_on": "test_set"},
+        }
+
+    # ── TOP-DECILE LIFT (Grup C): EŞİKTEN BAĞIMSIZ sıralama metriği (olasılıklardan,
+    # eşik seçimi YOK → test'te hesaplamak meşru). Binary-only guard. Baseline rastgele=1.0×,
+    # tavan (mükemmel sıralama)=min(1/decile, 1/prevalence) — pozitiflerin tümü decile'a
+    # sığabilirse capture 1.0'da tıkanır, sade 1/prevalence ulaşılamaz tavan verir.
+    if is_binary and y_prob_test is not None:
+        try:
+            evaluation["top_decile_lift"] = _top_decile_lift(y_test, y_prob_test[:, 1])
+        except Exception as e:
+            logger.warning(f"[evaluation] top-decile lift hesaplanamadi: {e}")
+
+        # ── AKSİYON YOĞUNLAŞMASI (D3): top-decile grup dağılımı — HAM raw_test carrier
+        # üzerinden, DEMOGRAFİ-AGNOSTİK kolonlarda (fairness'tan ayrı). Yeni model/feature
+        # YOK: mevcut y_prob_test + zaten taşınan ham kolonlar. Yığılma "nerede bakılmalı"
+        # gözlemi; base_rate_ratio ile yön (beklenen konsantrasyon vs kapsama boşluğu).
+        try:
+            from src.services.segment_carrier import select_concentration_columns
+            from src.services.action_concentration import compute_action_concentration
+            if raw_test is not None and not raw_test.empty:
+                conc_cols, conc_skipped = select_concentration_columns(raw_test)
+                evaluation["action_concentration"] = compute_action_concentration(
+                    y_prob_test[:, 1], raw_test, conc_cols, y_test,
+                    skipped_columns=conc_skipped,
+                )
+        except Exception as e:
+            logger.warning(f"[evaluation] aksiyon yogunlasmasi hesaplanamadi: {e}")
 
     # ROC-AUC
     if y_prob_test is not None:
@@ -279,10 +400,16 @@ def _evaluate_classification(
         try:
             prob_true, prob_pred = calibration_curve(y_test, y_prob_test[:, 1], n_bins=10)
             brier_score = float(np.mean((y_prob_test[:, 1] - y_test) ** 2))
+            # #5 Brier baseline (BINARY): sabit taban-oranı tahmincisinin Brier'i = p(1-p),
+            # p = pozitif oran. Kapalı form BINARY'ye özel — multi-class'ta farklı (1-Σpᵢ²);
+            # bu blok zaten `is_binary` guard'ı altında, çok sınıflıda hesaplanmaz (TODO: analog).
+            base_rate = float(np.mean(y_test))            # binary: P(y=1)
+            brier_baseline = round(base_rate * (1.0 - base_rate), 4)
             evaluation["calibration"] = {
                 "prob_true": [round(float(x), 4) for x in prob_true],
                 "prob_pred": [round(float(x), 4) for x in prob_pred],
                 "brier_score": round(brier_score, 4),
+                "brier_baseline": brier_baseline,
                 "is_well_calibrated": brier_score < 0.1,
             }
         except Exception:
@@ -1331,9 +1458,14 @@ def evaluate_model(state: AgentState) -> dict:
     elif intent == "anomaly_detection":
         evaluation_report = _pass_anomaly_metrics(state)
     else:
+        # Eşik ml_trainer'da OOF F1-max ile (leakage-free) seçildi → state.metrics'ten al.
+        # evaluator TEST'ten HESAPLAMAZ (yapısal fallback: yoksa 0.5, test-optimize ASLA).
+        _thr = _m.get("optimal_threshold", 0.5)
+        _thr_prov = _m.get("threshold_provenance")
         evaluation_report = _evaluate_classification(
             model, X_train, y_train, X_test, y_test, feature_names,
             cv_score=cv_score_cls, cv_metric=cv_metric_cls, raw_test=raw_test,
+            threshold=_thr, threshold_provenance=_thr_prov,
         )
 
     # Model name and feature plan

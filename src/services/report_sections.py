@@ -20,7 +20,15 @@ from typing import Optional
 
 from src.core.llm import get_llm
 from src.core.config import settings
-from src.core.feature_naming import humanize_feature
+from src.core.feature_naming import humanize_feature, is_derived_feature
+
+
+def _hf(name, lang, state):
+    """humanize_feature + ratio_meta: state'teki feature_report.ratio_feature_meta'yı geçirir.
+    Böylece ratio etiketleri (Faz 1 #4) her bölümde AYNI ve DOĞRU görünür — belirsiz string-parse
+    yerine üretim metadata'sından. Metadata yoksa humanize belirsiz adı ham gösterir."""
+    rm = (state.get("feature_report") or {}).get("ratio_feature_meta") or {}
+    return humanize_feature(name, lang, rm)
 from src.core.logging_config import get_logger
 from src.core.report_i18n import R_REASON
 from src.core.report_schema import (
@@ -37,6 +45,7 @@ from src.core.report_schema import (
     ORDER_SUMMARY,
     Evidence,
     ReportSection,
+    _fmt_value,
 )
 from src.services.fairness import wilson_interval
 
@@ -86,6 +95,9 @@ _FAIR_L = {
         "gap_note": ("0'a yakınsa seçim oranı farkı VERİDEN geliyor (model grubun "
                      "gerçek oranını yansıtıyor). Sıfırdan uzaksa fark MODELDEN "
                      "geliyor ve incelenmeye değer."),
+        "ci_overlap_note": ("İki grubun güven aralıkları örtüşüyor — bu fark "
+                            "istatistiksel olarak ayırt edilemez (gürültüden farksız "
+                            "olabilir); bir bulgu olarak okunmamalı."),
     },
     "en": {
         "ref_suffix": " (reference)",
@@ -106,6 +118,9 @@ _FAIR_L = {
         "gap_note": ("Near 0, the selection-rate gap comes from the DATA (the model "
                      "reflects the group's actual rate). Far from 0, the gap comes from "
                      "the MODEL and is worth examining."),
+        "ci_overlap_note": ("The two groups' confidence intervals overlap — this "
+                            "difference is statistically indistinguishable (may be no "
+                            "different from noise); it should not be read as a finding."),
     },
 }
 
@@ -170,12 +185,16 @@ def _fairness_evidence(fair: dict, lang: str) -> list[Evidence]:
                 di = c.get("disparate_impact")
                 brr = c.get("base_rate_ratio")
                 gap = c.get("selection_gap_vs_base")
+                # D2: DI'nin dayandığı seçim oranları ayırt edilemezse (CI örtüşür)
+                # notu değiştir — sayı görünür kalır ama "bulgu değil" damgası taşır.
+                di_note = (L["ci_overlap_note"] if c.get("disparate_impact_indistinguishable")
+                           else R_REASON(c.get("disparate_impact_undefined_reason"), lang))
                 ev.append(Evidence(
                     label=L["di"].format(col=col, g=gname, ref=ref_name),
                     value=di,
                     provenance="test_set",
                     sample_size=c.get("n"),
-                    note=R_REASON(c.get("disparate_impact_undefined_reason"), lang),
+                    note=di_note,
                     reference=_DI_REFERENCE_NOTE.get(lang, _DI_REFERENCE_NOTE["tr"]),
                 ))
                 ev.append(Evidence(
@@ -194,12 +213,16 @@ def _fairness_evidence(fair: dict, lang: str) -> list[Evidence]:
                         note=L["gap_note"],
                     ))
                 for metric in ("fpr_diff", "fnr_diff"):
+                    # D2: fark CI-örtüşme ile ayırt edilemezse notu bununla değiştir.
+                    diff_note = (L["ci_overlap_note"]
+                                 if c.get(f"{metric}_indistinguishable")
+                                 else R_REASON(c.get(f"{metric}_undefined_reason"), lang))
                     ev.append(Evidence(
                         label=L[metric].format(col=col, g=gname, ref=ref_name),
                         value=c.get(metric),
                         provenance="test_set",
                         sample_size=c.get("n"),
-                        note=R_REASON(c.get(f"{metric}_undefined_reason"), lang),
+                        note=diff_note,
                     ))
             else:
                 ev.append(Evidence(
@@ -419,8 +442,8 @@ def build_relations_section(state: dict, lang: str = "tr") -> ReportSection:
         score = r["score"]
         yon = _rel_direction(score, lang)
         return Evidence(
-            label=(f"{humanize_feature(r['feature'], lang)} ↔ {target} — {yon}"
-                   if target else humanize_feature(r["feature"], lang)),
+            label=(f"{_hf(r['feature'], lang, state)} ↔ {target} — {yon}"
+                   if target else _hf(r["feature"], lang, state)),
             value=score,
             provenance=provenance,
             sample_size=n_rows,
@@ -435,7 +458,7 @@ def build_relations_section(state: dict, lang: str = "tr") -> ReportSection:
     # X-X: "neredeyse aynı bilgi" çiftleri — hedefi hiç görmez, yorumu güvenli.
     for p in pairs[:RELATIONS_VISIBLE_TOP]:
         evidence.append(Evidence(
-            label=(f"{humanize_feature(p['a'], lang)} ↔ {humanize_feature(p['b'], lang)} — "
+            label=(f"{_hf(p['a'], lang, state)} ↔ {_hf(p['b'], lang, state)} — "
                    f"{_rel_direction(p['corr'], lang)}"),
             value=p["corr"],
             provenance=provenance,
@@ -467,6 +490,30 @@ def build_relations_section(state: dict, lang: str = "tr") -> ReportSection:
         ))
 
     if redundant:
+        # #10 — NEAR-DUP TAVSİYESİNİ İKİYE AYIR: ham↔ham çift için "yalnız birini topla"
+        # (kullanıcı ham alanı toplamayı bırakabilir); türetilmiş dahil çift için "özellik
+        # üretiminde sadeleştir" (kullanıcı MOTORUN ürettiği feature'ı toplamayı BIRAKAMAZ →
+        # eski tek-tip "veri toplama fırsatı" tavsiyesi türetilmişte YANLIŞTI). is_derived_feature
+        # ile çift-başına sınıflanır; tek liste kalır, her satır kendi doğasını taşır.
+        def _redundant_ev(p: dict) -> Evidence:
+            derived = is_derived_feature(p["a"]) or is_derived_feature(p["b"])
+            if derived:
+                note = ("Biri motorun ürettiği bir özellik — bu bir feature-engineering tekrarı; "
+                        "veri toplamada DEĞİL, özellik üretiminde sadeleştirilir."
+                        if lang == "tr" else
+                        "One is an engine-derived feature — a feature-engineering redundancy; "
+                        "prune it in feature generation, NOT data collection.")
+            else:
+                note = ("Her ikisi de ham alan — yalnız birini toplamak yeterli (veri toplama "
+                        "sadeleştirmesi)."
+                        if lang == "tr" else
+                        "Both are raw fields — collecting only one suffices (a data-collection "
+                        "simplification).")
+            return Evidence(
+                label=f"{_hf(p['a'], lang, state)} ↔ {_hf(p['b'], lang, state)}",
+                value=p["corr"], provenance=provenance, sample_size=n_rows, note=note,
+            )
+
         section.subsections.append(ReportSection(
             id="data_relations_redundant",
             title=("Neredeyse aynı bilgiyi taşıyan sütunlar"
@@ -475,18 +522,17 @@ def build_relations_section(state: dict, lang: str = "tr") -> ReportSection:
                       if lang == "tr" else
                       f"{len(redundant)} column pairs are near-duplicates of each other."),
             explanation=(
-                "Bu çiftlerden yalnızca biri modele katkı sağlar; ikisini birden tutmak "
-                "yeni bilgi eklemez. Bu, veri toplarken sadeleştirme fırsatıdır."
+                "Bu çiftlerden yalnızca biri modele katkı sağlar; ikisini birden tutmak yeni "
+                "bilgi eklemez. Sadeleştirme çiftin doğasına göre YA veri toplamada (iki ham "
+                "alan) YA da özellik üretiminde (biri motor türevi) yapılır — her satır hangisi "
+                "olduğunu belirtir."
                 if lang == "tr" else
                 "Only one of each pair adds anything to the model; keeping both adds no new "
-                "information. This is an opportunity to simplify data collection."
+                "information. Depending on the pair, the simplification belongs EITHER to data "
+                "collection (two raw fields) OR to feature generation (one is engine-derived) — "
+                "each row states which."
             ),
-            evidence=[
-                Evidence(
-                    label=f"{humanize_feature(p['a'], lang)} ↔ {humanize_feature(p['b'], lang)}",
-                    value=p["corr"], provenance=provenance, sample_size=n_rows,
-                ) for p in redundant
-            ],
+            evidence=[_redundant_ev(p) for p in redundant],
             status="ok",
         ))
 
@@ -495,7 +541,9 @@ def build_relations_section(state: dict, lang: str = "tr") -> ReportSection:
 
 # ── Hata Analizi bölümü ──────────────────────────────────────────────────────
 
-_ERRORS_TITLE = {"tr": "Model Nerede Yanılıyor", "en": "Where the Model Gets It Wrong"}
+# Faz 3 #6: başlık stili tutarlılığı — diğer 10 başlık isim-öbeği (Title Case);
+# tek istisna bu cümle-başlıktı. İsim-öbeğine çevrildi.
+_ERRORS_TITLE = {"tr": "Hata Analizi", "en": "Error Analysis"}
 
 # NEREDE / NEDEN ayrımı — nedensellik korumasının kardeşi. Çerçeve artık bölüm
 # başında bir kez (_ERRORS_DISCLAIMER); satır başına damga KALDIRILDI (boilerplate).
@@ -520,7 +568,7 @@ ERRORS_VISIBLE_TOP = 5
 
 
 def build_error_analysis_section(state: dict, lang: str = "tr") -> ReportSection:
-    """Model Nerede Yanılıyor — hata oranı, yüksek güvenli hatalar, ayrışan alanlar.
+    """Hata Analizi — hata oranı, yüksek güvenli hatalar, ayrışan alanlar.
 
     Kanıtın can alıcı kısmı: her alan için HATALI vakalardaki ortalama ile DOĞRU
     vakalardaki ortalama yan yana ("hatalı vakalarda 42 saat, doğrularda 17 saat").
@@ -567,11 +615,13 @@ def build_error_analysis_section(state: dict, lang: str = "tr") -> ReportSection
             label=("Emin olduğu hâlde yanıldığı tahminler"
                    if lang == "tr" else "Predictions it was confident about but got wrong"),
             value=conf.get("high_confidence_errors"), provenance="test_set", sample_size=n_err,
-            note=(f"Hataların %{conf.get('high_confidence_errors_pct', 0)}'i. Bunlar en riskli "
-                  f"hatalardır: model emin olduğu için kimse kontrol etmez."
+            note=(f"Hataların %{conf.get('high_confidence_errors_pct', 0)}'i. 'Emin' = model olasılığı "
+                  f">0.7 veya <0.3 (yani |olasılık−0.5|>0.2). Bunlar en riskli hatalardır: model "
+                  f"emin olduğu için kimse kontrol etmez."
                   if lang == "tr" else
-                  f"{conf.get('high_confidence_errors_pct', 0)}% of errors. These are the "
-                  f"riskiest: because the model is confident, nobody double-checks them."),
+                  f"{conf.get('high_confidence_errors_pct', 0)}% of errors. 'Confident' = model "
+                  f"probability >0.7 or <0.3 (i.e. |probability−0.5|>0.2). These are the riskiest: "
+                  f"because the model is confident, nobody double-checks them."),
         ))
 
     # Ayrışan alanlar — ham değer varsa "42 vs 17", yoksa görünür sebeple ölçekli.
@@ -581,8 +631,11 @@ def build_error_analysis_section(state: dict, lang: str = "tr") -> ReportSection
     def _feat_evidence(col: str, info: dict) -> Evidence:
         has_raw = info.get("raw_available")
         if has_raw:
-            m_err = info.get("mean_in_errors_raw")
-            m_cor = info.get("mean_in_correct_raw")
+            # Faz 3 #4: ham ortalama not metnine gömülü — TEK doğruluk kaynağı
+            # _fmt_value ile aynı ondalık disiplininden geçir (91571.9019 → 91,571.90;
+            # küçük ortalama (yaş 42.3) → "42.3"). Aksi hâlde ham 4-hane sızar.
+            m_err = _fmt_value(info.get("mean_in_errors_raw"))
+            m_cor = _fmt_value(info.get("mean_in_correct_raw"))
             detail = (f"Hatalı vakalarda ortalama **{m_err}**, doğru vakalarda **{m_cor}**."
                       if lang == "tr" else
                       f"Average **{m_err}** in wrong cases, **{m_cor}** in correct ones.")
@@ -591,8 +644,8 @@ def build_error_analysis_section(state: dict, lang: str = "tr") -> ReportSection
             detail = (f"Ham karşılığı yok — {_rur}" if lang == "tr"
                       else f"No raw equivalent — {_rur}")
         return Evidence(
-            label=(f"{humanize_feature(col, lang)} — ayrışma büyüklüğü"
-                   if lang == "tr" else f"{humanize_feature(col, lang)} — separation size"),
+            label=(f"{_hf(col, lang, state)} — ayrışma büyüklüğü"
+                   if lang == "tr" else f"{_hf(col, lang, state)} — separation size"),
             value=info.get("cohens_d"),
             provenance="test_set",
             sample_size=n_total,
@@ -751,11 +804,13 @@ _METRIC_META: dict[str, dict[str, tuple[str, str]]] = {
     },
     "mcc": {
         "tr": ("Dengeli başarı ölçüsü (MCC)",
-               "-1 ile 1 arasında; 0 rastgele tahminle aynı demektir. Dengesiz veride "
-               "doğruluktan daha dürüst bir özettir çünkü dört hücrenin hepsini hesaba katar."),
+               "-1 ile 1 arasında: 0 rastgele tahminle aynı, 1 kusursuz, -1 tam ters demektir. "
+               "Dengesiz veride doğruluktan daha dürüst bir özettir çünkü dört hücrenin hepsini "
+               "hesaba katar."),
         "en": ("Balanced quality score (MCC)",
-               "Between -1 and 1; 0 means no better than guessing. On imbalanced data it is a "
-               "more honest summary than accuracy because it uses all four cells."),
+               "Between -1 and 1: 0 means no better than guessing, 1 is perfect, -1 is fully "
+               "inverted. On imbalanced data it is a more honest summary than accuracy because "
+               "it uses all four cells."),
     },
     "log_loss": {
         "tr": ("Olasılık hatası (log-loss)",
@@ -797,9 +852,12 @@ _METRIC_META: dict[str, dict[str, tuple[str, str]]] = {
 
 # Rapordaki gösterim sırası — sözlük sırası değil, OKUYUCU önceliği:
 # ayırt etme gücü → yakalama → denge → ham doğruluk.
+# NOT: 'recall_weighted' KASITLI YOK — weighted recall MATEMATİKSEL OLARAK accuracy'ye
+# eşittir (aynı sayıyı iki ayrı metrik gibi göstermek sıfır bilgi taşır, yanıltır). Azınlık/
+# ilgi sınıfının recall+precision'ı ayrıca gösterilir (bkz. build_performance_section, #7).
 _METRIC_ORDER = (
     "roc_auc", "roc_auc_ovr", "pr_auc", "f1_weighted", "f1_macro",
-    "precision_weighted", "recall_weighted", "accuracy", "mcc", "log_loss",
+    "precision_weighted", "accuracy", "mcc", "log_loss",
     "r2", "rmse", "mae", "mape",
 )
 
@@ -1018,6 +1076,104 @@ def _metrics_unavailable_subsection(ev_report: dict, lang: str) -> Optional[Repo
     )
 
 
+# ── Aksiyon Yoğunlaşması (D3) alt-bölümü ─────────────────────────────────────
+
+def _ac_note(kind: str, rep, base, lang: str) -> str:
+    """Grup notu — NEDENSEL bağ kurmadan iki gözlemi yan yana koyar (yön netliği)."""
+    r = f"{_fmt_value(rep)}×" if rep is not None else "—"   # Faz 3 #4: oran 3 hane
+    b = f"{_fmt_value(base)}×" if base is not None else "—"
+    if lang == "tr":
+        return {
+            "expected": (f"Aksiyon setinde over-temsil ediliyor ({r}) VE veride yüksek taban "
+                         f"riskine sahip ({b}) — iki gözlem hizalı, beklenen konsantrasyon (kusur değil)."),
+            "over_unexpected": (f"Aksiyon setinde over-temsil ({r}) ama grubun veri-taban riski yüksek "
+                                f"değil ({b}) — beklenmedik; nereye bakılmalı."),
+            "coverage_gap": (f"Veri-taban riski yüksek ({b}) ama aksiyon setinde az temsil ({r}) — model "
+                             f"bu grubu decile DIŞINDA yakalıyor olabilir ya da kaçırıyor; incelenmeye değer."),
+        }.get(kind, f"Popülasyon payına göre {r} temsil (taban riski {b}).")
+    return {
+        "expected": (f"Over-represented in the action set ({r}) AND carries a high base risk in the "
+                     f"data ({b}) — the two observations are aligned, an expected concentration (not a defect)."),
+        "over_unexpected": (f"Over-represented in the action set ({r}) but the group's data base risk is "
+                            f"not high ({b}) — unexpected; worth a look."),
+        "coverage_gap": (f"High data base risk ({b}) but under-represented in the action set ({r}) — the "
+                         f"model may catch this group OUTSIDE the decile, or may be missing it; worth examining."),
+    }.get(kind, f"Represented at {r} of its population share (base risk {b}).")
+
+
+def _action_concentration_subsection(ev_report: dict, lang: str) -> Optional[ReportSection]:
+    """En riskli %10'a KİMİN girdiği — dağılım gözlemi (adalet değil). Nedensellik yasağı:
+    'yoğunlaşıyor' der, 'çünkü riskli' demez; base_rate_ratio yalnız hizalı-mı diye yan yana."""
+    ac = ev_report.get("action_concentration") or {}
+    if not ac:
+        return None
+    title = ("Aksiyon yoğunlaşması: en riskli %10 kim?" if lang == "tr"
+             else "Action concentration: who is the riskiest 10%?")
+    if ac.get("status") != "ok":
+        return ReportSection(
+            id="action_concentration", title=title, status="not_computed",
+            not_computed_reason=R_REASON(ac.get("reason"), lang),
+        )
+
+    ev: list[Evidence] = []
+    for col, cd in (ac.get("columns") or {}).items():
+        for value, g in (cd.get("groups") or {}).items():
+            if g.get("kind") in ("proportional", "aligned_or_weak", "undefined"):
+                # Orantılıya yakın gruplar da GÖRÜNÜR (iki yön de raporlanır) ama nötr not.
+                pass
+            # Güvenilirlik n_decile'dan (oran ölçeğindeki rep_ci, 0–1 için tasarlı
+            # width≤0.30 kuralını yanlış tetikler → Germany n=104'e sahte "ince" damgası).
+            # rep_ci yine görünür ama NOT metninde; damga gerçek örneklemden.
+            rc = g.get("rep_ci") or {}
+            _ci_lbl = "%95 aralık" if lang == "tr" else "95% CI"
+            ci_txt = (f" · {_ci_lbl} [{_fmt_value(rc.get('lower'))} — {_fmt_value(rc.get('upper'))}]"
+                      if rc.get("lower") is not None else "")
+            ev.append(Evidence(
+                label=f"{col} = {value}",
+                value=g.get("rep_ratio"),
+                provenance="test_set",
+                sample_size=g.get("n_decile"),
+                note=_ac_note(g.get("kind"), g.get("rep_ratio"), g.get("base_rate_ratio"), lang) + ci_txt,
+            ))
+        for value, reason in (cd.get("skipped_groups") or {}).items():
+            ev.append(Evidence(
+                label=(f"{col} = {value} — ölçülmedi" if lang == "tr"
+                       else f"{col} = {value} — not measured"),
+                value=None, provenance="test_set", note=R_REASON(reason, lang),
+            ))
+    for col, reason in (ac.get("skipped_columns") or {}).items():
+        ev.append(Evidence(
+            label=(f"{col} — yoğunlaşma adayı değil" if lang == "tr"
+                   else f"{col} — not a concentration candidate"),
+            value=None, provenance="test_set", note=R_REASON(reason, lang),
+        ))
+    if not ev:
+        return None
+
+    n_top = ac.get("n_top")
+    return ReportSection(
+        id="action_concentration", title=title,
+        headline=(f"Modelin işleme aldığı en riskli %10'un ({n_top} kayıt) grup dağılımı — "
+                  f"1.0× orantılı, yüksek=over-temsil, düşük=under-temsil."
+                  if lang == "tr" else
+                  f"The group split of the riskiest 10% ({n_top} rows) the model would act on — "
+                  f"1.0× is proportional, high=over-represented, low=under-represented."),
+        explanation=(
+            "Bu bölüm bir DAĞILIM gözlemidir, adalet ölçümü DEĞİL — en riskli %10'a kimin "
+            "girdiğini TANIMLAR, sebebini açıklamaz. Yüksek yoğunlaşma tek başına kusur değildir: "
+            "model gerçekten riskli bir grubu buluyor olabilir. Grubun veri-taban riski "
+            "(base_rate) yalnızca 'iki gözlem hizalı mı' diye YAN YANA konur — yoğunlaşmanın "
+            "SEBEBİ olarak değil."
+            if lang == "tr" else
+            "This is a DISTRIBUTION observation, not a fairness measurement — it DESCRIBES who "
+            "falls in the riskiest 10%, it does not explain why. High concentration is not a "
+            "defect on its own: the model may be finding a genuinely risky group. The group's "
+            "data base risk (base_rate) is placed ALONGSIDE only to show whether the two "
+            "observations are aligned — not as the CAUSE of the concentration."),
+        evidence=ev, status="ok",
+    )
+
+
 def build_performance_section(state: dict, lang: str = "tr") -> ReportSection:
     """Model Performansı — test metrikleri + güven aralıkları + confusion + sınıf başına.
 
@@ -1089,6 +1245,17 @@ def build_performance_section(state: dict, lang: str = "tr") -> ReportSection:
                 f"Baseline {base}: a model that learned nothing and guessed at random would "
                 f"score this (the share of 'yes' in the data). Compare against this number."
             )
+        # #5 accuracy baseline: hep ÇOĞUNLUK sınıfını diyen modelin doğruluğu. Dengesizde
+        # kritik — %79.65 taban → %83.9 model farkını okuyucu ancak böyle görür.
+        if key == "accuracy" and test_m.get("accuracy_baseline") is not None:
+            base = test_m["accuracy_baseline"]
+            reference = (
+                f"Taban çizgisi {base}: hep en sık görülen sınıfı diyen (hiçbir şey öğrenmeyen) "
+                f"model bu doğruluğu alırdı. Modelin katkısı bu sayının ÜSTÜNE ne eklediğidir."
+                if lang == "tr" else
+                f"Baseline {base}: always predicting the most common class (learning nothing) "
+                f"gives this accuracy. The model's contribution is what it adds ON TOP of this."
+            )
         evidence.append(Evidence(
             label=label, value=test_m[key], provenance="test_set",
             sample_size=n_test,
@@ -1110,13 +1277,152 @@ def build_performance_section(state: dict, lang: str = "tr") -> ReportSection:
                   "repeated resampling). A narrow band means a stable result."),
         ))
 
+    # #7 İLGİ SINIFI (azınlık/pozitif) recall + precision — weighted recall'ın (==accuracy)
+    # yerine. Dengesizde toplam skor azınlığı gizler; ilgi sınıfının yakalama/isabeti ayrı
+    # gösterilir ve digest'e girer → özet bunu yansıtır. Pozitif≠azınlık ise İKİSİ de.
+    cb = ev_report.get("class_balance") or {}
+    per_class = ev_report.get("per_class_metrics") or {}
+    disp = _class_display(list((cb.get("distribution") or {}).keys()), lang)
+    for lab in cb.get("interest_classes", []):
+        pc = per_class.get(str(lab))
+        if not pc:
+            continue
+        nm = disp.get(str(lab), str(lab))
+        role = ""
+        if lab == cb.get("minority_class") and lab == cb.get("positive_class"):
+            role = (" (azınlık + pozitif)" if lang == "tr" else " (minority + positive)")
+        elif lab == cb.get("positive_class"):
+            role = (" (pozitif)" if lang == "tr" else " (positive)")
+        elif lab == cb.get("minority_class"):
+            role = (" (azınlık)" if lang == "tr" else " (minority)")
+        evidence.append(Evidence(
+            label=(f"İlgi sınıfı '{nm}'{role} — yakalama (recall)" if lang == "tr"
+                   else f"Interest class '{nm}'{role} — catch (recall)"),
+            value=pc.get("recall"), provenance="test_set", sample_size=pc.get("support"),
+            note=(f"Gerçekte '{nm}' olanların yüzde kaçını model yakaladı. Toplam skor bunu "
+                  f"gizler; dengesiz veride ASIL bakılacak sayı budur."
+                  if lang == "tr" else
+                  f"Of those truly '{nm}', what share the model caught. The overall score hides "
+                  f"this; on imbalanced data this is the number that matters."),
+        ))
+        evidence.append(Evidence(
+            label=(f"İlgi sınıfı '{nm}'{role} — isabet (precision)" if lang == "tr"
+                   else f"Interest class '{nm}'{role} — accuracy of hits (precision)"),
+            value=pc.get("precision"), provenance="test_set", sample_size=pc.get("support"),
+            note=(f"Model '{nm}' dediğinde yüzde kaç haklı çıktı."
+                  if lang == "tr" else
+                  f"When the model said '{nm}', what share it got right."),
+        ))
+
+    # ── #9 KULLANILAN EŞİK + provenance + eşik-bağımlı/bağımsız ayrımı ──
+    thr_info = ev_report.get("threshold") or {}
+    if thr_info.get("value") is not None:
+        prov = thr_info.get("provenance") or {}
+        src = prov.get("source", "default_0.5")
+        src_txt = ("katman-dışı çapraz-doğrulama (OOF, F1-max)" if src == "oof_cv_f1max"
+                   else "varsayılan 0.5") if lang == "tr" else \
+                  ("out-of-fold cross-validation (OOF, F1-max)" if src == "oof_cv_f1max" else "default 0.5")
+        evidence.append(Evidence(
+            label=("Kullanılan sınıflandırma eşiği" if lang == "tr" else "Classification threshold used"),
+            value=thr_info["value"], provenance="cv", sample_size=prov.get("n"),
+            note=(f"Bu olasılık kesme noktasının üstü '{disp.get('1','pozitif')}' sayılır. "
+                  f"AYARLANABİLİR — değiştirirseniz aşağıdaki EŞİK-BAĞIMLI metrikler oynar: "
+                  f"accuracy, F1, precision, recall, confusion matrix. EŞİK-BAĞIMSIZ (değişmez): "
+                  f"ROC-AUC, PR-AUC, top-decile lift."
+                  if lang == "tr" else
+                  f"Scores above this probability cutoff count as '{disp.get('1','positive')}'. "
+                  f"ADJUSTABLE — if you change it, the THRESHOLD-DEPENDENT metrics move: "
+                  f"accuracy, F1, precision, recall, confusion matrix. THRESHOLD-INDEPENDENT "
+                  f"(unchanged): ROC-AUC, PR-AUC, top-decile lift."),
+            reference=(f"Kaynak: {src_txt} — eşik test setinde DEĞİL, sızıntısız seçildi."
+                       if lang == "tr" else
+                       f"Source: {src_txt} — chosen leakage-free, NOT on the test set."),
+        ))
+
+    # ── #9 EŞİK TAKASI: F1 düz-aralığının iki ucu (SEÇİM OOF, ÖLÇÜM test) ──
+    tr_off = ev_report.get("threshold_tradeoff") or {}
+    if tr_off.get("high_recall") and tr_off.get("high_precision"):
+        hr, hp, ch = tr_off["high_recall"], tr_off["high_precision"], tr_off.get("chosen", {})
+        evidence.append(Evidence(
+            label=("Eşik takası (F1 bu aralıkta düz)" if lang == "tr"
+                   else "Threshold trade-off (F1 is flat across this band)"),
+            value=None, provenance="test_set",
+            note=(f"Eşik bir İŞ KARARI: F1 bu komşulukta neredeyse sabit, ama recall↔precision "
+                  f"takası kayar. Yüksek-recall ucu (eşik {hr['threshold']}): recall {hr['recall']}, "
+                  f"precision {hr['precision']}. Yüksek-precision ucu (eşik {hp['threshold']}): "
+                  f"recall {hp['recall']}, precision {hp['precision']}. Seçili (eşik {ch.get('threshold')}): "
+                  f"recall {ch.get('recall')}, precision {ch.get('precision')}. Ürün slider'ı bunu canlı yapar."
+                  if lang == "tr" else
+                  f"The threshold is a BUSINESS DECISION: F1 is nearly constant across this band, but "
+                  f"the recall↔precision trade-off shifts. High-recall end (threshold {hr['threshold']}): "
+                  f"recall {hr['recall']}, precision {hr['precision']}. High-precision end "
+                  f"(threshold {hp['threshold']}): recall {hp['recall']}, precision {hp['precision']}. "
+                  f"Chosen (threshold {ch.get('threshold')}): recall {ch.get('recall')}, "
+                  f"precision {ch.get('precision')}. The product slider does this live."),
+            reference=("Aralık katman-dışı (OOF) eğriden seçildi · değerler test setinde ölçüldü."
+                       if lang == "tr" else
+                       "Band selected on the out-of-fold (OOF) curve · values measured on the test set."),
+        ))
+
+    # ── #9 TOP-DECILE LIFT: eşikten bağımsız iş metriği (baseline + tavan zorunlu) ──
+    tdl = ev_report.get("top_decile_lift") or {}
+    if tdl.get("lift") is not None and tdl.get("total_positives"):
+        pct = round(tdl["capture"] * 100, 1)
+        evidence.append(Evidence(
+            label=("En riskli %10'un yakalama gücü (top-decile lift)" if lang == "tr"
+                   else "Catching power of the riskiest 10% (top-decile lift)"),
+            value=tdl["lift"], provenance="test_set", sample_size=tdl.get("n_top"),
+            note=(f"En riskli %10'u alırsanız gerçek pozitiflerin %{pct}'ini yakalarsınız "
+                  f"({tdl['positives_in_top']}/{tdl['total_positives']}). EŞİKTEN BAĞIMSIZ — "
+                  f"sıralama kalitesi, kesme noktası değişse de sabit (bir avantaj)."
+                  if lang == "tr" else
+                  f"Taking the riskiest 10% catches {pct}% of the true positives "
+                  f"({tdl['positives_in_top']}/{tdl['total_positives']}). THRESHOLD-INDEPENDENT — "
+                  f"a ranking quality; unchanged if the cutoff moves (an advantage)."),
+            reference=(f"Baseline (rastgele) 1.0× · tavan (mükemmel sıralama) {_fmt_value(tdl.get('ceiling'))}×. "
+                       f"Referanssız lift anlamsız."
+                       if lang == "tr" else
+                       f"Baseline (random) 1.0× · ceiling (perfect ranking) {_fmt_value(tdl.get('ceiling'))}×. "
+                       f"Lift is meaningless without these."),
+        ))
+
     section = ReportSection(
         id="performance", title=title, order=ORDER_PERFORMANCE,
         evidence=evidence, status="ok",
         table=_confusion_table(cm, lang) if cm_ok else None,
     )
 
-    per_class = ev_report.get("per_class_metrics") or {}
+    # D3: "en riskli %10 kimi yakalıyor" (lift) → "peki KİM bu %10" — doğal akış, lift'in ardına.
+    _ac = _action_concentration_subsection(ev_report, lang)
+    if _ac:
+        section.subsections.append(_ac)
+
+    # #8 SINIF DENGESİZLİĞİNİN ADI KONUR — headline (digest'e girer, tüm metrikleri çerçeveler).
+    # Kademe (balanced/imbalanced/severe) üniform-pay türevli eşikten (evaluator). Dağılım HER
+    # ZAMAN yazılır; "dengesiz" nitelemesi + uyarı yalnız eşik altında (flag'i sonuçtan ayır).
+    if cb.get("distribution"):
+        _dist = " / ".join(
+            (f"%{round(r*100, 2):g} {disp.get(str(lab), str(lab))}" if lang == "tr"
+             else f"{round(r*100, 2):g}% {disp.get(str(lab), str(lab))}")
+            for lab, r in sorted(cb["distribution"].items(), key=lambda kv: -kv[1]))
+        _lvl = cb.get("level", "balanced")
+        if _lvl == "severe":
+            section.headline = (
+                f"Sınıf dengesi: {_dist} — CİDDİ DENGESİZ. Bu rejimde ROC-AUC yanıltıcıdır; "
+                f"PR-AUC birincil metriktir, doğruluk taban çizgisine kıyasla okunmalıdır."
+                if lang == "tr" else
+                f"Class balance: {_dist} — SEVERELY IMBALANCED. ROC-AUC is misleading in this "
+                f"regime; PR-AUC is the primary metric, and accuracy must be read against its baseline.")
+        elif _lvl == "imbalanced":
+            section.headline = (
+                f"Sınıf dengesi: {_dist} — DENGESİZ. Tüm metrikler bu ışıkta okunmalı; toplam "
+                f"skorlar azınlık/ilgi sınıfının recall'ını gizler (aşağıda ayrı verildi)."
+                if lang == "tr" else
+                f"Class balance: {_dist} — IMBALANCED. Read all metrics in this light; overall "
+                f"scores hide the minority/interest class's recall (given separately below).")
+        else:
+            section.headline = (f"Sınıf dengesi: {_dist} — dengeli." if lang == "tr"
+                                else f"Class balance: {_dist} — balanced.")
     if per_class and cm_ok:
         section.subsections.append(ReportSection(
             id="performance_per_class",
@@ -1153,15 +1459,19 @@ def build_performance_section(state: dict, lang: str = "tr") -> ReportSection:
             headline=(f"{len(all_scores)} model denendi; en yüksek skoru alan seçildi."
                       if lang == "tr" else
                       f"{len(all_scores)} models were tried; the highest scoring one was chosen."),
+            # Faz 3 #3: her satırda tekrar eden aynı not → BİR KEZ, listenin başında.
+            explanation=("Aşağıdaki sayılar çapraz doğrulama skorlarıdır — modeller birbiriyle "
+                         "tam bu skora göre karşılaştırıldı ve seçim bu sayıya dayanır."
+                         if lang == "tr" else
+                         "The numbers below are cross-validation scores — models were compared on "
+                         "exactly this, and the choice rests on this number."),
             evidence=[
+                # Faz 3 #4 İSTİSNASI: burada 3. ve 4. hane iki modeli AYIRIR (0.8581 vs
+                # 0.8569); değer 4-haneli STRING olarak verilir → genel 3-hane kuralına
+                # tabi olmaz (_fmt_value str dalını aynen basar). Bölüm-tipine özel, dinamik.
                 Evidence(
-                    label=(f"{name}{' ← seçilen' if name == chosen else ''}"),
-                    value=score, provenance="cv",
-                    note=("Çapraz doğrulama skoru — modeller birbiriyle bu skora göre "
-                          "karşılaştırıldı, seçim bu sayıya dayanır."
-                          if lang == "tr" else
-                          "Cross-validation score — models were compared on this, and the "
-                          "choice rests on this number."),
+                    label=(f"{name}{(' ← seçilen' if lang == 'tr' else ' ← selected') if name == chosen else ''}"),
+                    value=f"{float(score):.4f}", provenance="cv",
                 )
                 for name, score in sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
             ],
@@ -1227,6 +1537,19 @@ _SPECULATION_PATTERNS = [
     r"\bthis\s+is\s+why\b",
 ]
 
+# Faz 3 #7 — VERİ/MODEL'i niteleyen editoryal fluff. KÖR TEK-KELİME DEĞİL, İSİM
+# TAMLAMASI (sıfat + veri/model/analiz kelimesi): "robust standard errors" (meşru
+# istatistik terimi) veya "comprehensive scan" (leakage bölümünün 'üç bağımsız
+# kontrol' kullanımı) YANLIŞLIKLA yakalanmasın diye. Yalnız boş övgü kalıbı hedeflenir.
+_EDITORIAL_FLUFF_PATTERNS = [
+    r"\b(?:robust|comprehensive|rich|clean|high[-\s]quality|solid|powerful|excellent)\s+"
+    r"(?:data\s?set|data|model|analysis|pipeline|feature\s+set)\b",
+    r"\b(?:sağlam|kapsamlı|zengin|temiz|yüksek\s+kaliteli|güçlü|mükemmel)\s+"
+    r"(?:veri\s*seti|veri|model|analiz(?:i|imiz)?|boru\s+hattı)\b",
+    # modeli niteleyen pazarlama dili — bu raporlarda kanıta dayalı meşru kullanımı yok
+    r"\bstate[-\s]of[-\s]the[-\s]art\b", r"\bcutting[-\s]edge\b", r"\bson\s+teknoloji\b",
+]
+
 
 # OLUMSUZLAMA PENCERESİ — yanlış alarm koruması.
 # "hataların NEDENLERİNİ AÇIKLAMAMAKTADIR" cümlesi tam da İSTEDİĞİMİZ çerçevedir,
@@ -1289,6 +1612,13 @@ def detect_speculation(text: str) -> list[str]:
         always = pat in _ALWAYS_SPECULATIVE
         for m in re.finditer(pat, text or "", flags=re.IGNORECASE):
             if not always and _is_negated(text, m.start(), m.end()):
+                continue
+            hits.append(m.group())
+    # Faz 3 #7: veri/model'i niteleyen editoryal fluff. Olumsuzlanmışsa ("sağlam
+    # DEĞİL") gerçek bir eleştiridir → temiz sayılır, aynı pencere korumasıyla.
+    for pat in _EDITORIAL_FLUFF_PATTERNS:
+        for m in re.finditer(pat, text or "", flags=re.IGNORECASE):
+            if _is_negated(text, m.start(), m.end()):
                 continue
             hits.append(m.group())
     return hits
@@ -1376,8 +1706,8 @@ def build_features_section(state: dict, lang: str = "tr") -> ReportSection:
     def _shap_ev() -> list[Evidence]:
         return [
             Evidence(
-                label=(f"{humanize_feature(feat, lang)} — tahmine katkı payı"
-                       if lang == "tr" else f"{humanize_feature(feat, lang)} — contribution share"),
+                label=(f"{_hf(feat, lang, state)} — tahmine katkı payı"
+                       if lang == "tr" else f"{_hf(feat, lang, state)} — contribution share"),
                 value=pct, provenance="test_set", sample_size=shap.get("n_samples_used"),
                 note=(f"Modelin kararına %{pct} katkı. {shap_note} {stamp}"
                       if lang == "tr" else f"{pct}% of the model's decision. {shap_note} {stamp}"),
@@ -1388,8 +1718,8 @@ def build_features_section(state: dict, lang: str = "tr") -> ReportSection:
     def _fi_ev() -> list[Evidence]:
         return [
             Evidence(
-                label=(f"{humanize_feature(feat, lang)} — modelin iç ağırlığı"
-                       if lang == "tr" else f"{humanize_feature(feat, lang)} — internal weight"),
+                label=(f"{_hf(feat, lang, state)} — modelin iç ağırlığı"
+                       if lang == "tr" else f"{_hf(feat, lang, state)} — internal weight"),
                 value=pct, provenance="model_internal",
                 note=f"%{pct}. {fi_note} {stamp}" if lang == "tr" else f"{pct}%. {fi_note} {stamp}",
             )
@@ -1448,15 +1778,34 @@ _LEAKAGE_TITLE = {"tr": "Sızıntı ve Riskler", "en": "Leakage & Risks"}
 
 # Üç DEDEKTÖR, üç FARKLI yöntem. Karıştırılırsa okuyucu "aynı şey üç kez mi
 # söyleniyor" sanır. Her biri kalem bazında ayrı alt bölüm + kendi yöntem etiketi.
+# Not: sabit "üç" cümlesi KALDIRILDI. Koşan dedektör sayısı tek kaynaktan (ran_detectors)
+# üretilir → intro sayısı ile gövdedeki alt bölüm sayısı YAPISAL olarak ayrışamaz (bkz.
+# build_leakage_section: _checks_phrase + _LEAKAGE_DETECTOR_NAMES).
 _LEAKAGE_INTRO = {
     "tr": ("Veri sızıntısı: modelin, gerçekte tahmin anında elde OLMAYACAK bir bilgiye "
-           "yaslanması. Sızıntılı bir model testte parlak görünür ama sahada çöker. "
-           "Üç bağımsız kontrol yapıldı; her biri farklı bir açıdan bakar."),
+           "yaslanması. Sızıntılı bir model testte parlak görünür ama sahada çöker."),
     "en": ("Data leakage: the model leaning on information that would NOT actually be "
            "available at prediction time. A leaky model looks brilliant in testing but "
-           "collapses in the field. Three independent checks were run, each from a "
-           "different angle."),
+           "collapses in the field."),
 }
+
+# Koşan sızıntı dedektörlerinin GÖRÜNEN adları — TEK KAYNAK. ran_detectors bu anahtarları
+# içerir; intro sayısı, "temiz" başlığındaki ad listesi ve gövdedeki alt bölümler hep buradan
+# türer. Yeni dedektör → buraya bir ad + ran_detectors'a bir anahtar + gövdeye render bloğu;
+# sayı her yerde kendiliğinden güncellenir (status rozeti dersi).
+_LEAKAGE_DETECTOR_NAMES = {
+    "domain":      {"tr": "anlam bazlı",  "en": "semantic"},
+    "target_lock": {"tr": "dilim kilidi", "en": "slice-lock"},
+    "importance":  {"tr": "baskınlık",    "en": "dominance"},
+}
+
+
+def _checks_phrase(n: int, lang: str) -> str:
+    """Koşan kontrol sayısını dilbilgisiyle üretir (intro sonu). Tek kaynak: n."""
+    if lang == "tr":
+        return f"{n} bağımsız kontrol yapıldı; her biri farklı bir açıdan bakar."
+    unit = "check was" if n == 1 else "checks were"
+    return f"{n} independent {unit} run, each from a different angle."
 
 # not: purity_gain'in DOĞRU okunuşu — Wilson düzeltmesi bu dedektörün eski sessiz
 # yanlış-alarmını kapatıyor. Ham oran değil, GENEL ORANIN ÜSTÜNE ne kadar EKLEDİĞİ.
@@ -1521,9 +1870,21 @@ def build_leakage_section(state: dict, lang: str = "tr") -> ReportSection:
 
     total_flags = len(domain_concerns) + len(target_lock) + len(suspects)
 
+    # TEK KAYNAK: hangi dedektörler FİİLEN koştu. intro sayısı, "temiz" başlığındaki ad
+    # listesi ve gövdedeki alt bölümler hep bu listeden türer → ayrışamazlar. domain bir
+    # dedektör; importance koştuysa target_lock + importance (iki ayrı yöntem) koşar.
+    ran_detectors: list[str] = []
+    if domain_ran:
+        ran_detectors.append("domain")
+    if importance_ran:
+        ran_detectors += ["target_lock", "importance"]
+    n_checks = len(ran_detectors)
+    ran_names = [_LEAKAGE_DETECTOR_NAMES[d][lang] for d in ran_detectors]
+
     section = ReportSection(
         id="leakage", title=title, order=ORDER_LEAKAGE_RISK, status="ok",
-        disclaimer="> " + _LEAKAGE_INTRO.get(lang, _LEAKAGE_INTRO["tr"]),
+        disclaimer=("> " + _LEAKAGE_INTRO.get(lang, _LEAKAGE_INTRO["tr"])
+                    + " " + _checks_phrase(n_checks, lang)),
     )
 
     # ── Alt bölüm 1: Domain (şema/anlam) ─────────────────────────────────────
@@ -1535,7 +1896,7 @@ def build_leakage_section(state: dict, lang: str = "tr") -> ReportSection:
                                       "low": "low suspicion"}
             ev = [
                 Evidence(
-                    label=(f"{humanize_feature(c.get('column_name', '?'), lang)} "
+                    label=(f"{_hf(c.get('column_name', '?'), lang, state)} "
                            f"({c.get('relationship_type', '')})"),
                     value=conf_label.get(c.get("confidence", "low"), c.get("confidence")),
                     provenance="schema_semantic",
@@ -1597,9 +1958,9 @@ def build_leakage_section(state: dict, lang: str = "tr") -> ReportSection:
                               f"In the '{c.get('bin')}' range the target's variation nearly "
                               f"collapses (purity {c.get('purity')}).")
                 ev.append(Evidence(
-                    label=(f"{humanize_feature(c.get('feature', '?'), lang)} — dilim kilidi"
+                    label=(f"{_hf(c.get('feature', '?'), lang, state)} — dilim kilidi"
                            if lang == "tr" else
-                           f"{humanize_feature(c.get('feature', '?'), lang)} — slice lock"),
+                           f"{_hf(c.get('feature', '?'), lang, state)} — slice lock"),
                     value=gain if gain is not None else c.get("purity"),
                     provenance="test_set",
                     sample_size=c.get("bin_size"),
@@ -1633,9 +1994,9 @@ def build_leakage_section(state: dict, lang: str = "tr") -> ReportSection:
                 else {"high": "high", "medium": "medium"}
             ev = [
                 Evidence(
-                    label=(f"{humanize_feature(s.get('column', '?'), lang)} — {sev_label.get(s.get('severity'), s.get('severity'))} şüphe"
+                    label=(f"{_hf(s.get('column', '?'), lang, state)} — {sev_label.get(s.get('severity'), s.get('severity'))} şüphe"
                            if lang == "tr" else
-                           f"{humanize_feature(s.get('column', '?'), lang)} — {sev_label.get(s.get('severity'), s.get('severity'))} suspicion"),
+                           f"{_hf(s.get('column', '?'), lang, state)} — {sev_label.get(s.get('severity'), s.get('severity'))} suspicion"),
                     value=None, provenance="model_internal", note=s.get("reason", ""),
                 )
                 for s in suspects
@@ -1656,30 +2017,43 @@ def build_leakage_section(state: dict, lang: str = "tr") -> ReportSection:
                     "may be a hidden copy of the target. Not a certainty, but worth a look."),
                 evidence=ev,
             ))
+        else:
+            # "koştu ama temiz" ≠ "hiç koşmadı" (bölüm ilkesi): baskınlık dedektörü de
+            # temizken AÇIKÇA görünür. Böylece gövdedeki alt bölüm sayısı = ran_detectors
+            # (intro sayısı) — yapısal olarak ayrışamazlar.
+            section.subsections.append(ReportSection(
+                id="leakage_importance", status="ok",
+                title=("Aşırı baskın alan kontrolü" if lang == "tr"
+                       else "Dominant-field check"),
+                headline=("Aşırı baskın alan kontrolü yapıldı; işaretlenen alan yok."
+                          if lang == "tr" else
+                          "The dominant-field check ran; no field was flagged."),
+                explanation=(
+                    "Tek bir alanın modelin neredeyse tamamını taşıması sızıntının klasik "
+                    "işaretidir; böyle bir alan bulunmadı."
+                    if lang == "tr" else
+                    "One field carrying almost the entire model is a classic leakage sign; "
+                    "no such field was found."),
+            ))
 
     # Üst başlık DETERMİNİSTİK: bu bölümün üst düzeyinde kendi kanıtı yok (kanıt alt
     # bölümlerde), yani LLM'e verilecek zemin yok. "Temiz" ile "işaret var" ayrımı
     # koddan yazılır — sessiz boşluk da, kanıtsız yorum da olmaz.
     if total_flags == 0:
-        ran_names = []
-        if domain_ran:
-            ran_names.append("anlam bazlı" if lang == "tr" else "semantic")
-        if importance_ran:
-            ran_names.append("dilim kilidi + baskınlık" if lang == "tr"
-                             else "slice-lock + dominance")
+        # ran_names/n_checks TEK KAYNAKTAN (yukarıdaki ran_detectors) — intro ile ayrışmaz.
         section.headline = (
-            f"Sızıntı belirtisi yok: yapılan {len(ran_names)} kontrolün "
+            f"Sızıntı belirtisi yok: yapılan {n_checks} kontrolün "
             f"({', '.join(ran_names)}) hiçbiri bir işaret bulmadı."
             if lang == "tr" else
-            f"No sign of leakage: none of the {len(ran_names)} checks "
+            f"No sign of leakage: none of the {n_checks} checks "
             f"({', '.join(ran_names)}) flagged anything.")
         section.explanation = (
-            "Bu, sızıntının kesin olmadığı anlamına gelmez — yalnızca bu üç yöntemin "
+            f"Bu, sızıntının kesin olmadığı anlamına gelmez — yalnızca bu {n_checks} yöntemin "
             "yakaladığı türden bir sızıntı görünmüyor. Yine de test skorları gerçekçi "
             "kabul edilebilir."
             if lang == "tr" else
             "This does not prove there is no leakage — only that no leakage of the kind "
-            "these three methods catch is visible. The test scores can be taken as realistic.")
+            f"these {n_checks} methods catch is visible. The test scores can be taken as realistic.")
     else:
         section.headline = (
             f"{total_flags} işaret bulundu — her biri aşağıda yöntemiyle birlikte."
@@ -1865,17 +2239,32 @@ def build_generalization_section(state: dict, lang: str = "tr") -> ReportSection
             label=("Yeni veriye genelleme (CV−Test farkı)" if lang == "tr"
                    else "Generalization to new data (CV−Test gap)"),
             value=gap, provenance="cv",
-            uncertainty=({"lower": ovf.get("ci_lower"), "upper": ovf.get("ci_upper"),
-                          "method": "bootstrap"}
-                         if ovf.get("ci_lower") is not None else None),
+            # uncertainty KASITLI None: ovf.ci_lower/upper TEST metriğinin bootstrap CI'ıdır
+            # (evaluator._analyze_overfitting'de inconclusive verdict'i için kullanılır) — GAP'in
+            # CI'ı DEĞİL. Onu buraya "%95 aralık" diye basmak yanlış-etiketti (aralık gap değerini
+            # içermiyordu bile). Test-ROC CI'ı zaten Model Performansı bölümünde doğru yerinde.
+            # TODO: gap'in KENDİ CI'ı paired bootstrap (CV-fold vs test yeniden örnekleme) ile
+            # hesaplanıp buraya eklenebilir; şimdilik yanlış CI göstermektense hiç gösterme.
+            uncertainty=None,
             note=note,
         ))
 
     if cal and cal.get("brier_score") is not None:
+        # #5 Brier baseline: taban-oranı tahmincisinin skoru (binary'de p(1-p)). Kazanım
+        # mütevazı olabilir (churn: baseline 0.1621 → model 0.1448) — gösterilmesi gereken tam bu.
+        brier_ref = ""
+        if cal.get("brier_baseline") is not None:
+            bb = cal["brier_baseline"]
+            brier_ref = (
+                f"Taban çizgisi {bb}: hep aynı taban oranını tahmin eden (hiçbir şey öğrenmeyen) "
+                f"model bu Brier'i alırdı. Model bunun ALTINA ne kadar inerse o kadar iyi."
+                if lang == "tr" else
+                f"Baseline {bb}: always predicting the same base rate (learning nothing) gives "
+                f"this Brier. The further BELOW it the model goes, the better.")
         evidence.append(Evidence(
             label=("Olasılık tahminlerinin gerçekçiliği (Brier)" if lang == "tr"
                    else "Realism of probability estimates (Brier)"),
-            value=cal.get("brier_score"), provenance="test_set",
+            value=cal.get("brier_score"), provenance="test_set", reference=brier_ref,
             note=("0'a yakın olması iyidir: modelin '%70 eminim' dediğinde gerçekten "
                   "%70 civarı haklı çıktığı anlamına gelir."
                   if lang == "tr" else
@@ -2072,6 +2461,7 @@ ABSOLUTE RULES
 - Evidence marked "reliable: false" (thin sample / wide interval) MUST NOT be used to draw a conclusion. Say the measurement is too thin instead.
 - Evidence with value null was NOT measured. Its note says why. Report it as not measured — never as zero, and never as good news.
 - Do NOT deliver a verdict the evidence does not contain. Do not label anything as "biased", "fair", "high bias", "discriminatory" or "production-ready". Present what was measured and let the reader judge.
+- Do NOT add flattering adjectives that qualify the DATA, MODEL or ANALYSIS unless that exact quality is in the evidence. Banned noun-phrases include "robust dataset", "comprehensive analysis", "rich/clean data", "powerful/state-of-the-art model" / "sağlam veri", "kapsamlı analiz", "zengin/temiz veri", "güçlü/mükemmel model". State what was measured; do not decorate it. (A statistical term like "robust standard errors" is fine — the ban is only the empty data/model compliment.)
 - Explain every technical term in one plain sentence the first time it appears.
 - NUMBER FORMATTING: each number in the evidence is already in its correct display form — rate metrics (accuracy, recall, precision, false-alarm/miss rate, selection/base rate) as percentages like "86,4%" / "%86,4"; scores (ROC-AUC, PR-AUC, MCC, correlations, Cohen's d, any "ratio"/DI) as plain decimals like "0.922". Reproduce each number in the SAME form shown. Never put % next to a plain 0-to-1 score, and never turn a shown percentage back into a raw decimal.
 - Write in {language}. Every word of both fields must be in {language}.
@@ -2094,7 +2484,7 @@ DATA-RELATIONSHIPS-SPECIFIC (if this is the "Veri İlişkileri" / "Data Relation
 - You MUST include one sentence stating plainly that these are relationships, not causes, and that an unmeasured common driver could explain them.
 - A strong relationship does NOT mean the field is important to the model, and a weak one does not mean it is useless. Do not rank "importance" here.
 
-ERROR-ANALYSIS-SPECIFIC (if this is the "Model Nerede Yanılıyor" / "Where the Model Gets It Wrong" section)
+ERROR-ANALYSIS-SPECIFIC (if this is the "Hata Analizi" / "Error Analysis" section)
 - This section reports WHERE errors concentrate. WHY the model errs was NOT measured and you have no evidence for it.
 - BANNED — never explain or guess a reason: "because", "the reason is", "probably", "likely due to", "this suggests that", "presumably" / "çünkü", "sebebi", "nedeni", "muhtemelen", "büyük ihtimalle", "görünüşe göre", "olduğu için". A sentence like "the model errs on older customers because it has too few of them" is a FAILED response — that explanation was never measured.
 - REQUIRED framing: state in which fields the wrong predictions differ from the correct ones and by how much, and say plainly that this shows where to look, not why the model is wrong.
@@ -2446,11 +2836,34 @@ def detect_fabrication(text: str, allowed: set[str]) -> list[str]:
     return hits
 
 
-def _build_digest(sections: list[ReportSection], lang: str) -> str:
+# #11(a): öneri digest'ine taşınan nedensellik damgası. error_analysis öneri girdisinde
+# KALIR (aksiyon alınabilir "nerede bakılmalı") ama LLM onu SEBEP diye kullanmasın diye
+# çerçeve digest'e de basılır — bölümün explanation'ı digest'e taşınmadığından (yalnız
+# headline+kanıt), damga aksi hâlde kaybolurdu.
+_DIGEST_CAUSAL_NOTE = {
+    "tr": "- ⚠️ Bu bölüm hatanın NEREDE olduğunu gösterir, NEDENİNİ değil — öneride 'sebep' olarak kullanma.",
+    "en": "- ⚠️ This section shows WHERE errors occur, not WHY — do not use it as a cause in a recommendation.",
+}
+
+
+def _build_digest(
+    sections: list[ReportSection],
+    lang: str,
+    *,
+    exclude_ids: frozenset = frozenset(),
+    causal_note_ids: frozenset = frozenset(),
+) -> str:
     """Kurulmuş bölümlerin özetini sentez LLM'ine verilecek metne çevirir.
 
     Her bölümün başlığı + kurulmuş kanıtın ana sayıları. Sentez SADECE bunu görür;
     ham state'i görmez, dolayısıyla üstte olmayan bir şeyi 'hatırlayamaz'.
+
+    exclude_ids: bu id'li bölümler (ve alt-bölümleri) digest'e HİÇ girmez. #11(a) için
+        öneriler hedefinde {"features"} — özellik önemi katkıyı ölçer, aksiyon değildir;
+        digest'te olması LLM'i "credit_score'u iyileştir" gibi aksiyonizasyona iter
+        (nedensel FİİL yok → regex kaçırır). Kaynağı kesmek tek yapısal çözüm.
+    causal_note_ids: bu bölümlerin başlığına _DIGEST_CAUSAL_NOTE eklenir (KALIR ama
+        "sebep değil" damgalı).
     """
     from src.core.report_schema import PROVENANCE_LABEL
     prov_map = PROVENANCE_LABEL.get(lang, PROVENANCE_LABEL["tr"])
@@ -2460,11 +2873,15 @@ def _build_digest(sections: list[ReportSection], lang: str) -> str:
     for sec in sections:
         if sec.raw_markdown is not None:
             continue
+        if sec.id in exclude_ids:
+            continue   # #11(a): hedefli dışlama (öneriler için importance) — alt-bölümler de gider
         title = sec.title or sec.id
         if sec.status in ("not_applicable", "not_computed"):
             lines.append(f"### {title}: {sec.not_computed_reason}")
             continue
         lines.append(f"### {title}")
+        if sec.id in causal_note_ids:
+            lines.append(_DIGEST_CAUSAL_NOTE.get(lang, _DIGEST_CAUSAL_NOTE["tr"]))
         if sec.headline:
             lines.append(f"- {sec.headline}")
         for e in sec.evidence[:8]:
@@ -2473,6 +2890,10 @@ def _build_digest(sections: list[ReportSection], lang: str) -> str:
             line = f"- {e.label}: {val} [{prov}]"
             if not e.reliable:
                 line += _thin
+            # BASELINE'lar reference'ta yaşıyor (accuracy/PR-AUC/Brier taban çizgisi). Digest'e
+            # taşınmazsa sentez "83.9% strong" der, taban çizgisini görmez → yanıltıcı özet.
+            if e.reference:
+                line += f"\n    baseline/ref: {e.reference}"
             lines.append(line)
         # Alt bölümler: başlık + headline + İLK BİRKAÇ kanıt satırı. Yalnız başlık
         # yetmiyordu — feature detayı (SHAP/ham-birim) subsection kanıtında yaşıyor;
@@ -2505,15 +2926,91 @@ def build_summary_section(state: dict, order: int = ORDER_SUMMARY) -> ReportSect
     )
 
 
+_RISK_NAME = {
+    "severe_imbalance":         {"tr": "Ciddi sınıf dengesizliği", "en": "Severe class imbalance"},
+    "minority_recall":          {"tr": "Azınlık sınıf yakalama", "en": "Minority-class recall"},
+    "confident_errors":         {"tr": "Emin-hatalar", "en": "Confident errors"},
+    "brier_vs_baseline":        {"tr": "Olasılık kalitesi (Brier)", "en": "Probability quality (Brier)"},
+    "overfitting":              {"tr": "Genelleme (CV−Test)", "en": "Generalization (CV−Test)"},
+    "leakage":                  {"tr": "Sızıntı işaretleri", "en": "Leakage flags"},
+    "near_duplicates":          {"tr": "Near-duplicate özellikler", "en": "Near-duplicate features"},
+    "normalization_collisions": {"tr": "Kolon adı çakışması", "en": "Column-name collision"},
+    "data_quality":             {"tr": "Veri kalitesi", "en": "Data quality"},
+    "fairness":                 {"tr": "Adalet (fairness)", "en": "Fairness"},
+    "action_concentration":     {"tr": "Aksiyon yoğunlaşması", "en": "Action concentration"},
+}
+_RISK_PROV = {"overfitting": "cv", "leakage": "model_internal",
+              "normalization_collisions": "schema_semantic"}
+
+
 def build_assessment_section(state: dict) -> ReportSection:
+    """Güçlü/Zayıf — ZAYIF taraf DETERMİNİSTİK risk listesinden (kod üretir, ölçmez, toplar).
+    LLM madde ekleyemez/çıkaramaz. "Temiz" ≠ "ölçülmedi": koşan/koşmayan kontroller ayrı."""
     lang = normalize_lang_local(state)
-    return ReportSection(
+    from src.services.risk_assessment import build_risk_list
+    rl = build_risk_list(state)
+    risks, clean, not_run = rl["risks"], rl["clean"], rl["not_run"]
+    sec = ReportSection(
         id="assessment", title=_ASSESSMENT_TITLE.get(lang, _ASSESSMENT_TITLE["tr"]),
         order=ORDER_ASSESSMENT, status="ok",
     )
 
+    def _nm(cid: str) -> str:
+        return _RISK_NAME.get(cid, {}).get(lang, cid)
+
+    if risks:
+        by_sev: dict = {}
+        for r in risks:
+            by_sev[r.severity] = by_sev.get(r.severity, 0) + 1
+        sev_txt = ", ".join(f"{n} {s}" for s, n in
+                            sorted(by_sev.items(), key=lambda kv: -{"info": 0, "warn": 1, "critical": 2}[kv[0]]))
+        sec.headline = (f"{len(risks)} risk/uyarı bulundu ({sev_txt}). Bunlar 'nereye bakılmalı' der."
+                        if lang == "tr" else
+                        f"{len(risks)} risks/warnings found ({sev_txt}). These say 'where to look'.")
+        for r in risks:
+            sec.evidence.append(Evidence(
+                label=f"[{r.severity}] {_nm(r.id)}", value=r.value,
+                provenance=_RISK_PROV.get(r.id, "test_set"),
+                note=r.detail.get(lang, r.detail.get("tr", "")),
+            ))
+        # Rule 3 (tam şeffaflık): risk VARKEN bile temiz koşan kontroller compact listelenir —
+        # "sadece bunlara baktık" izlenimi olmasın; her kontrolün koştuğu görünsün.
+        if clean:
+            names = ", ".join(_nm(c.id) for c in clean)
+            sec.evidence.append(Evidence(
+                label=(f"Ayrıca temiz koşan {len(clean)} kontrol" if lang == "tr"
+                       else f"{len(clean)} other checks ran clean"),
+                value=None, provenance="test_set",
+                note=(f"İşaret bulmayan kontroller: {names}." if lang == "tr"
+                      else f"Checks that flagged nothing: {names}."),
+            ))
+    else:
+        ran = ", ".join(_nm(c.id) for c in clean)
+        sec.headline = (f"{len(clean)} risk kontrolü koştu, hiçbiri işaret bulmadı: {ran}."
+                        if lang == "tr" else
+                        f"{len(clean)} risk checks ran, none flagged anything: {ran}.")
+
+    # Rule 3: KOŞMAYAN kontrol her zaman AÇIKÇA listelenir — "temiz" sayılmaz (sessiz boşluk yok).
+    for c in not_run:
+        sec.evidence.append(Evidence(
+            label=(f"[koşmadı] {_nm(c.id)}" if lang == "tr" else f"[not run] {_nm(c.id)}"),
+            value=None, provenance=_RISK_PROV.get(c.id, "test_set"),
+            note=c.not_run_reason.get(lang, c.not_run_reason.get("tr", "")),
+        ))
+    return sec
+
 
 def build_recommendations_section(state: dict) -> ReportSection:
+    # ÖNERİLER HENÜZ KANITA-ÇAPALI DEĞİL (assessment'ın aksine). Bölüm boş kurulur;
+    # prose'u build_synthesis_prose DIGEST'ten yazar. Nedensellik koruması İKİ katman:
+    #   1) detect_speculation (⊇ detect_causal_language), fail-closed (kalıcı ihlal → düşürülür);
+    #   2) #11(a): DIGEST'ten importance KESİLDİ → LLM'in causalize edeceği kaynak yok.
+    #
+    # TODO (#11-b, İLERİDE — kapatılmadı): TAM determinizm için öneriler serbest-sentez
+    # olmaktan çıkıp risk listesinden (build_risk_list) TÜRETİLMELİ — her öneri bir bulguya
+    # kod-tarafı çapalı, LLM yalnız anlatır (assessment/Grup B deseni). (a) kaynağı kesti ama
+    # öneriler hâlâ kendi kanıtını taşımıyor; bu yüzden regex son savunma hattı olmaya devam
+    # ediyor. "Neden öneriler assessment gibi kanıt-çapalı değil?" → burası cevabı.
     lang = normalize_lang_local(state)
     return ReportSection(
         id="recommendations", title=_RECS_TITLE.get(lang, _RECS_TITLE["tr"]),
@@ -2536,6 +3033,7 @@ ABSOLUTE RULES
 - Every word in {language}. Explain any technical term in one plain sentence.
 - Do NOT deliver a verdict the digest does not contain. NEVER call the model "reliable" / "trustworthy" / "production-ready" / "güvenilir" / "üretime hazır". A stable MEASUREMENT (a narrow gap/interval) is not the same as a reliable MODEL — if you mean the measurement is stable, say "kararlı" / "stable". Present what was found and let the reader judge.
 - Be honest and calibrated: reflect both strengths and limitations. Do not overstate.
+- Do NOT decorate the DATA, MODEL or ANALYSIS with empty compliments. Banned noun-phrases: "robust dataset", "comprehensive analysis", "rich/clean data", "powerful/state-of-the-art model" / "sağlam veri", "kapsamlı analiz", "zengin/temiz veri", "güçlü/mükemmel model". State findings; do not decorate them.
 - NUMBER FORMATTING: every number in the digest is ALREADY written in its correct display form. Rate metrics (accuracy, recall, precision, false-alarm/miss rate, selection/base rate) appear as percentages like "86,4%" / "%86,4"; scores (ROC-AUC, PR-AUC, MCC, correlations, Cohen's d, any "ratio"/DI) appear as plain decimals like "0.922". REPRODUCE EACH NUMBER IN THE SAME FORM THE DIGEST SHOWS. Never attach a % sign to a plain 0-to-1 score (never "%0.922" — that reads as 0.9 percent), and never turn a shown percentage back into a raw decimal.
 {section_specific}"""
 
@@ -2668,6 +3166,16 @@ _ASSESS_NO_RISK_LINE = {
     "tr": "**Zayıf yönler / riskler:** Bu çalışmada belirgin bir risk tespit edilmedi.",
     "en": "**Weaknesses / risks:** No significant risk was detected in this run.",
 }
+# Risk VARSA: zayıflık listesi DETERMİNİSTİK risk taramasından gelir. LLM bu maddeleri
+# anlatıya çevirir — EKLEYEMEZ/ÇIKARAMAZ (statü rozeti dersi). Sayılar zaten Evidence'ta.
+_ASSESS_RISK_ADDON = {
+    "tr": ("\n\n- ZORUNLU: Zayıf yön / risk listesi AŞAĞIDAKİ deterministik maddelerdir — "
+           "bunları anlatıya çevir, HİÇBİRİNİ ekleme, HİÇBİRİNİ çıkarma, yeni risk UYDURMA:\n{items}\n"
+           "Nedensellik dili KULLANMA ('neden' değil 'nereye bak'). Güçlü yönleri digest'ten yaz."),
+    "en": ("\n\n- MANDATORY: the weakness / risk list is EXACTLY the deterministic items below — "
+           "narrate them, ADD nothing, REMOVE nothing, INVENT no new risk:\n{items}\n"
+           "Use NO causal language ('where to look', not 'why'). Write strengths from the digest."),
+}
 
 
 def _assessment_no_genuine_risk(built_sections: list[ReportSection], state: dict) -> bool:
@@ -2728,14 +3236,31 @@ def build_synthesis_prose(
     from langchain_core.messages import HumanMessage, SystemMessage
 
     allowed = collect_allowed_numbers(built_sections)
-    digest = _build_digest(built_sections, lang)
+    # #11(a) HEDEFLİ DIŞLAMA: yalnız ÖNERİLER importance'ı görmez (aksiyonizasyon kaynağı).
+    # summary/assessment importance'ı görmeye devam eder ("en güçlü özellik" orada meşru
+    # bir güçlü-yön ve ikisinin de kendi causal guard'ı var). error_analysis öneri
+    # girdisinde KALIR ama nedensellik damgalı (aksiyon alınabilir "nerede bakılmalı").
+    if section.id == "recommendations":
+        digest = _build_digest(built_sections, lang,
+                               exclude_ids=frozenset({"features"}),
+                               causal_note_ids=frozenset({"error_analysis"}))
+    else:
+        digest = _build_digest(built_sections, lang)
     spec = _SYNTHESIS_SPECIFIC.get(section.id, {}).get(lang, "")
     # Güçlü/Zayıf: gerçek risk yoksa zayıflık satırını LLM'e bırakma — KOD basar
     # (LLM güçlü yönü tekrar etmeye meyilli; bkz. _assessment_no_genuine_risk).
     _no_risk_line = None
-    if section.id == "assessment" and _assessment_no_genuine_risk(built_sections, state):
-        _no_risk_line = _ASSESS_NO_RISK_LINE.get(lang, _ASSESS_NO_RISK_LINE["tr"])
-        spec = spec + _ASSESS_NO_RISK_ADDON.get(lang, _ASSESS_NO_RISK_ADDON["tr"])
+    if section.id == "assessment":
+        # Zayıf yön/risk = DETERMİNİSTİK risk listesi (kod üretir, LLM anlatır — ekleyemez).
+        from src.services.risk_assessment import build_risk_list
+        _rl = build_risk_list(state)
+        if _rl["risks"]:
+            _items = "\n".join(f"  - [{r.severity}] {r.detail.get(lang, r.detail.get('tr', ''))}"
+                               for r in _rl["risks"])
+            spec = spec + _ASSESS_RISK_ADDON.get(lang, _ASSESS_RISK_ADDON["tr"]).format(items=_items)
+        else:
+            _no_risk_line = _ASSESS_NO_RISK_LINE.get(lang, _ASSESS_NO_RISK_LINE["tr"])
+            spec = spec + _ASSESS_NO_RISK_ADDON.get(lang, _ASSESS_NO_RISK_ADDON["tr"])
     system = _SYNTHESIS_SYSTEM.format(language=LANGUAGE_NAME[lang], section_specific=spec)
     human = _SYNTHESIS_HUMAN.format(
         user_query=state.get("user_query", "—"), digest=digest, title=section.title)

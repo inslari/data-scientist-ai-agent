@@ -206,6 +206,39 @@ def test_di_dusukken_performans_farki_sifir_olabilir():
         "kusursuz modelde seçim farkının veriyle açıklanamayan kısmı SIFIR olmalı"
 
 
+def test_d2_ortusen_ci_fark_ayirt_edilemez_damgasi():
+    """D2: iki grubun CI'ları örtüşüyorsa fark 'ayırt edilemez' damgası taşır (SİLİNMEZ).
+
+    Küçük, neredeyse-aynı iki grup → farklar gürültü, Wilson aralıkları örtüşür.
+    Damga True olur ama ham fark değeri hâlâ dict'te durur (sessiz-sıfır yasağı).
+    """
+    rng = np.random.default_rng(0)
+    y_true = rng.integers(0, 2, 120)
+    y_pred = y_true.copy()
+    flip = rng.choice(120, 30, replace=False)          # her iki grupta benzer gürültü
+    y_pred[flip] = 1 - y_pred[flip]
+    seg = pd.DataFrame({"grp": ["A"] * 60 + ["B"] * 60})
+
+    out = analyze_fairness(y_true, y_pred, seg, _meta(["grp"]), "classification")
+    cmp = out["segments"]["grp"]["comparisons"]["groups"]["B"]
+    # Damga alanları MEVCUT ve örtüşen aralıkta True
+    assert cmp["fpr_diff_indistinguishable"] is True
+    assert cmp["disparate_impact_indistinguishable"] is True
+    # Ham fark SİLİNMEDİ — hâlâ bir sayı (veya tanımlı None), damga onu gizlemez
+    assert "fpr_diff" in cmp
+
+
+def test_d2_ayrik_ci_damga_basmaz():
+    """D2: aralıklar KESİN ayrıksa (gerçek fark) indistinguishable=False — damga yok."""
+    # A: %90 pozitif seçim, B: %10 — büyük, ayrık gruplar
+    y_true = np.array([1] * 100 + [0] * 100)
+    y_pred = np.array([1] * 90 + [0] * 10 + [1] * 10 + [0] * 90)
+    seg = pd.DataFrame({"grp": ["A"] * 100 + ["B"] * 100})
+    out = analyze_fairness(y_true, y_pred, seg, _meta(["grp"]), "classification")
+    cmp = out["segments"]["grp"]["comparisons"]["groups"]["B"]
+    assert cmp["disparate_impact_indistinguishable"] is False
+
+
 def test_model_kaynakli_secim_farki_ayirt_ediliyor():
     """Taban oranı AYNI ama model bir gruba daha az pozitif diyorsa → gap ≠ 0."""
     # İki grup da %50 pozitif; ama model B'de pozitiflerin yarısını kaçırıyor.

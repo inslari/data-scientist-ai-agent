@@ -331,15 +331,47 @@ LLM_SECTION_SCHEMA: dict = {
 # ── Markdown render ──────────────────────────────────────────────────────────
 
 def _fmt_value(v: Any) -> str:
+    """Sayıyı BÜYÜKLÜĞÜNE göre biçimler — kolon adı/veri seti yaması YOK, dinamik.
+
+    Faz 3 ondalık disiplini:
+      • |v| >= 1000  → binlik ayraç + 2 hane (para / hedef-birimli RMSE: 91,571.90)
+      • 1 <= |v| <1000 → 3 hane (skor/oran/Cohen's d), sondaki sıfırlar atılır
+      • |v| < 1       → 3 hane (0-1 skorları: 0.853)
+    NOT: Model-karşılaştırma bölümü 3. ve 4. hanenin karar değiştirdiği tek yerdir
+    (oof_blend 0.8581 vs stacking 0.8569); orası değeri ZATEN 4 haneli STRING olarak
+    verir → bu fonksiyon ona dokunmaz (str dalı aynen basar). Para tespiti (Evidence'a
+    'unit' alanı) ayrı iş; şimdilik büyüklük >= 1000 eşiği yeter.
+    """
     if v is None:
         return "—"
     if isinstance(v, bool):
         return "evet" if v else "hayır"
     if isinstance(v, float):
-        return f"{v:.4f}".rstrip("0").rstrip(".")
+        a = abs(v)
+        if a >= 1000:
+            return f"{v:,.2f}"
+        if a >= 1:
+            return f"{v:,.3f}".rstrip("0").rstrip(".")
+        return f"{v:.3f}".rstrip("0").rstrip(".")
     if isinstance(v, int):
         return f"{v:,}"
     return str(v)
+
+
+# GA yönteminin JARGON adı → düz-dil parantez glossu (Faz 3 #1). Terim SİLİNMEZ,
+# yanına bir cümle konur: okuyucu "(bootstrap)" görünce ne olduğunu bilmiyordu.
+_METHOD_GLOSS = {
+    "tr": {
+        "bootstrap": "bootstrap — aynı test verisi binlerce kez yeniden örneklenerek",
+        "wilson": "Wilson — küçük örneklemde daha dürüst aralık",
+        "fisher-z": "Fisher-z — korelasyonun çarpık dağılımı düzeltilerek",
+    },
+    "en": {
+        "bootstrap": "bootstrap — by resampling the same test set thousands of times",
+        "wilson": "Wilson — an honest interval on small samples",
+        "fisher-z": "Fisher-z — correcting the skewed spread of a correlation",
+    },
+}
 
 
 def render_evidence(ev: Evidence, lang: str = "tr") -> str:
@@ -355,10 +387,11 @@ def render_evidence(ev: Evidence, lang: str = "tr") -> str:
     if ev.uncertainty:
         lo, hi = ev.uncertainty.get("lower"), ev.uncertainty.get("upper")
         meth = ev.uncertainty.get("method", "")
+        meth_txt = _METHOD_GLOSS.get(lang, _METHOD_GLOSS["tr"]).get(meth, meth)
         if lo is not None and hi is not None:
             rng = f"[{_fmt_value(lo)} — {_fmt_value(hi)}]"
-            parts.append(f"%95 aralık {rng} ({meth})" if lang == "tr"
-                         else f"95% interval {rng} ({meth})")
+            parts.append(f"%95 aralık {rng} ({meth_txt})" if lang == "tr"
+                         else f"95% interval {rng} ({meth_txt})")
 
     line = " · ".join(parts)
 

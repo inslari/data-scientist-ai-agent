@@ -77,6 +77,19 @@ def wilson_interval(successes: int, n: int, z: float = 1.96) -> Optional[dict]:
     }
 
 
+def intervals_overlap(a: Optional[dict], b: Optional[dict]) -> Optional[bool]:
+    """İki Wilson aralığı örtüşüyor mu? (fark ayırt-edilebilirlik testi.)
+
+    Örtüşme → iki oran istatistiksel olarak ayırt EDİLEMEZ (aralarındaki fark
+    gürültüden farksız olabilir). Biri None ise karar VERİLEMEZ → None döner
+    (False değil: "aralık yok" ≠ "örtüşmüyor"). Çağıran yalnız ``is True``/``is False``
+    ile kesin durumlarda hareket etmeli.
+    """
+    if not a or not b:
+        return None
+    return a["lower"] <= b["upper"] and b["lower"] <= a["upper"]
+
+
 def _rate(mask: np.ndarray, condition: np.ndarray) -> tuple[Optional[float], int, int]:
     """(oran, pay, payda) — payda 0 ise oran None (0 DEĞİL; tanımsız ≠ sıfır)."""
     denom = int(mask.sum())
@@ -346,6 +359,15 @@ def _build_comparisons(groups: dict, task: str) -> dict:
                         or {"code": "fr_diff_undefined"}
                     )
 
+            # D2 — FARK CI-ÖRTÜŞME DAMGASI: iki grubun güven aralığı örtüşüyorsa
+            # aradaki fark istatistiksel olarak AYIRT EDİLEMEZ (gürültüden farksız).
+            # Ham fark SİLİNMEZ (sessiz-sıfır yasağı) — görünür kalır ama damga taşır;
+            # rapor bunu not olarak basar, risk-list bulgu SAYMAZ. (accuracy'nin CI'ı
+            # yok → damgalanmaz.)
+            for metric in ("fpr", "fnr"):
+                ov = intervals_overlap(m.get(f"{metric}_ci"), ref_m.get(f"{metric}_ci"))
+                cmp[f"{metric}_diff_indistinguishable"] = (ov is True)
+
             # Seçim oranı paritesi (DI) — HAM, eşiksiz.
             sel, ref_sel = m.get("selection_rate"), ref_m.get("selection_rate")
             if sel is not None and ref_sel is not None and ref_sel > 0:
@@ -356,6 +378,11 @@ def _build_comparisons(groups: dict, task: str) -> dict:
                     {"code": "fr_di_undef_zero"}
                     if ref_sel == 0 else {"code": "fr_di_undef_other"}
                 )
+            # DI için de CI-örtüşme damgası — seçim oranlarının aralıkları örtüşüyorsa
+            # DI≠1 gürültü olabilir; bulgu sayılmaması için işaretlenir (D2).
+            ov_sel = intervals_overlap(m.get("selection_rate_ci"),
+                                       ref_m.get("selection_rate_ci"))
+            cmp["disparate_impact_indistinguishable"] = (ov_sel is True)
 
             # Verinin kendisindeki taban oranı farkı — DI'yi yorumlamanın anahtarı.
             base, ref_base = m.get("base_rate"), ref_m.get("base_rate")

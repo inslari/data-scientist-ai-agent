@@ -133,6 +133,53 @@ def select_segment_columns(
     return selected, skipped
 
 
+def select_concentration_columns(
+    df: pd.DataFrame,
+    *,
+    exclude: Optional[set[str]] = None,
+) -> tuple[list[str], dict[str, str]]:
+    """D3 aksiyon-yoğunlaşması için aday kolonlar — DEMOGRAFİ-AGNOSTİK.
+
+    ``select_segment_columns``'ın kardinalite [2, max_card] + motor-türevi eleme
+    kurallarını YENİDEN KULLANIR ama ``_is_demographic`` filtresini KULLANMAZ.
+    Sebep: D3'ün sorusu adalet değil — "modelin aksiyon aldığı en riskli %10 tek
+    bir gruba mı yığılmış". Bunun için grup demografik olmak zorunda değil;
+    loan_grade bir kredi segmenti ama yığılma teşhisi için tamamen geçerli.
+
+    İKİ KAVRAM AYRI KALIR: fairness'ın ``select_segment_columns``'ı (demografik)
+    HİÇ değişmez; bu ayrı bir seçici, ayrı bir çıktı. Bir kolonun ikisinde birden
+    çıkması (churn'de country/gender) sorun değil — farklı sorular, ayrı raporlar.
+    """
+    excl = {c for c in (exclude or set()) if c}
+    max_card = settings.FAIRNESS_SEGMENT_MAX_CARDINALITY
+    selected: list[str] = []
+    skipped: dict[str, str] = {}
+
+    for col in df.columns:
+        if col in excl:
+            continue
+        if is_derived_feature(col):
+            continue   # motor türevi (ratio_*, is_zero_*, *_log) bir grup tanımı değildir
+        try:
+            nuniq = int(df[col].nunique(dropna=True))
+        except Exception as e:  # pragma: no cover - defensive
+            skipped[col] = {"code": "seg_skip_card_unreadable", "params": {"e": str(e)}}
+            continue
+        if nuniq < 2:
+            skipped[col] = {"code": "seg_skip_single_value"}
+            continue
+        if nuniq > max_card:
+            # Yüksek kardinaliteli SÜREKLİ sayısal (age, income, ID) grup değildir → sessiz.
+            # Yüksek kardinaliteli KATEGORİK gerçek aday ama binleme ayrı iş → sebebiyle görünür.
+            if pd.api.types.is_numeric_dtype(df[col]):
+                continue
+            skipped[col] = {"code": "seg_skip_high_card", "params": {"n": nuniq, "max": max_card}}
+            continue
+        selected.append(col)
+
+    return selected, skipped
+
+
 def build_raw_test_carrier(
     X_test_raw: pd.DataFrame,
     db_intelligence: dict,
