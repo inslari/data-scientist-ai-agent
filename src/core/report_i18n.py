@@ -447,6 +447,31 @@ _STRINGS: dict[str, dict[str, str]] = {
         "tr": "veri setinde düşük kardinaliteli kategorik kolon bulunamadı",
         "en": "no low-cardinality categorical column was found in the dataset",
     },
+    # ── aksiyon yoğunlaşması (D3) ──
+    "ac_no_columns": {
+        "tr": "yoğunlaşma için uygun (düşük kardinaliteli kategorik) kolon yok",
+        "en": "no suitable (low-cardinality categorical) column for concentration analysis",
+    },
+    "ac_no_probs": {
+        "tr": "olasılık üretilemedi — sıralamaya dayalı yoğunlaşma hesaplanamaz",
+        "en": "no probabilities were produced — ranking-based concentration cannot be computed",
+    },
+    "ac_misaligned": {
+        "tr": "ham taşıyıcı ({r} satır) tahminlerle ({p} satır) hizalanmıyor — yanlış gruba atıf yapmamak için analiz yapılmadı",
+        "en": "the raw carrier ({r} rows) does not align with the predictions ({p} rows) — analysis was skipped to avoid attributing to the wrong group",
+    },
+    "ac_thin_decile": {
+        "tr": "en riskli %10 çok ince (n={n} < {min}) — grup dağılımı gürültüden ayırt edilemezdi",
+        "en": "the riskiest 10% is too thin (n={n} < {min}) — the group split would be indistinguishable from noise",
+    },
+    "ac_thin_group": {
+        "tr": "grup örneklemi çok ince (n={n} < {min}) — bu grup için yoğunlaşma ölçülmedi",
+        "en": "group sample too thin (n={n} < {min}) — concentration was not measured for this group",
+    },
+    "ac_no_groups": {
+        "tr": "ölçüm için yeterli örnekleme sahip grup yok",
+        "en": "no group has a large enough sample to be measured",
+    },
     # ── evaluator: hata analizinde ham karşılık yok ──
     "raw_unavailable_derived": {
         "tr": "bu özellik modelleme sırasında türetildi (ham karşılığı yok) — değerler modelin çalıştığı ölçekte",

@@ -945,6 +945,10 @@ def _build_oof_blend_candidate(
         metric = lambda y, p: roc_auc_score(y, p, multi_class="ovr", average="weighted")
     w, blend_score = _optimize_blend_weights(oof_list, y_train, metric)
 
+    # Harmanlanmış OOF olasılığı (leakage-free) — EŞİK SEÇİMİNDE REUSE (yeniden CV yok,
+    # ek maliyet ~0). Yalnız binary'de anlamlı (oof_list elemanları 1D pozitif olasılık).
+    oof_blended = np.average(np.stack(oof_list, axis=0), axis=0, weights=w) if is_binary else None
+
     estimators = [
         (n, _wrap_with_smote(clone(models[n]), y_train) if is_imbalanced else clone(models[n]))
         for n in used
@@ -952,7 +956,73 @@ def _build_oof_blend_candidate(
     blend = WeightedProbaBlend(estimators=estimators, weights=w)
     logger.info(f"[automl] {'oof_blend':25s} ROC-AUC: {blend_score:.4f} "
           f"(agirliklar={dict(zip(used, np.round(w, 3).tolist()))})")
-    return blend, float(blend_score), w
+    return blend, float(blend_score), w, oof_blended
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# İLKE — "SEÇ train/OOF'ta, ÖLÇ test'te" (4. tekrar: winsor, impute, eşik, takas eğrisi).
+# Bir EŞİĞİ/SINIRI (threshold, winsor bound, impute değeri, düz-F1 aralığı) veriye
+# BAKARAK seçmek istatistik öğrenmektir → train/OOF'ta yapılır. O SABİT eşikte METRİK
+# ÖLÇMEK test'te yapılır. Test'te seçip test'te ölçmek sızıntıdır (metrik iyimser).
+# Yeni bir eşik/sınır eklerken bu ayrımı koru; alternatif eşikler provenance taşısın
+# (source: OOF eğrisi · ölçüm: test seti).
+# ─────────────────────────────────────────────────────────────────────────────
+def _oof_f1_range(y_true: np.ndarray, prob_pos: np.ndarray, tolerance: float = 0.01):
+    """OOF F1 eğrisinden SEÇİM (leakage-free): (seçilen F1-max eşiği, düz-aralığın
+    YÜKSEK-RECALL ucu = düşük eşik, YÜKSEK-PRECISION ucu = yüksek eşik, max_F1).
+    Düz aralık = F1 ≥ max_F1 − tolerance. precision_recall_curve: p/r uzunluğu
+    len(thresholds)+1 → f1[:-1] eşiklerle hizalı. ÖLÇÜM çağıranın işi (test)."""
+    precisions, recalls, thresholds = precision_recall_curve(y_true, prob_pos)
+    if len(thresholds) == 0:
+        return 0.5, 0.5, 0.5, 0.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f1 = 2 * precisions * recalls / (precisions + recalls + 1e-9)
+    f1t = f1[:-1]
+    best = int(np.argmax(f1t))
+    max_f1 = float(f1t[best])
+    chosen = float(thresholds[best])
+    flat = thresholds[f1t >= (max_f1 - tolerance)]
+    lo = float(np.min(flat))    # düşük eşik → daha çok pozitif → YÜKSEK RECALL ucu
+    hi = float(np.max(flat))    # yüksek eşik → YÜKSEK PRECISION ucu
+    return round(chosen, 4), round(lo, 4), round(hi, 4), round(max_f1, 4)
+
+
+def _select_oof_threshold(
+    selected_model, X_train, y_train, cv, is_binary, precomputed_oof=None,
+) -> tuple[float, dict]:
+    """Sınıflandırma eşiğini OOF (out-of-fold) olasılıklarından F1-max seçer — LEAKAGE-FREE.
+
+    NEDEN OOF, train-fit DEĞİL (winsor'dan farkı): eşik modelin OLASILIKLARINDAN türüyor;
+    train satırlarında model o satırları görmüş → olasılık dağılımı keskinleşmiş/kaymış,
+    train-fit eşik test dağılımına uymaz (sızıntıyı giderir ama yerine bias koyar). OOF
+    tahminleri bu problemi yaşamaz. Blend'de mevcut OOF REUSE; tek/stacking'de bir CV.
+
+    FALLBACK YAPISAL: OOF üretilemezse → 0.5 (dürüst varsayılan). Bu fonksiyon y_test'i
+    HİÇ ALMAZ → test-optimize sızıntısı YAPISAL olarak imkânsız (konvansiyona bağlı değil)."""
+    n = int(len(y_train))
+    if not is_binary:
+        return 0.5, {"value": 0.5, "source": "default_0.5", "reason": "multiclass", "n": n}
+    try:
+        if precomputed_oof is not None:
+            oof_pos = np.asarray(precomputed_oof)              # blend OOF reuse (ek maliyet ~0)
+        else:
+            oof = cross_val_predict(clone(selected_model), X_train, y_train, cv=cv,
+                                    method="predict_proba", n_jobs=-1)
+            oof_pos = oof[:, 1]
+        # Eşik + düz-F1 aralığı OOF eğrisinden SEÇİLİR (leakage-free). Aralık uçları
+        # (yüksek-recall / yüksek-precision) takas cümlesi için — ÖLÇÜM test'te (evaluator).
+        thr, flat_lo, flat_hi, max_f1 = _oof_f1_range(np.asarray(y_train), oof_pos)
+        logger.info(f"[automl] Eşik (OOF F1-max): {thr} (n={n}, "
+                    f"kaynak={'blend-oof-reuse' if precomputed_oof is not None else 'cv-oof'}, "
+                    f"düz-F1 aralığı=[{flat_lo}, {flat_hi}])")
+        return thr, {"value": thr, "source": "oof_cv_f1max", "n": n,
+                     "reused_blend_oof": precomputed_oof is not None,
+                     "flat_lo_thr": flat_lo, "flat_hi_thr": flat_hi,
+                     "flat_max_f1": max_f1, "flat_tolerance": 0.01}
+    except Exception as e:
+        logger.warning(f"[automl] OOF eşiği hesaplanamadi ({e}) → dürüst varsayilan 0.5 "
+                       f"(test-optimize ASLA)")
+        return 0.5, {"value": 0.5, "source": "default_0.5", "reason": str(e)[:120], "n": n}
 
 
 def _build_oof_blend_candidate_reg(
@@ -1117,7 +1187,7 @@ def _run_classification(
     if ensemble_score is not None:
         results["stacking_ensemble"] = {"score": ensemble_score, "std": 0.0, "time": 0.0}
 
-    blend_model, blend_score, blend_weights = _build_oof_blend_candidate(
+    blend_model, blend_score, blend_weights, blend_oof = _build_oof_blend_candidate(
         models, results, X_train, y_train, cv, is_binary, is_imbalanced
     )
     if blend_score is not None:
@@ -1153,6 +1223,14 @@ def _run_classification(
         # (varyans düşürme). SMOTE/Optuna sarmalı modeli olduğu gibi base alır.
         selected_model, seed_bagging_rounds = _maybe_seed_bag(selected_model, best_name, "classification")
 
+    # ── EŞİK: OOF F1-max (LEAKAGE-FREE, final fit ÖNCESİ, selected_model unfitted) ──
+    # Blend seçildiyse mevcut harmanlanmış OOF'u REUSE (yeniden CV yok); tek/stacking'de
+    # bir cross_val_predict. y_test HİÇ görülmez → test-optimize sızıntısı yapısal imkânsız.
+    optimal_threshold, threshold_provenance = _select_oof_threshold(
+        selected_model, X_train, y_train, cv, is_binary,
+        precomputed_oof=blend_oof if use_blend else None,
+    )
+
     # ── Final training (+ opsiyonel olasılık kalibrasyonu) ──
     # GradientBoosting+imbalanced sample_weight ile eğitilir; diğerlerinde SMOTE
     # pipeline veya class_weight zaten dengeyi sağlar.
@@ -1178,21 +1256,14 @@ def _run_classification(
     except Exception:
         y_pred = np.zeros(len(X_test)) # Fallback if predict fails
         
-    optimal_threshold = 0.5  # default
-
+    # optimal_threshold OOF'tan geldi (yukarıda, final fit öncesi). Test'ten HESAPLANMAZ —
+    # eski precision_recall_curve(y_test,...) sızıntısı KALDIRILDI. Test tahminleri OOF eşiğiyle.
     try:
         y_prob = best_model.predict_proba(X_test)
         if y_prob is not None and is_binary:
-            # F1-score maximize threshold
-            precisions, recalls, pr_thresholds = precision_recall_curve(y_test, y_prob[:, 1])
-            f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-9)
-            best_f1_idx = np.argmax(f1_scores)
-            optimal_threshold = float(pr_thresholds[best_f1_idx]) if best_f1_idx < len(pr_thresholds) else 0.5
-
-            y_pred = (y_prob[:, 1] >= optimal_threshold).astype(int)
-            logger.info(f"[automl] Optimal threshold (F1-max): {optimal_threshold:.4f}")
+            y_pred = (y_prob[:, 1] >= optimal_threshold).astype(int)   # OOF eşiği (leakage-free)
     except Exception as e:
-        logger.error(f"[automl] Threshold hesaplama hatası: {e}")
+        logger.error(f"[automl] predict_proba/eşik uygulama hatası: {e}")
 
     # Metrics
     metrics: dict[str, Any] = {
@@ -1213,6 +1284,7 @@ def _run_classification(
         "minority_ratio":      round(float(minority_ratio), 4),
         "smote_applied":       is_imbalanced,
         "optimal_threshold":   round(optimal_threshold, 4),
+        "threshold_provenance": threshold_provenance,   # değer + kaynak (oof_cv_f1max / default_0.5) + n
         "calibration_applied": calibration_applied,
         "ensemble_used":       use_ensemble,
         "ensemble_type":       "oof_blend" if use_blend else ("stacking" if use_stacking else None),

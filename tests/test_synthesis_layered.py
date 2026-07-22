@@ -204,16 +204,23 @@ def test_genelleme_yoksa_gorunur_sebep():
 # ═══ SENTEZ BÖLÜM İSKELETLERİ ════════════════════════════════════════════════
 
 def test_sentez_bolumleri_order_ve_kanitsiz():
-    """Sentezin kendi kanıtı YOK — headline/explanation sonradan LLM'den."""
+    """Özet/Öneriler'in kendi kanıtı YOK (headline/explanation sonradan LLM'den).
+    DEĞERLENDİRME (assessment) İSTİSNA: Faz 2 Grup B'de zayıf yön/risk listesi
+    DETERMİNİSTİK kanıt olarak taşınıyor (kod üretir, LLM anlatır) — koşmayan
+    kontroller (fairness vb.) rule 3 gereği not-run kanıtı olarak her zaman görünür."""
     su = build_summary_section({"report_language": "tr"})
     ass = build_assessment_section({"report_language": "tr"})
     rec = build_recommendations_section({"report_language": "tr"})
     assert su.order == ORDER_SUMMARY
     assert ass.order == ORDER_ASSESSMENT
     assert rec.order == ORDER_RECOMMENDATIONS
-    # kanıt yok, status ok (prose sonradan yazılır)
-    for s in (su, ass, rec):
+    # Özet + Öneriler: kanıtsız (saf sentez)
+    for s in (su, rec):
         assert s.evidence == [] and s.status == "ok"
+    # Assessment: deterministik risk listesi taşır (en azından fairness not-run) — kanıtsız DEĞİL
+    assert ass.status == "ok"
+    assert any("fairness" in str(e.label).lower() for e in ass.evidence), \
+        "assessment fairness not-run kanıtını taşımalı (rule 3)"
 
 
 def test_ozet_en_ustte_oneriler_sonda():
@@ -318,12 +325,18 @@ def test_oran_metrikleri_yuzde_skorlar_ondalik_digestte():
     assert "0.8385" not in digest, "oran prose'da ham ondalık GÖSTERİLMEMELİ"
 
 
-def test_kanit_katmani_kesin_deger_koruyor():
-    """Kanıt katmanı (render_evidence) DEĞİŞMEZ — kesin 0.8385 korunur, % değil."""
-    from src.core.report_schema import render_evidence
+def test_kanit_katmani_ondalik_gosterir_yuzde_degil():
+    """Kanıt katmanı (render_evidence) skoru ONDALIK gösterir, YÜZDE değil.
+
+    Faz 3 #4 ondalık disiplini: skorlar 3 haneye yuvarlanır (0.8385 → 0.838).
+    Bu, digest'in yüzde göstermesinden (test_..._digestte) ayrı bir katman —
+    kanıt hâlâ ondalık, yüzdeye çevrilmez. (Model-karşılaştırma bölümü 4 hane
+    tutar; o değeri STRING olarak verir, bu genel kurala girmez.)
+    """
+    from src.core.report_schema import render_evidence, _fmt_value
     line = render_evidence(Evidence(label="Doğruluk", value=0.8385, provenance="test_set"), "en")
-    assert "0.8385" in line, "kanıt katmanında kesin değer korunmalı"
-    assert "%" not in line and "83.9" not in line, "kanıt katmanı yüzdeye çevrilmemeli"
+    assert _fmt_value(0.8385) in line, "kanıt katmanı skoru ondalık (3 hane) göstermeli"
+    assert "%" not in line, "kanıt katmanı yüzdeye çevrilmemeli"
 
 
 def test_yuzde_formu_uydurma_sayilmaz():
