@@ -51,6 +51,7 @@ def _council_llm(temperature: float = 0):
         provider=settings.COUNCIL_PROVIDER,
         model_name=settings.COUNCIL_MODEL,
         temperature=temperature,
+        role="council",
     )
 
 

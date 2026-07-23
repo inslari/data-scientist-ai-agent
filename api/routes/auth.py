@@ -1,4 +1,4 @@
-import secrets
+import hmac
 import jwt
 from jwt.exceptions import InvalidTokenError
 from datetime import datetime, timedelta, timezone
@@ -11,11 +11,12 @@ from api.core.database import get_db
 from api.core.security import get_password_hash, verify_password, create_access_token, create_refresh_token, ACCESS_TOKEN_EXPIRE_MINUTES, SECRET_KEY, ALGORITHM
 from api.models.user import UserModel
 from api.models.token_blacklist import TokenBlacklistModel
-from api.schemas.auth import UserCreate, UserResponse, Token, ForgotPasswordRequest, ResetPasswordRequest, ResendVerificationRequest, RefreshTokenRequest, ChangePasswordRequest, UpdateProfileRequest, DeleteAccountRequest
+from api.models.password_reset_request import PendingPasswordResetModel
+from api.schemas.auth import UserCreate, UserResponse, Token, RefreshTokenRequest, ChangePasswordRequest, UpdateProfileRequest, DeleteAccountRequest, RequestPasswordResetRequest, AdminResetWithCodeRequest
 from api.core.deps import get_current_user, oauth2_scheme
 from api.core.disposable_emails import is_disposable_email
 from api.core.limiter import limiter
-from api.core.email import send_verification_email, send_reset_password_email
+from src.core.config import settings
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -36,66 +37,28 @@ def register(request: Request, user_in: UserCreate, db: Session = Depends(get_db
             detail="The user with this email already exists in the system.",
         )
     
-    # Generate verification token
-    verification_token = secrets.token_urlsafe(32)
-    
+    # Closed platform (no email): the very first registrant bootstraps as admin AND is
+    # auto-verified (no one exists yet to approve them). Everyone after registers
+    # unverified and must be approved by an admin in the panel before they can log in.
+    is_first_user = db.query(UserModel).count() == 0
+
     # Create new user
     user = UserModel(
         email=user_in.email,
         full_name=user_in.full_name,
         hashed_password=get_password_hash(user_in.password),
-        is_verified=False,
-        verification_token=verification_token,
-        verification_token_expires=datetime.now(timezone.utc) + timedelta(hours=24)
+        is_verified=is_first_user,
+        is_admin=is_first_user,
     )
     db.add(user)
     try:
         db.commit()
         db.refresh(user)
-        
-        # Send verification email asynchronously via background tasks or synchronously here
-        # For simplicity we'll do it synchronously here
-        send_verification_email(user.email, verification_token)
-        
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=400, detail="Database integrity error")
-    
+
     return user
-
-@router.post("/resend-verification")
-@limiter.limit("3/minute")
-def resend_verification(request: Request, data: ResendVerificationRequest, db: Session = Depends(get_db)):
-    user = db.query(UserModel).filter(UserModel.email == data.email).first()
-    if user and not user.is_verified:
-        verification_token = secrets.token_urlsafe(32)
-        user.verification_token = verification_token
-        user.verification_token_expires = datetime.now(timezone.utc) + timedelta(hours=24)
-        db.commit()
-        send_verification_email(user.email, verification_token)
-    return {"message": "If the email is registered and unverified, a new verification link has been sent."}
-
-@router.get("/verify-email")
-def verify_email(token: str, db: Session = Depends(get_db)):    
-    if not token:
-        raise HTTPException(status_code=400, detail="Token is required")
-        
-    user = db.query(UserModel).filter(UserModel.verification_token == token).first()
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid verification token")
-        
-    if user.verification_token_expires:
-        expires = user.verification_token_expires
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) > expires:
-            raise HTTPException(status_code=400, detail="Verification token has expired. Please request a new one.")
-        
-    user.is_verified = True
-    user.verification_token = None
-    db.commit()
-    
-    return {"message": "Email verified successfully"}
 
 @router.post("/login", response_model=Token)
 @limiter.limit("10/minute")
@@ -131,7 +94,7 @@ def login(request: Request, db: Session = Depends(get_db), form_data: OAuth2Pass
         raise HTTPException(status_code=400, detail="Inactive user")
         
     if not user.is_verified:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Email not verified. Please check your inbox.")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your account is pending admin approval.")
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -140,44 +103,61 @@ def login(request: Request, db: Session = Depends(get_db), form_data: OAuth2Pass
     refresh_token = create_refresh_token(data={"sub": str(user.id), "v": user.token_version})
     return {"access_token": access_token, "token_type": "bearer", "refresh_token": refresh_token}
 
-@router.post("/forgot-password")
+@router.post("/request-password-reset")
 @limiter.limit("5/minute")
-def forgot_password(request: Request, data: ForgotPasswordRequest, db: Session = Depends(get_db)):
+def request_password_reset(request: Request, data: RequestPasswordResetRequest, db: Session = Depends(get_db)):
+    """
+    Mail-free password reset (closed platform). The user submits their desired new
+    password; it is hashed immediately and held in ``pending_password_resets`` until
+    an admin approves it — the admin never sees the plaintext. One pending request per
+    user (a new one replaces the old). Always returns a generic success to avoid email
+    enumeration.
+    """
     user = db.query(UserModel).filter(UserModel.email == data.email).first()
     if user:
-        reset_token = secrets.token_urlsafe(32)
-        user.reset_password_token = reset_token
-        user.reset_password_expires = datetime.now(timezone.utc) + timedelta(hours=1)
+        pending = (
+            db.query(PendingPasswordResetModel)
+            .filter(PendingPasswordResetModel.user_id == user.id)
+            .first()
+        )
+        if pending is None:
+            pending = PendingPasswordResetModel(user_id=user.id, email=user.email)
+            db.add(pending)
+        pending.email = user.email
+        pending.hashed_new_password = get_password_hash(data.new_password)
+        pending.created_at = datetime.now(timezone.utc)
         db.commit()
-        send_reset_password_email(user.email, reset_token)
-    
-    # Always return success to prevent email enumeration
-    return {"message": "If that email is in our system, we have sent a password reset link."}
 
-@router.post("/reset-password")
+    return {"message": "If that email is registered, your request was submitted and awaits admin approval."}
+
+
+@router.post("/admin-reset-with-code")
 @limiter.limit("5/minute")
-def reset_password(request: Request, data: ResetPasswordRequest, db: Session = Depends(get_db)):
-    user = db.query(UserModel).filter(UserModel.reset_password_token == data.token).first()
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid or expired reset token.")
-        
-    # Check if token is expired (assuming reset_password_expires is a naive or aware datetime, let's compare properly)
-    if user.reset_password_expires:
-        # SQLite datetime might not have tzinfo, make it UTC if it doesn't
-        expires = user.reset_password_expires
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-            
-        if datetime.now(timezone.utc) > expires:
-            raise HTTPException(status_code=400, detail="Reset token has expired.")
-            
+def admin_reset_with_code(request: Request, data: AdminResetWithCodeRequest, db: Session = Depends(get_db)):
+    """
+    Break-glass reset for **admin accounts only**, using the setup-time
+    ``ADMIN_RESET_CODE``. Lets a locked-out admin recover without another admin to
+    approve them. Disabled (always fails) when the env code is unset. Generic error on
+    any failure to avoid leaking which condition failed.
+    """
+    generic_error = HTTPException(status_code=400, detail="Invalid reset code or account.")
+
+    configured = settings.ADMIN_RESET_CODE
+    # Constant-time compare; bail if break-glass isn't configured.
+    if not configured or not hmac.compare_digest(data.code, configured):
+        raise generic_error
+
+    user = db.query(UserModel).filter(UserModel.email == data.email).first()
+    if not user or not user.is_admin:
+        raise generic_error
+
     user.hashed_password = get_password_hash(data.new_password)
-    user.token_version += 1
-    user.reset_password_token = None
-    user.reset_password_expires = None
+    user.token_version += 1  # invalidate existing sessions
+    # Drop any pending self-service request now that the password is set directly.
+    db.query(PendingPasswordResetModel).filter(PendingPasswordResetModel.user_id == user.id).delete()
     db.commit()
-    
-    return {"message": "Password has been reset successfully."}
+
+    return {"message": "Admin password has been reset successfully."}
 
 @router.post("/refresh", response_model=Token)
 def refresh_token(data: RefreshTokenRequest, db: Session = Depends(get_db)):

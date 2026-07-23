@@ -156,7 +156,7 @@ def llm_route(
             human += f"\n\nDataset description (for context):\n{doc}"
 
         RouterDecision = _decision_model([e.key for e in experts])
-        llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
+        llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0, role="intelligence")
         decision = llm.with_structured_output(RouterDecision).invoke(
             [("system", system), ("human", human)]
         )

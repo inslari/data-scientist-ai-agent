@@ -11,6 +11,7 @@ class UserModel(Base):
     hashed_password = Column(String(255), nullable=False)
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
+    is_admin = Column(Boolean, default=False, nullable=False, server_default="0")
     verification_token = Column(String(255), nullable=True, index=True)
     verification_token_expires = Column(DateTime, nullable=True)
     reset_password_token = Column(String(255), nullable=True, index=True)

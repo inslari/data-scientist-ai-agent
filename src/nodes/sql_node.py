@@ -66,7 +66,7 @@ async def sql_node(state: AgentState, config: RunnableConfig) -> AgentState:
       4. LLM ile chart konfigürasyonu belirler
       5. State'e yazar
     """
-    llm        = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
+    llm        = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0, role="intelligence")
     user_query = state["user_query"]
     data_group_id = config.get("configurable", {}).get("data_group_id")
     if not data_group_id:

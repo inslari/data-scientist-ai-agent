@@ -234,7 +234,7 @@ class DatabaseIntelligenceEngine:
                      Defaults to settings.DEFAULT_LLM_PROVIDER.
         """
         if llm is None:
-            self.llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0, provider=provider)
+            self.llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0, provider=provider, role="intelligence")
         else:
             self.llm = llm
 

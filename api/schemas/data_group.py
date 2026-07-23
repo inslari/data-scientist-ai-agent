@@ -1,5 +1,5 @@
 from pydantic import BaseModel, ConfigDict
-from typing import Optional, List
+from typing import Optional, List, Union
 from api.schemas.mcp import MCPConfigResponse
 from api.schemas.csv import CSVFileResponse
 
@@ -29,6 +29,9 @@ class DataGroupResponse(DataGroupBase):
 
     # Data Visualization öneri kartları. None/[] = henüz üretilmedi → UI boş gösterir.
     viz_suggestions: Optional[List[dict]] = None
+
+    # Bu gruptaki grafiklerin varsayılan renk teması (tema id'si ya da özel palet).
+    viz_theme: Optional[Union[str, dict]] = None
 
     model_config = ConfigDict(from_attributes=True)
 

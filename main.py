@@ -12,6 +12,10 @@ from api.models.data_group_query import DataGroupQueryModel  # Must be imported 
 from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # Must be imported so the table is created
 from api.models.log_entry import LogEntryModel  # Must be imported so the app_logs table is created
 from api.models.llm_usage import LLMUsageModel  # Must be imported so the llm_usage table is created (C3)
+from api.models.ai_provider import AiProviderModel  # DB-managed LLM provider config tables
+from api.models.ai_model import AiModelModel
+from api.models.ai_role_assignment import AiRoleAssignmentModel
+from api.models.password_reset_request import PendingPasswordResetModel  # mail-free reset requests
 
 # Yapısal logging — süreç başında bir kez. API'de DB logging varsayılan kapalı
 # (LOG_DB_ENABLED=true ile açılabilir); tablo yine create_all ile oluşur.
@@ -24,11 +28,13 @@ Base.metadata.create_all(bind=engine)
 from api.routes.mcp import router as mcp_router
 from api.routes.csv import router as csv_router
 from api.routes.data_group import router as data_group_router
-from api.routes.data_viz import router as data_viz_router
+from api.routes.data_viz import router as data_viz_router, themes_router as viz_themes_router
 from api.routes.project import router as project_router
 from api.routes.auth import router as auth_router
 from api.routes.domain_pack import router as domain_pack_router
 from api.routes.data_group_query import router as data_group_query_router
+from api.routes.admin_ai import router as admin_ai_router
+from api.routes.admin_users import router as admin_users_router, reset_router as admin_password_resets_router
 
 from contextlib import asynccontextmanager
 import asyncio
@@ -75,12 +81,16 @@ app.add_middleware(SlowAPIMiddleware)
 
 app.include_router(data_group_router)
 app.include_router(data_viz_router)
+app.include_router(viz_themes_router)
 app.include_router(data_group_query_router)
 app.include_router(project_router)
 app.include_router(mcp_router)
 app.include_router(csv_router)
 app.include_router(auth_router)
 app.include_router(domain_pack_router)
+app.include_router(admin_ai_router)
+app.include_router(admin_users_router)
+app.include_router(admin_password_resets_router)
 
 
 @app.get("/health", tags=["System"])

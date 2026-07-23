@@ -10,6 +10,9 @@ load_dotenv(override=True)
 class Settings:
     # API & MCP Configuration
     API_BASE_URL: str = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+    # Break-glass admin password reset (closed platform, no email). Set at setup to a
+    # long random value; empty disables the /auth/admin-reset-with-code endpoint.
+    ADMIN_RESET_CODE: str = os.getenv("ADMIN_RESET_CODE", "")
     MCP_SERVER_HOST: str = os.getenv("MCP_SERVER_HOST", "127.0.0.1")
     MCP_SERVER_PORT: int = int(os.getenv("MCP_SERVER_PORT", "9001"))
     MCP_SERVER_PATH: str = os.getenv("MCP_SERVER_PATH", "/mcp")
@@ -110,6 +113,9 @@ class Settings:
     # truncated mid-object (→ JSONDecodeError). Bump both generously.
     OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
     OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "8192"))
+    # Ollama server endpoint. Default is the local daemon; a DB-configured provider
+    # can override this per-connection (get_llm threads base_url into ChatOllama).
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
     # Intelligence Engine schema-analysis cache (project bazlı, application DB'de).
     # analyze_schema çıktısı aynı şema için deterministik (temperature=0); cache

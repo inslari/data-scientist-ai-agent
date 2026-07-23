@@ -23,30 +23,40 @@ from src.core.llm import get_llm
 from src.core.logging_config import get_logger
 logger = get_logger(__name__)
 
-SUGGESTION_COUNT = 6
+SUGGESTION_COUNT = 8
 _MAX_SCHEMA_CHARS = 6000
-_VALID_CHART_TYPES = {"bar", "line", "pie", "scatter", "hist", "box", "heatmap", "grouped_bar"}
+_BUSINESS_CHART_TYPES = {"kpi", "bar", "hbar", "line", "trend", "pie", "donut",
+                         "stacked100", "funnel", "waterfall", "grouped_bar"}
+_STATISTICAL_CHART_TYPES = {"scatter", "hist", "box", "heatmap"}
+_VALID_CHART_TYPES = _BUSINESS_CHART_TYPES | _STATISTICAL_CHART_TYPES
 _VALID_AGGS = {"none", "sum", "mean", "count"}
 
 _SYSTEM_PROMPT = """You are a data-visualization analyst. You will be given a database/CSV schema.
 
 Your task: Produce {count} DIVERSE, concrete chart ideas a user could generate from this data.
 
+The reader is usually NON-TECHNICAL, so most ideas should be business forms:
+kpi | bar | hbar | line | trend | pie | donut | stacked100 | funnel | waterfall | grouped_bar.
+Include at most 2 statistical ideas (scatter | hist | box | heatmap), and only where the
+question genuinely is about distribution, spread, outliers or correlation.
+
 Rules:
 - Base every idea on tables/columns that ACTUALLY exist in the schema; never invent column names.
-- Diversity: cover different chart types (bar, line, pie, scatter, hist, box, grouped_bar) and
-  different columns. Prefer charts that reveal something useful (distributions, comparisons, trends, breakdowns).
+- Diversity: cover different chart types and different columns. Prefer charts that reveal
+  something useful (headline totals, comparisons, trends, breakdowns).
+- Titles read like a sentence a person would say ("Bölgelere göre toplam gelir"), never a raw
+  column expression ("avg_balance by geography").
 - Each idea has:
     - "title": a short chart title (<= 8 words)
     - "description": one clear sentence on what it shows
-    - "chart_type": one of bar | line | pie | scatter | hist | box | heatmap | grouped_bar
+    - "chart_type": one of the types listed above
     - "x": the category/axis/label column name (exactly as in schema)
     - "y": the numeric value column name, or null (e.g. for hist)
     - "agg": one of none | sum | mean | count
 - Return ONLY a JSON array of {count} objects. No prose, no markdown.
 
 Example:
-[{{"title":"Revenue by region","description":"Total revenue for each region.","chart_type":"bar","x":"region","y":"revenue","agg":"sum"}}]
+[{{"title":"Bölgelere göre toplam gelir","description":"Her bölgenin toplam geliri.","chart_type":"bar","x":"region","y":"revenue","agg":"sum"}}]
 """
 
 

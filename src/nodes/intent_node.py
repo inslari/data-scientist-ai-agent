@@ -58,7 +58,7 @@ def intent_node(state: AgentState) -> AgentState:
             "current_step": "intent_node",
         }
 
-    llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
+    llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0, role="intelligence")
 
     INTENT_PROMPT = create_chat_prompt(
         "intent_discovery.md", "Kullanıcı sorusu: {user_query}\n\n{domain_context}"

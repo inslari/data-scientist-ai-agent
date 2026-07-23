@@ -12,7 +12,7 @@ def planner_node(state: AgentState) -> AgentState:
     """
     Node 3: Takes the database intelligence and user query as input and produces an analysis plan.
     """
-    llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0)
+    llm = get_llm(model_name=settings.INTELLIGENCE_ENGINE_MODEL, temperature=0, role="intelligence")
 
     db_intelligence = state.get("db_intelligence", {})
     intent = state.get("intent", "eda")

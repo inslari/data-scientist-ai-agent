@@ -30,6 +30,7 @@ def check_table(table_name):
 existing_cols = check_table("projects")
 data_group_cols = check_table("data_groups")
 job_cols = check_table("background_jobs")
+user_cols = check_table("users")
 
 with engine.connect() as conn:
     if "query" not in existing_cols:
@@ -84,12 +85,33 @@ with engine.connect() as conn:
         print("Adding 'viz_suggestions' column to 'data_groups'...")
         conn.execute(text("ALTER TABLE data_groups ADD COLUMN viz_suggestions JSON"))
 
+    # Grubun varsayılan grafik renk teması (src/services/viz_themes.py)
+    if "viz_theme" not in data_group_cols:
+        print("Adding 'viz_theme' column to 'data_groups'...")
+        conn.execute(text("ALTER TABLE data_groups ADD COLUMN viz_theme JSON"))
+
     # Rapor dili — run anında UI'dan job'a yazılır (tr|en)
     if "language" not in job_cols:
         print("Adding 'language' column to 'background_jobs'...")
         conn.execute(text("ALTER TABLE background_jobs ADD COLUMN language VARCHAR"))
 
+    # Admin rolü — DB-managed LLM provider ayarları admin ile korunuyor.
+    if "is_admin" not in user_cols:
+        print("Adding 'is_admin' column to 'users'...")
+        conn.execute(text("ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE NOT NULL"))
+
     conn.commit()
+
+# Mevcut kurulumlarda henüz admin yoksa en eski kullanıcıyı admin yap (kapalı platform,
+# ilk kullanıcı = admin). Idempotent: zaten bir admin varsa dokunmaz.
+with engine.connect() as conn:
+    conn.execute(text(
+        "UPDATE users SET is_admin = TRUE "
+        "WHERE id = (SELECT MIN(id) FROM users) "
+        "AND NOT EXISTS (SELECT 1 FROM users WHERE is_admin = TRUE)"
+    ))
+    conn.commit()
+print("Admin promotion ensured (oldest user).")
 
 # Create data_group_queries table (raw SQL, idempotent)
 with engine.connect() as conn:
@@ -126,6 +148,30 @@ with engine.connect() as conn:
     """))
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_visualizations_data_group_id ON visualizations (data_group_id)"))
     conn.commit()
+
+# Grafik bazında tema override'ı (tablo daha önce oluşturulmuş olabilir)
+viz_cols = check_table("visualizations")
+with engine.connect() as conn:
+    if "theme" not in viz_cols:
+        print("Adding 'theme' column to 'visualizations'...")
+        conn.execute(text("ALTER TABLE visualizations ADD COLUMN theme JSON"))
+    # SQL sonucu — tablo görünümü + LLM'siz yeniden render için
+    if "data" not in viz_cols:
+        print("Adding 'data' column to 'visualizations'...")
+        conn.execute(text("ALTER TABLE visualizations ADD COLUMN data JSON"))
+    conn.commit()
+
+# Mod ayrımı kaldırıldı (tek akış); 'mode' kolonu artık okunmuyor/yazılmıyor ve her
+# satırda NULL. Ayrı bir bağlantıda ve toleranslı: eski SQLite DROP COLUMN desteklemez,
+# desteklemiyorsa ölü kolon zararsızca kalır.
+if "mode" in viz_cols:
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE visualizations DROP COLUMN mode"))
+            conn.commit()
+        print("Dropped unused 'mode' column from 'visualizations'.")
+    except Exception as e:
+        print(f"Could not drop 'mode' column (harmless, leaving it): {e}")
 print("Table 'visualizations' ensured.")
 
 print("Migration completed.")

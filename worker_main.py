@@ -16,6 +16,10 @@ from api.models.mcp import MCPConfigModel
 from api.models.db_intelligence_cache import DbIntelligenceCacheModel  # table auto-created via create_all
 from api.models.log_entry import LogEntryModel  # app_logs table — DB logging hedefi
 from api.models.llm_usage import LLMUsageModel  # llm_usage table — token/cost accounting (C3)
+from api.models.ai_provider import AiProviderModel  # ai_providers table — DB-managed LLM config
+from api.models.ai_model import AiModelModel  # ai_models table
+from api.models.ai_role_assignment import AiRoleAssignmentModel  # ai_role_assignments table
+from api.models.password_reset_request import PendingPasswordResetModel  # pending_password_resets table
 from api.core.worker import job_worker_loop, maintenance_loop
 
 def recover_interrupted_jobs():

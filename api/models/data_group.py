@@ -27,6 +27,10 @@ class DataGroupModel(Base):
     # NULL = henüz üretilmedi. list[dict]: {title, description, chart_type, x, y, agg}.
     viz_suggestions = Column(JSON, nullable=True)
 
+    # Bu veri grubunda üretilen grafiklerin varsayılan renk teması. Tema id'si ya da
+    # {"id": "custom", "colors": [...]} (src/services/viz_themes.py). NULL = katalog varsayılanı.
+    viz_theme = Column(JSON, nullable=True)
+
     # Domain (sector) pack for this dataset. Used by Talk-to-Data chat and as the
     # fallback for projects on this data group. NULL/empty = global DOMAIN_PACK.
     domain_pack = Column(String, nullable=True)
@@ -77,8 +81,12 @@ class VisualizationModel(Base):
 
     user_query = Column(String, nullable=True)     # serbest istek ya da seçilen kart başlığı
     spec = Column(JSON, nullable=True)              # _VizSpec.model_dump()
-    image_b64 = Column(Text, nullable=True)         # matplotlib PNG (base64)
-    chart = Column(JSON, nullable=True)             # recharts payload | None
+    image_b64 = Column(Text, nullable=True)         # matplotlib PNG (base64) — indirme için
+    chart = Column(JSON, nullable=True)             # tema-bağımsız frontend payload'ı | None
+    theme = Column(JSON, nullable=True)             # bu grafiğe özel tema (grup varsayılanını ezer)
+    # SQL sonucu {"columns","rows","truncated"} (viz_data.to_storable). Tablo görünümü ve
+    # spec/tema değişiminde PNG'yi LLM/SQL olmadan yeniden üretmek için saklanır.
+    data = Column(JSON, nullable=True)
     sql = Column(String, nullable=True)
     summary = Column(String, nullable=True)         # NL yorum
 

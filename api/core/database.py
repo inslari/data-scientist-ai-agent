@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 # .env dosyasını yükle.
@@ -45,6 +45,19 @@ _pool_kwargs = (
 )
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=_connect_args, **_pool_kwargs)
+
+# SQLite foreign key'leri VARSAYILAN OLARAK ZORLAMAZ. Bu, ondelete="CASCADE" /
+# "SET NULL" tanımlarını sqlite'ta sessizce etkisiz bırakır: passive_deletes=True olan
+# ilişkilerde (ör. ai_providers → ai_models) silme sonrası çocuk satırlar öksüz kalır ve
+# onlara işaret eden atamalar NULL'a düşmez. Postgres'te doğru, dev sqlite'ında yanlış
+# davranan bir ayrım — her bağlantıda PRAGMA açarak ikisini eşitliyoruz.
+if _is_sqlite:
+    @event.listens_for(engine, "connect")
+    def _sqlite_enable_foreign_keys(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

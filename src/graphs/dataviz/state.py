@@ -21,6 +21,15 @@ class VizState(TypedDict):
     # serbest doğal dil isteğinde None.
     selected_suggestion: Optional[dict]
 
+    # Mevcut bir grafiği doğal dille değiştirirken (refine) önceki spec/SQL bağlamı:
+    # {"spec", "sql", "original_request"}. Yeni grafik üretiminde None.
+    refine_context: Optional[dict]
+
+    # Renk teması: tema id'si ya da {"id": "custom", "colors": [...]} (viz_themes.resolve_theme)
+    viz_theme: Optional[dict]
+    # Sunucu PNG'sindeki sayı biçimlendirmesi için yerel ("tr" | "en")
+    locale: Optional[str]
+
     # Domain (Sector) Pack — Talk-to-Data ile aynı pluggable katman
     domain_pack: Optional[str]
     merchant_context: Optional[dict]
@@ -47,8 +56,9 @@ class VizState(TypedDict):
     validation_fix_hint: Optional[str]
 
     # Render node çıktısı (viz_render_node)
-    viz_image_b64: Optional[str]              # matplotlib PNG (base64)
-    viz_chart: Optional[dict]                 # recharts payload | None (hibrit)
+    viz_image_b64: Optional[str]              # matplotlib PNG (base64) — indirme/dışa aktarım
+    viz_chart: Optional[dict]                 # frontend'in çizdiği tema-bağımsız payload | None
+    viz_data: Optional[dict]                  # SQL sonucu {"columns","rows"} (viz_data.to_storable)
     viz_render_error: Optional[str]
 
     # Interpreter çıktısı
@@ -64,18 +74,40 @@ class VizState(TypedDict):
 
 # ─── Structured LLM output modelleri (talktodata deseni: _drop_extra validator) ──
 
-_CHART_TYPES = "bar | line | pie | scatter | hist | box | heatmap | grouped_bar"
+# Rapor (iş) grafikleri + analist (EDA) grafikleri
+_REPORT_TYPES  = "kpi | bar | hbar | line | trend | pie | donut | stacked100 | funnel | waterfall | grouped_bar"
+_ANALYST_TYPES = "scatter | hist | box | heatmap"
+_CHART_TYPES = f"{_REPORT_TYPES} | {_ANALYST_TYPES}"
 _AGGS = "none | sum | mean | count"
+_VALUE_FORMATS = "number | percent | currency | compact"
+
+_SPEC_FIELDS = {
+    "chart_type", "x", "y", "group", "agg", "title", "sql",
+    "subtitle", "x_label", "y_label", "value_format", "currency",
+    "sort", "top_n", "data_labels", "target", "compare_to",
+}
 
 
 class _VizSpec(BaseModel):
     chart_type: str = Field(description=f"One of: {_CHART_TYPES}")
     x: Optional[str] = Field(default=None, description="Column for the X axis / category / labels")
     y: Optional[str] = Field(default=None, description="Column for the Y axis / numeric value")
-    group: Optional[str] = Field(default=None, description="Optional column to group/hue by (grouped_bar)")
+    group: Optional[str] = Field(default=None, description="Optional column to group/hue by (grouped_bar, stacked100)")
     agg: str = Field(default="none", description=f"Aggregation to apply to y grouped by x: {_AGGS}")
-    title: str = Field(default="Visualization", description="Chart title")
+    title: str = Field(default="Visualization", description="Chart title, written as a plain sentence")
     sql: str = Field(description="A single SELECT query that returns exactly the columns needed to draw this chart")
+
+    # Sunum / okunabilirlik alanları (özellikle rapor modu)
+    subtitle: Optional[str] = Field(default=None, description="One short line of context under the title")
+    x_label: Optional[str] = Field(default=None, description="Human-readable X axis label (NOT the raw column name)")
+    y_label: Optional[str] = Field(default=None, description="Human-readable Y axis label (NOT the raw column name)")
+    value_format: str = Field(default="number", description=f"How to format values: {_VALUE_FORMATS}")
+    currency: Optional[str] = Field(default=None, description="Currency symbol/code when value_format=currency, e.g. ₺, $, EUR")
+    sort: str = Field(default="none", description="Sort categories by value: desc | asc | none")
+    top_n: Optional[int] = Field(default=None, description="Keep only the top N categories; the rest are merged into 'Other'")
+    data_labels: bool = Field(default=False, description="Draw the value on each mark")
+    target: Optional[float] = Field(default=None, description="Reference/target value drawn as a line (trend) or compared against (kpi)")
+    compare_to: Optional[str] = Field(default=None, description="Column holding the previous-period value, for the KPI delta badge")
 
     @model_validator(mode="before")
     @classmethod
@@ -83,8 +115,7 @@ class _VizSpec(BaseModel):
         if isinstance(values, dict):
             if "sql" not in values and "query" in values:
                 values["sql"] = values.pop("query")
-            allowed = {"chart_type", "x", "y", "group", "agg", "title", "sql"}
-            return {k: v for k, v in values.items() if k in allowed}
+            return {k: v for k, v in values.items() if k in _SPEC_FIELDS}
         return values
 
 

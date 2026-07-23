@@ -46,5 +46,15 @@ def get_current_user(
         
     if token_version is not None and user.token_version != token_version:
         raise credentials_exception
-        
+
     return user
+
+
+def get_current_admin(current_user: UserModel = Depends(get_current_user)) -> UserModel:
+    """Like get_current_user but rejects non-admins with 403. Gates admin-only routes."""
+    if not getattr(current_user, "is_admin", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required.",
+        )
+    return current_user
