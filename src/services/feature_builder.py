@@ -2033,6 +2033,83 @@ def _finalize_ratio_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return _apply_ratio_stats(df, _fit_ratio_stats(df, cols))
 
 
+def assemble_pipeline_ctx(
+    *, intent: str, modality: str, aggregated: bool, target_name: str,
+    drop_columns: list, ratio_feature_meta: dict, missing_indicator_meta: dict,
+    derived_flag_meta: dict, feature_plan: dict, encode_exclude: set,
+    outlier_cols, timeseries_lag, domain_feature_cols: list, date_feature_cols: list,
+    column_renames: list,
+) -> dict:
+    """Katman 1 BEYAN YÜZEYİ (T0) — orkestratörün ihtiyacı olan her şeyi TEK yerde beyan eder.
+
+    Üç tür bilgi taşır:
+      1. **Yapısal ön-koşullar** (``deduplicated``/``target_col``/``drop_columns``) —
+         ``check_structural_preconditions`` bunları fiili çerçeve üzerinde denetler.
+      2. **Donmuş seçimler** (ratio çiftleri, flag kolonları, zscore/normalize spec'leri,
+         exclude/outlier listeleri) — pre-split sabit kararlar; orkestratör yeniden TÜRETMEZ,
+         manifest'e ``frozen_choice`` olarak DONDURUR.
+      3. **Kapsam olguları** (modality/aggregated/ts-lag/domain/date/rename/unported_ops) —
+         ``check_pipeline_scope`` bunlara bakar.
+
+    MEKANİZMANIN KİLİT ÖZELLİĞİ: burada BEYAN EDİLMEYEN her olgu, orkestratörde "bilinmiyor"
+    sayılır ve artifact'i **``deployable=False``** yapar. Yani bu fonksiyona yeni bir olgu
+    eklemeyi unutmak "sessizce destekleniyor" sonucunu DOĞURAMAZ — en kötü ihtimalle artifact
+    deploy edilemez olur. Kapsam ancak bilinçli genişletilir (port → guard 0 → kural kaldır).
+
+    SAF fonksiyon: ``build_features``'ın hesapladığı değerleri alır, hiçbir şey hesaplamaz →
+    tek başına test edilebilir ve ``build_features``'tan bağımsız evrilir.
+    """
+    from src.services.inference.orchestrator import PORTED_FEATURE_OPS
+
+    derived = (feature_plan or {}).get("derived_features") or []
+
+    def _specs(op_name: str) -> list:
+        out = []
+        for s in derived:
+            op = s.get("op") if isinstance(s, dict) else getattr(s, "op", None)
+            if op != op_name:
+                continue
+            name = s.get("name") if isinstance(s, dict) else getattr(s, "name", None)
+            inputs = s.get("inputs") if isinstance(s, dict) else getattr(s, "inputs", None)
+            if name and inputs:
+                out.append([name, inputs[0]])
+        return out
+
+    ops_used = {(s.get("op") if isinstance(s, dict) else getattr(s, "op", None)) for s in derived}
+    unported_ops = sorted(o for o in ops_used if o and o not in PORTED_FEATURE_OPS)
+
+    return {
+        # ── 1. yapısal ön-koşullar ──────────────────────────────
+        # dedup: _clean_data split ÖNCESİ tüm df'te yapar. Konumu orkestratörde YENİDEN
+        # ÜRETİLEMEZ ("tüm df'i dedup'la sonra böl" ≠ "böl sonra train'i dedup'la") →
+        # karar kuralı gereği ADIM değil ÖN-KOŞUL olarak beyan edilir.
+        "deduplicated":   True,
+        "target_col":     target_name,
+        "drop_columns":   list(drop_columns),
+        # ── 2. donmuş seçimler (pre-split sabit kararlar) ───────
+        "ratio_pairs":    [[n, a, b] for n, (a, b) in (ratio_feature_meta or {}).items()],
+        "missing_indicator_cols": list((missing_indicator_meta or {}).values()),
+        "zero_flag_cols": list((derived_flag_meta or {}).values()),
+        "zscore_specs":   _specs("zscore"),
+        "normalize_specs": _specs("normalize"),
+        "encode_exclude": sorted(encode_exclude or set()),
+        "outlier_cols":   sorted(outlier_cols or []),
+        "intent":         intent,
+        # ── 3. kapsam olguları ─────────────────────────────────
+        # NORMALİZASYON (fail-open kapatma): build_features'ta boş modality "tabular"
+        # demektir (`if modality == "timeseries"` else tabular yol). Boş bırakılsaydı
+        # kapsam kuralı `bool(v)` üzerinden onu SESSİZCE geçerdi — beyan var ama değer
+        # yok = en kötü hâl. Burada niyet açıkça yazılır.
+        "modality":        (modality or "tabular"),
+        "aggregated":      bool(aggregated),
+        "timeseries_lag":  timeseries_lag,
+        "domain_features": list(domain_feature_cols or []),
+        "date_features":   list(date_feature_cols or []),
+        "column_renames":  list(column_renames or []),
+        "unported_ops":    unported_ops,
+    }
+
+
 def build_features(state: dict) -> dict:
     """
     Feature Engineering Service — BigData Edition
@@ -2088,8 +2165,13 @@ def build_features(state: dict) -> dict:
     # Multi-table join suffix'lerini temizle. Çarpışmalar (farklı-değerli iki kolonun
     # aynı normalize adına düşmesi) rapora taşınır → sessiz veri kaybı asla (Faz 0.5).
     all_tables = [t["table_name"] for t in db_intelligence.get("tables", [])]
+    _cols_before_norm = list(df.columns)          # Katman 1 beyani: yeniden-adlandirma oldu mu?
     df, normalization_collisions = _normalize_column_names(
         df, table_names=all_tables if all_tables else None)
+    # Katman 1 KAPSAM OLGUSU: _normalize_column_names portlanmadi → ad degistiyse
+    # orkestratorun ham ad → egitim adi eslemesi YOK; kapsam kapisi bunu reddeder.
+    column_renames = [[o, n] for o, n in zip(_cols_before_norm, list(df.columns)) if o != n] \
+        if len(_cols_before_norm) == len(df.columns) else [["<kolon-sayisi-degisti>", ""]]
     logger.info(f"[feature_eng] Normalizasyon sonrasi: {len(df.columns)} kolon")
 
     # Critic'ten gelen drop_features uygula
@@ -2128,6 +2210,13 @@ def build_features(state: dict) -> dict:
     # sinyalini koru. Row-wise → leakage yok, split'ten once guvenli. Eklenen kolonlar
     # auto_feature_cols'ta birikir; supervised yolda count/deviation ile genisler.
     auto_feature_cols: list[str] = _add_missing_indicators(df, exclude=leakage_exclude)
+    # Katman 1 (T0): FILTRELENMEMIS kayit — {uretilen: kaynak}. `auto_features` alani
+    # X_train'e gore filtreli yayinlanir (hayatta-kalan listesi) → orkestratorun donmus
+    # secim kaynagi olarak YETERSIZ; select_drop'un dusurdukleri kaybolur ve groupby'in
+    # secim yaptigi ara cerceve eski yoldan sapar. `ratio_feature_meta` dersinin tekrari.
+    # NOT: burada ad-cozumleme guvenli — suffix SABIT (`f"{c}_isna"`), ratio'nun
+    # `ratio_a_b` belirsizligi (hangi alt cizgi boluyor) yok.
+    missing_indicator_meta: dict[str, str] = {n: n[: -len("_isna")] for n in auto_feature_cols}
 
     # Temizlik
     df = _clean_data(df)
@@ -2183,6 +2272,7 @@ def build_features(state: dict) -> dict:
     if leaky_cols_high:
         logger.info(f"[feature_eng] High-confidence leaky kolonlar (türev üretilmeyecek): {leaky_cols_high}")
 
+    date_feature_cols: list[str] = []      # Katman 1 kapsam olgusu (asagida doldurulur)
     # Date feature extraction — leaky olan timestamp kolonları atlanır
     for col in meta.get_by_type("timestamp"):
         if col in df.columns:
@@ -2194,6 +2284,9 @@ def build_features(state: dict) -> dict:
                 df[f"{col}_year"]      = dt.dt.year
                 df[f"{col}_month"]     = dt.dt.month
                 df[f"{col}_dayofweek"] = dt.dt.dayofweek
+                # Katman 1 KAPSAM OLGUSU: timestamp turevleri portlanmadi → uretildilerse
+                # kapsam kapisi bu kosuyu reddeder (sessizce eksik artifact dogmasin).
+                date_feature_cols.extend([f"{col}_year", f"{col}_month", f"{col}_dayofweek"])
             except Exception:
                 pass
 
@@ -2290,6 +2383,11 @@ def build_features(state: dict) -> dict:
         df, original_cols, meta, intent, aggregated, leaky_cols_high)
     df, derived_flag_cols = _build_zero_missing_flags(
         df, original_cols, intent, aggregated, force_zero_cols=ratio_denom_zero_cols)
+    # Katman 1 (T0): FILTRELENMEMIS kayit — {uretilen: kaynak}. `derived_flags` alani
+    # X_train'e gore filtreli (hayatta-kalan) → frozen kaynagi olarak yetersiz (yukaridaki
+    # missing_indicator_meta ile ayni gerekce). Prefix SABIT → ad-cozumleme belirsiz degil.
+    derived_flag_meta: dict[str, str] = {
+        n: n[len("is_zero_"):] for n in derived_flag_cols if n.startswith("is_zero_")}
 
     # ── LEAKAGE-SAFE SIRA (GRANDMASTER DİSİPLİNİ) ────────────────
     # Encoder/scaler/feature-selection/sizinti tespiti İSTATİSTİK öğrenir (target
@@ -2303,6 +2401,18 @@ def build_features(state: dict) -> dict:
     if ts_lag_info:
         ts_protected_cols |= (set(ts_lag_info.get("lag_columns", []))
                               | set(ts_lag_info.get("rolling_columns", [])))
+
+    # Katman 1 BEYAN YÜZEYİ — BİR KEZ kurulur, iki tüketicisi var: gölge koşu (T1) ve
+    # feature_report["pipeline_ctx"]. Tek kaynak → ikisi sapamaz.
+    pipeline_ctx = assemble_pipeline_ctx(
+        intent=intent, modality=modality, aggregated=aggregated, target_name=target_name,
+        drop_columns=existing, ratio_feature_meta=ratio_feature_meta,
+        missing_indicator_meta=missing_indicator_meta, derived_flag_meta=derived_flag_meta,
+        feature_plan=feature_plan, encode_exclude=(disallowed | leakage_exclude),
+        outlier_cols=meta.get_outlier_cols(), timeseries_lag=ts_lag_info,
+        domain_feature_cols=domain_feature_cols, date_feature_cols=date_feature_cols,
+        column_renames=column_renames)
+    shadow_report: dict = {}             # T1 gölge koşu sonucu (yalnız shadow modunda dolar)
 
     # 14. Train/test split
     split_imbalanced = 0
@@ -2395,6 +2505,11 @@ def build_features(state: dict) -> dict:
         # clip[q01,q99] + NaN→train-median görür; payda-sıfır ∪ kaynak-missing aynı
         # dağılım-içi değere iner → gizli 0.0 sentinel YOK. Encode/scale/relations'tan
         # ÖNCE: hepsi temiz sonlu değer görür, kuantiller test'ten sızmaz.
+        # Katman 1 T1 — GÖLGE KOŞU kancası: post-split zincir ÖNCESİ X_train'i yakala.
+        # Yalnız `shadow` modunda kopyalanır (legacy'de maliyet SIFIR). Bkz. inference/shadow.py.
+        _shadow_x_train = (X_train.copy()
+                           if settings.FEATURE_PIPELINE_MODE == "shadow" else None)
+
         X_train, X_test = _finalize_ratio_features_tt(X_train, X_test, ratio_feature_cols)
         _dropped_ratio = set(ratio_feature_cols) - set(X_train.columns)
         ratio_feature_cols = [c for c in ratio_feature_cols if c in X_train.columns]
@@ -2446,6 +2561,14 @@ def build_features(state: dict) -> dict:
             X_train, X_test, domain_leakage_report)
         leakage_report["dropped"].extend(domain_dropped)
 
+        # Katman 1 T1 — GÖLGE KARŞILAŞTIRMASI. Üretim çıktısı YUKARIDA tamamlandı; buradan
+        # sonrası salt gözlem. `run_shadow_comparison` ASLA fırlatmaz (kendi içinde yutar) →
+        # gölge koşu üretim koşusunu bozamaz. Sonuç feature_report'a düşer (kanıt toplama).
+        if _shadow_x_train is not None:
+            from src.services.inference.shadow import run_shadow_comparison
+            shadow_report = run_shadow_comparison(
+                _shadow_x_train, y_train, pipeline_ctx, X_train)
+
     y_train_arr = np.array(y_train)
     y_test_arr  = np.array(y_test)
 
@@ -2489,6 +2612,16 @@ def build_features(state: dict) -> dict:
         # selection'dan ÖNCE hesaplandığı için orada düşmüş ratio'lar da geçer; hepsini
         # tutmak her bölümde AYNI etiketi garanti eder (aksi halde biri humanize biri ham).
         "ratio_feature_meta":       {k: list(v) for k, v in ratio_feature_meta.items()},
+        # Katman 1 (T0) — FILTRELENMEMIS kayitlar (X_train'e gore FILTRELENMEZ; ustteki
+        # ratio_feature_meta ile ayni sozlesme). Orkestratorun donmus secim kaynagi bunlar;
+        # `auto_features`/`derived_flags` hayatta-kalan listeleridir, o amac icin KULLANILMAZ.
+        "missing_indicator_meta":   dict(missing_indicator_meta),
+        "derived_flag_meta":        dict(derived_flag_meta),
+        # Katman 1 BEYAN YUZEYI — orkestratore verilecek ctx (beyan edilmeyen olgu →
+        # artifact deployable=False; sessizce "destekleniyor" olamaz).
+        "pipeline_ctx":             pipeline_ctx,
+        # T1 golge kosu sonucu (yalniz FEATURE_PIPELINE_MODE=shadow'da dolar; legacy'de {}).
+        "shadow_report":            shadow_report,
         "auto_features":            [c for c in auto_feature_cols if c in X_train.columns],
         "timeseries_lag":           ts_lag_info,
         "split_strategy":           split_strategy,

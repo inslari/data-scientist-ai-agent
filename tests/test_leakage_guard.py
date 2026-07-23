@@ -95,11 +95,19 @@ class ContinuousFeatureNotDroppedTest(unittest.TestCase):
         self.assertIn("row_id", [d["column"] for d in report["dropped"]])
 
     def test_metric_semantic_exempts_even_if_int(self):
-        # A high-cardinality integer column labeled 'metric' is a measurement, not an ID
+        # A high-cardinality integer column labeled 'metric' is a measurement, not an ID.
+        #
+        # FIXTURE FIX (2026-07-23): the old fixture drew ints from [0, 100_000) over 1500 rows
+        # → ~100% unique, i.e. it looked exactly like an integer identifier. Since 998d779 the
+        # rule is deliberate: the 'metric'/'numeric' semantic exemption does NOT apply to
+        # near-unique (>95%) integer columns, because the intelligence engine routinely labels
+        # customer_id as "metric" and a genuine integer measurement is almost never fully unique.
+        # The test now uses a realistic sensor reading (high cardinality, NOT near-unique), which
+        # is what the exemption is actually for.
         rng = np.random.default_rng(1)
         n = 1500
         y = pd.Series(rng.integers(0, 2, n))
-        df = pd.DataFrame({"sensor_count": rng.integers(0, 100000, n)})
+        df = pd.DataFrame({"sensor_count": rng.integers(0, 400, n)})   # ~400 uniq / 1500 satır
 
         class _Meta:
             columns = {"sensor_count": {"semantic_type": "metric"}}

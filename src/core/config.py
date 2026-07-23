@@ -30,6 +30,17 @@ class Settings:
     # into the classification catalog. Adds breadth at some runtime cost.
     EXTRA_MODELS_ENABLED : bool = os.getenv("EXTRA_MODELS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
+    # Katman 1 terminus — feature pipeline'i KIM calistiriyor (gecici, T5'te KALDIRILACAK).
+    #   legacy       : eski build_features yolu (VARSAYILAN — uretim davranisi degismez)
+    #   shadow       : eski yol CIKTIYI URETIR + orkestrator paralel kosar, fark LOGLANIR
+    #                  (asla firlatilmaz). Amac: kapsam kapisini GERCEK veride sinamak.
+    #   orchestrator : orkestrator uretim yolu (T2+)
+    # DIKKAT: bu flag iki kod yolu demektir — A-refactor'unun yapisal olarak imkansiz
+    # kilmak istedigi sey. Bu yuzden CIKIS OLCUTU olay-tabanli ve backlog'da AYRI kalem:
+    # (a) golgede sifir divergence (b) T2 bit-birebir (c) T3/T4 A/B onaylanmis → T5'te
+    # flag + legacy dal BIRLIKTE silinir. Olcutsuz birakilirsa kalici ikize doner.
+    FEATURE_PIPELINE_MODE: str = os.getenv("FEATURE_PIPELINE_MODE", "legacy").strip().lower()
+
     # Deployment environment. When set to "local" (env ENVIRONMENT=local), the
     # default dataset DB points at data/financial.db so the MCP server serves the
     # financial transaction dataset locally without any .env DB overrides.
