@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.core.report_schema import ORDER_ERROR_ANALYSIS, render_section
+from src.core.report_schema import ORDER_ERROR_ANALYSIS, _fmt_value, render_section
 from src.services.evaluator import _analyze_errors
 from src.services.report_sections import (
     ERRORS_VISIBLE_TOP,
@@ -100,10 +100,14 @@ def test_bolumde_ham_deger_gosteriliyor():
     md = render_section(sec, "tr")
 
     assert "Hatalı vakalarda ortalama" in md
-    assert str(info["mean_in_errors_raw"]) in md, "ham hata ortalaması metinde yok"
-    assert str(info["mean_in_correct_raw"]) in md, "ham doğru ortalaması metinde yok"
-    # Ölçekli değer kullanıcıya "değer" diye SUNULMAMALI.
+    # Faz 3 ondalık disiplini: metin HAM değeri gösterir ama `_fmt_value` ile BİÇİMLENDİRİR
+    # (magnitude-tabanlı; 41.9747 → "41.975"). İddia "ham mı ölçekli mi", "kaç ondalık" değil →
+    # assert biçimlendirilmiş ham değere bağlanır (ham repr'e değil; o bayat sözleşmeydi).
+    assert _fmt_value(info["mean_in_errors_raw"]) in md, "ham hata ortalaması metinde yok"
+    assert _fmt_value(info["mean_in_correct_raw"]) in md, "ham doğru ortalaması metinde yok"
+    # Ölçekli değer kullanıcıya "değer" diye SUNULMAMALI (asıl korunan davranış).
     assert str(info["mean_in_errors"]) not in md
+    assert _fmt_value(info["mean_in_errors"]) not in md
 
 
 # ═══════════════════════════════════════════════════════════════════════════
