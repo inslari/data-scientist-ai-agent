@@ -1900,7 +1900,13 @@ def train_model(state: AgentState) -> dict:
     os.makedirs("data/models", exist_ok=True)
     model_path = f"data/models/model_{uuid.uuid4().hex}.pkl"
     try:
-        joblib.dump(model, model_path)
+        # compress=3: model dosyaları ensemble ağırlıklı (blend/bagging → çok RandomForest)
+        # ~40MB ort., en kötü 147MB. Ölçüldü: 147MB→34MB (4.3×), 4.8MB→1.0MB (4.7×) → dizin
+        # ~4.5× küçülür. Maliyet: +2.2s dump (eğitim anında önemsiz), +0.45s yükleme/model.
+        # ⚠️ Yükleme maliyeti HER İSTEKTE değil, model YÜKLEMEDE ödenir → endpoint tasarımı
+        # artifact/model'i cache'ler (bir kez yükle, çok skorla) → pratik serving maliyeti ~0.
+        # joblib.load compress'i OTOMATİK algılar → eski sıkıştırılmamış modeller okunmaya devam eder.
+        joblib.dump(model, model_path, compress=3)
     except Exception as e:
         logger.warning(f"[automl] UYARI: Model diske kaydedilemedi: {e}")
         model_path = None
@@ -1911,6 +1917,28 @@ def train_model(state: AgentState) -> dict:
 
     # Büyük-N guard notunu metrics'ten ayıkla → state'e taşı (rapora yansır).
     guard_note = metrics.pop("heavy_model_guard", {}) if isinstance(metrics, dict) else {}
+
+    # ── KATMAN 1 FAZ B: model_ref ekle (FAIL-OPEN; id YOKSA denemeden atla → 3× stacktrace olmaz) ──
+    # Faz A artifact'i yazdıysa (state'te id), model_path artık VAR → build_model_ref + update.
+    # phase="model". Persistence fail-OPEN: patlarsa logla, artifact önceki fazda kalır (servis reddeder).
+    _art_id = state.get("inference_artifact_id")
+    if _art_id and model_path:
+        try:
+            import sklearn
+            from src.services.inference.references import build_model_ref
+            from src.services.inference.serialize import update_artifact_fields
+            _mref = build_model_ref(
+                model_path=model_path, model_name=model_name,
+                optimal_threshold=metrics.get("optimal_threshold") if isinstance(metrics, dict) else None,
+                threshold_provenance=metrics.get("threshold_provenance") if isinstance(metrics, dict) else None,
+                sklearn_version=sklearn.__version__,
+            )
+            update_artifact_fields(_art_id, {"model_ref": _mref, "phase": "model"})
+            logger.info(f"[automl] Faz B model_ref eklendi: artifact={_art_id}")
+        except Exception as _e:
+            logger.error(f"[automl] Faz B artifact güncellenemedi (fail-open, koşu sürüyor): {_e}")
+    elif not _art_id:
+        logger.info("[automl] Faz B atlandı: inference_artifact_id yok (Faz A yazamadı ya da legacy mod)")
 
     return {
         **state,

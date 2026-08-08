@@ -16,6 +16,10 @@ from api.models.ai_provider import AiProviderModel  # DB-managed LLM provider co
 from api.models.ai_model import AiModelModel
 from api.models.ai_role_assignment import AiRoleAssignmentModel
 from api.models.password_reset_request import PendingPasswordResetModel  # mail-free reset requests
+from api.models.artifact import ArtifactModel  # Katman 1 inference artifact index (serving)
+from api.models.artifact_event import ArtifactEventModel  # Manuel promotion olay günlüğü
+from api.models.prediction import PredictionModel  # Katman 2 temeli — skorlama kayıt tablosu
+from api.models.monitoring_summary import MonitoringSummaryModel  # Katman 2 — pencereli monitoring özeti
 
 # Yapısal logging — süreç başında bir kez. API'de DB logging varsayılan kapalı
 # (LOG_DB_ENABLED=true ile açılabilir); tablo yine create_all ile oluşur.
@@ -25,11 +29,23 @@ setup_logging(process="api")
 # Create all DB tables
 Base.metadata.create_all(bind=engine)
 
+# ŞEMA DRIFT KAPISI (create_all SONRASI): create_all mevcut tabloya kolon EKLEMEZ → modele kolon
+# eklenip migration yazılmazsa DB geride kalır ve o tabloyu SELECT eden endpoint SESSİZCE 500'ler
+# (monitoring detay prod'da tam böyle kırıldı). Fail-closed: eksik kolon → başlatma durur, migrate_db'ye
+# yönlendirir. extra_in_db yalnız uyarı. Bypass: ALLOW_SCHEMA_DRIFT=1.
+from api.core.db_safety import assert_schema_current
+from src.core.logging_config import get_logger as _get_logger
+assert_schema_current(engine, Base.metadata, logger=_get_logger("schema_drift"))
+
 from api.routes.mcp import router as mcp_router
 from api.routes.csv import router as csv_router
 from api.routes.data_group import router as data_group_router
 from api.routes.data_viz import router as data_viz_router, themes_router as viz_themes_router
 from api.routes.project import router as project_router
+from api.routes.scoring import router as scoring_router
+from api.routes.artifacts import router as artifacts_router
+from api.routes.labels import router as labels_router
+from api.routes.monitoring import router as monitoring_router, portfolio_router as monitoring_portfolio_router
 from api.routes.auth import router as auth_router
 from api.routes.domain_pack import router as domain_pack_router
 from api.routes.data_group_query import router as data_group_query_router
@@ -84,6 +100,11 @@ app.include_router(data_viz_router)
 app.include_router(viz_themes_router)
 app.include_router(data_group_query_router)
 app.include_router(project_router)
+app.include_router(scoring_router)
+app.include_router(artifacts_router)
+app.include_router(labels_router)
+app.include_router(monitoring_router)
+app.include_router(monitoring_portfolio_router)   # cross-project (prefix="/monitoring", AYRI router)
 app.include_router(mcp_router)
 app.include_router(csv_router)
 app.include_router(auth_router)

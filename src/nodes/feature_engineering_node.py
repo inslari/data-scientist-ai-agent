@@ -46,6 +46,9 @@ def feature_engineering_node(state: AgentState) -> AgentState:
         # Ham test taşıyıcısı (fairness + hata analizi okur) — yol + meta.
         "raw_test_path": result.get("raw_test_path", ""),
         "raw_test_meta": result.get("raw_test_meta", {}),
+        # Katman 1 wiring: artifact id (Faz B/C servisleri state'ten okur) + durum bloğu.
+        "inference_artifact_id": result.get("inference_artifact_id"),
+        "inference_artifact": result.get("inference_artifact"),
         # Veri İlişkileri özeti — split anında gerçek train partisyonundan hesaplandı.
         "relations_report": result.get("relations_report", {}),
         "current_step": "feature_engineering_node",

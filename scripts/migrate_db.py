@@ -174,4 +174,55 @@ if "mode" in viz_cols:
         print(f"Could not drop 'mode' column (harmless, leaving it): {e}")
 print("Table 'visualizations' ensured.")
 
+# ── predictions (Katman 2) — create_all mevcut tabloya kolon EKLEMEZ ──
+# Remote inspect (2026-08-05, read-only): tablo VAR; input_row/actual_label/label_backfilled_at
+# ZATEN eklenmiş, EKSİK olan: business_key, input_row_sampled, input_warning_flags + YENİ source.
+# Blok yine de hepsini kontrol eder (idempotent) → sadece eksikleri ekler, varsa atlar.
+pred_cols = check_table("predictions")
+_pred_adds = [
+    ("business_key",        "ALTER TABLE predictions ADD COLUMN business_key VARCHAR"),
+    ("input_row",           "ALTER TABLE predictions ADD COLUMN input_row JSON"),
+    ("input_row_sampled",   "ALTER TABLE predictions ADD COLUMN input_row_sampled BOOLEAN"),
+    ("input_warning_flags", "ALTER TABLE predictions ADD COLUMN input_warning_flags JSON"),
+    ("actual_label",        "ALTER TABLE predictions ADD COLUMN actual_label JSON"),
+    ("label_backfilled_at", "ALTER TABLE predictions ADD COLUMN label_backfilled_at DOUBLE PRECISION"),
+    # KAYNAK ayrımı (ui_manual monitoring'ten dışlanır). Nullable, server-default YOK → mevcut satırlar
+    # NULL kalır; aggregator coalesce(source,'api') ile NULL'ı üretim sayar (körleşme yok).
+    ("source",              "ALTER TABLE predictions ADD COLUMN source VARCHAR"),
+]
+if pred_cols:  # tablo yoksa create_all yaratır; blok yalnız MEVCUT tabloya kolon ekler
+    with engine.connect() as conn:
+        for col, ddl in _pred_adds:
+            if col not in pred_cols:
+                print(f"Adding '{col}' column to 'predictions'...")
+                conn.execute(text(ddl))
+        # business_key index (model: index=True) — kolon eklendiyse indexi de kur
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_predictions_business_key ON predictions (business_key)"))
+        conn.commit()
+    print("Table 'predictions' ensured (Katman 2 kolonları).")
+
+# ── monitoring_summary (Katman 2) — ŞEMA KAYMASI ONARIMI ──
+# Remote inspect (2026-08-05): tablo Parça 2-4 döneminde yaratıldı ama **Faz 0 kolonları HİÇ migrate
+# edilmedi** (modele eklendi, create_all mevcut tabloyu ALTER etmez) → summary/deployments endpoint'leri
+# `overall_status` yokluğundan 500 veriyordu (Monitoring tab "Couldn't load"; latest 0-tahminde erken
+# döndüğü için Overview kurtuluyordu). Blok hepsini idempotent kontrol eder → yalnız eksikleri ekler.
+# excluded_ui_count NOT NULL DEFAULT 0 (mevcut satırlar 0'a düşer); Faz 0 kolonları nullable.
+ms_cols = check_table("monitoring_summary")
+_ms_adds = [
+    ("excluded_ui_count",     "ALTER TABLE monitoring_summary ADD COLUMN excluded_ui_count INTEGER NOT NULL DEFAULT 0"),
+    ("overall_status",        "ALTER TABLE monitoring_summary ADD COLUMN overall_status VARCHAR"),
+    ("overall_status_reason", "ALTER TABLE monitoring_summary ADD COLUMN overall_status_reason JSON"),
+    ("psi_scalars",           "ALTER TABLE monitoring_summary ADD COLUMN psi_scalars JSON"),
+    ("psi_distribution",      "ALTER TABLE monitoring_summary ADD COLUMN psi_distribution JSON"),
+]
+if ms_cols:  # tablo yoksa create_all zaten tüm kolonlarla yaratır
+    with engine.connect() as conn:
+        for col, ddl in _ms_adds:
+            if col not in ms_cols:
+                print(f"Adding '{col}' column to 'monitoring_summary'...")
+                conn.execute(text(ddl))
+        conn.commit()
+    print("Table 'monitoring_summary' ensured (excluded_ui_count + Faz 0 kolonları).")
+
 print("Migration completed.")

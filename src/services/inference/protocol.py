@@ -163,4 +163,16 @@ class Artifact:
     training_reference: dict = field(default_factory=dict)      # PSI/CBPE referansı (sonraki parça)
     model_ref: dict = field(default_factory=dict)               # model + eşik (sonraki parça)
     final_features: list[str] = field(default_factory=list)     # selection sonrası hayatta kalanlar
-    artifact_schema_version: str = "1.1"
+    # YAŞAM DÖNGÜSÜ FAZI (wiring): artifact ÜÇ ayrı anda dolar → "features" (Faz A: manifest/param_store/
+    # raw_input_signature/training_reference.per_feature) → "model" (Faz B: model_ref) → "complete"
+    # (Faz C: training_reference.baseline_metrics). `load_for_serving` YALNIZ "complete"i kabul eder;
+    # "complete" ancak model_ref DOLU ∧ baseline_metrics VAR ise set edilir (status yalan söyleyemez).
+    # İki değer YETMEZDİ: Faz A sonrası (model yok) ile Faz B sonrası (baseline yok) farklı eksikler.
+    phase: str = "features"
+    # İŞ ANAHTARI KOLONU (Katman 2 gerçekleşen-perf v2 erken-şartı): eğitim bir entity/id kolonu
+    # bildirdiyse (timeseries entity_col) skorlama o kolonu ``predictions.business_key``'e yazar.
+    # None → bildirilmemiş (v1 varsayılan; entity kolonu genelde model girdisi DEĞİL). backfill-by-
+    # business_key v2'ye BLOKLU (bir anahtar → çok tahmin belirsizliği); kolon+yazım ŞİMDİ (geçmiş
+    # kayıt sonradan düzeltilemez), okuma tarafı sonra.
+    business_key_column: "str | None" = None
+    artifact_schema_version: str = "1.2"                        # 1.1→1.2: `phase` eklendi (additive)

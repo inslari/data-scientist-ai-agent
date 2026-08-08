@@ -54,6 +54,10 @@ class AgentState(TypedDict, total=False):
 
     # Feature Engineering output
     feature_report: dict             # Summary of applied transformations
+    # Katman 1 inference artifact (wiring): ağır Artifact (param_store sklearn estimator taşır →
+    # checkpoint'e giremez) diske yazılır, state'te YALNIZ id taşınır (model/split deseniyle aynı).
+    inference_artifact_id: str       # data/artifacts/<id>/ ; None → yazılamadı ya da legacy mod
+    inference_artifact: dict         # {artifact_id, deployable, phase, reason} — rapor/Katman 2 okur
     X_train: list[dict]              # Training features (DEPRECATED inline; bkz. *_path)
     X_test: list[dict]               # Test features (DEPRECATED inline; bkz. *_path)
     y_train: list                    # Training labels (DEPRECATED inline; bkz. *_path)

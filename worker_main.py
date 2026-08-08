@@ -20,6 +20,10 @@ from api.models.ai_provider import AiProviderModel  # ai_providers table — DB-
 from api.models.ai_model import AiModelModel  # ai_models table
 from api.models.ai_role_assignment import AiRoleAssignmentModel  # ai_role_assignments table
 from api.models.password_reset_request import PendingPasswordResetModel  # pending_password_resets table
+from api.models.artifact import ArtifactModel  # artifacts table — Katman 1 serving index
+from api.models.artifact_event import ArtifactEventModel  # artifact_events — manuel promotion olay günlüğü
+from api.models.prediction import PredictionModel  # predictions table — Katman 2 kayıt
+from api.models.monitoring_summary import MonitoringSummaryModel  # monitoring_summary — Katman 2 özet
 from api.core.worker import job_worker_loop, maintenance_loop
 
 def recover_interrupted_jobs():
@@ -58,7 +62,7 @@ def recover_interrupted_jobs():
         db.close()
 
 def main():
-    from src.core.logging_config import setup_logging
+    from src.core.logging_config import setup_logging, get_logger
     # Worker'da console + DB logging açık (process="worker" etiketiyle app_logs'a yazar).
     setup_logging(process="worker", db_logging=True)
 
@@ -66,9 +70,24 @@ def main():
     print("   Data Scientist AI Agent - Worker Process   ")
     print("==============================================")
 
+    # Aktif feature-pipeline modunu STARTUP'ta açıkça logla. Shadow/T5c koşularında
+    # "hangi modda koştuk" sorusunun kanıtı burada (önceden hiçbir yerde loglanmıyordu).
+    # FEATURE_PIPELINE_MODE settings'te; SERVING_RAW_REPLAY feature_builder modül sabiti.
+    from src.core.config import settings as _settings
+    from src.services.feature_builder import SERVING_RAW_REPLAY as _raw_replay
+    get_logger(__name__).info(
+        "[startup] FEATURE_PIPELINE_MODE=%s | SERVING_RAW_REPLAY=%s",
+        _settings.FEATURE_PIPELINE_MODE, _raw_replay,
+    )
+
     # Ensure tables exist
     Base.metadata.create_all(bind=engine)
-    
+
+    # ŞEMA DRIFT KAPISI (create_all SONRASI): worker da geride kalmış DB'ye karşı fail-closed dursun
+    # (aggregator MonitoringSummaryModel yazar/okur → eksik kolon orada da 500'ler). Bypass: ALLOW_SCHEMA_DRIFT=1.
+    from api.core.db_safety import assert_schema_current
+    assert_schema_current(engine, Base.metadata, logger=get_logger("schema_drift"))
+
     # Clean up any stuck jobs
     recover_interrupted_jobs()
     

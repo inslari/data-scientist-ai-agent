@@ -35,7 +35,9 @@ class ImputeStep(DefaultFitTransform):
     çerçeve verildiğinde birebir aynı çıktı:
       * numeric : median; ``is_integer_dtype`` ise ``int(round(median))``
       * object  : ``mode()[0]`` (mode boş değilse)
-    Tek fark #4: ``fit``'e X_train verilir, tüm-df değil.
+    İki fark: (a) #4 — ``fit``'e X_train verilir, tüm-df değil; (b) T3b-gate — dolgu
+    ÖĞRENİLEN kolon kümesi daha geniş (aşağıda). (b) çıktıda görünmez (byte-nötr),
+    yalnız ``param_store``'u büyütür; eşdeğerlik iddiası ÇIKTI düzeyinde durur.
 
     Parametre yapısı (``fit`` dönüşü):
       * ``numeric_median``     : {kolon: uygulanan dolgu}  — int kolonda YUVARLANMIŞ (transform bunu uygular)
@@ -43,18 +45,34 @@ class ImputeStep(DefaultFitTransform):
       * ``integer_cols``       : round+int uygulanan kolonlar (İncelik 2: ham vs yuvarlanmış ayrımı)
       * ``object_mode``        : {kolon: mode[0]}
 
-    Yalnızca ``fit`` çerçevesinde NULL taşıyan kolonlar için dolgu öğrenilir
-    (``_clean_data`` ile aynı: ``isnull().any()`` kapısı). Train'de null'suz ama
-    prod'da null gelebilecek kolonlar bu ilk sürümde dolgu ÖĞRENMEZ (parity'yi korumak
-    için bilinçli); downstream ``fillna(0)`` yakalar. Tüm-kolon median'ı saklamak ileri
-    bir sağlamlaştırma (şimdilik kapsam dışı — parity önceliği)."""
+    **KAPI YOK (T3b-gate) — dolgu, UYGUN HER kolon için öğrenilir.** Önceki sürüm
+    ``_clean_data``'nın ``isnull().any()`` kapısını replika ediyordu: yalnız *fit
+    çerçevesinde* null taşıyan kolonlar dolgu öğrenirdi. O kapı kaldırıldı, çünkü:
+
+      **train'de null olmayan ama serving'de null gelebilecek kolonlar için dolgu
+      ÖĞRENİLMELİDİR; aksi halde terminal ``fillna(0)`` devreye girer ve dağılım-DIŞI
+      bir değer üretir.** (0, çoğu ölçek için meşru bir değer bile değildir.)
+
+    Somut vaka — housing/``total_bedrooms``: 207 null'un 207'si de ``random_state=42``
+    split'inde TEST tarafına düşüyor → fit çerçevesi (train) null'suz → eski kapı kolonu
+    ATLARDI → o 207 hücre medyan (437.0) yerine ``0.0`` olurdu. Yani kapı, #4 fiksinin
+    (fit çerçevesinin full→train daralması) tam da faydasını REGRESYONA çeviriyordu.
+    Kapının varlığı yapısal bir sınırdı, ölçülmüş bir tercih değil.
+
+    Kapının kaldırılması ``fit_frame == transform çerçevesi`` iken **byte-nötr**: yeni
+    öğrenilen kolonlar tanımı gereği o çerçevede null'suzdur, ``fillna`` onlarda no-op'tur.
+    Değişen tek şey ``param_store``'un BOYUTU (daha çok kolon dolgu taşır) — bu sessiz
+    kalmasın diye manifest'e ``param_footprint`` yazılır (bkz. ``param_footprint``).
+
+    Medyanı NaN çıkan kolon (boş çerçeve / tümü-null) atlanır: NaN dolgu zaten hiçbir
+    hücreyi doldurmaz, ama int kolonda ``int(round(nan))`` patlardı."""
 
     id = "impute_missing"
     type = "parametric"
     param_kind = "fitted_stat"
 
     def __init__(self, config: StepConfig | None = None):
-        # config["columns"]: opsiyonel kısıtlama; None → fit'te tüm null-taşıyan kolonlar
+        # config["columns"]: opsiyonel kısıtlama; None → fit'te UYGUN TÜM kolonlar (kapı yok)
         self.config: StepConfig = config or {}
 
     def fit(self, X_train: pd.DataFrame, y_train: "pd.Series | None" = None) -> dict:
@@ -63,13 +81,20 @@ class ImputeStep(DefaultFitTransform):
         numeric_median_raw: dict = {}
         integer_cols: list = []
         object_mode: dict = {}
+        # Fit çerçevesinde FİİLEN null taşıyan kolonlar = ESKİ kapının öğreneceği kümenin ta
+        # kendisi. Kapı kalktığı için artık bir filtre DEĞİL, yalnız kayıt: "kaç kolon büyüdük"
+        # sorusu manifest'ten (param_footprint) cevaplanabilsin. ``transform`` bunu OKUMAZ.
+        null_columns: list = []
 
         for col in X_train.select_dtypes(include="number").columns:
             if only is not None and col not in only:
                 continue
-            if not X_train[col].isnull().any():      # _clean_data ile aynı kapı
-                continue
-            raw = float(X_train[col].median())
+            if X_train[col].isnull().any():                   # KAYIT (kapı DEĞİL)
+                null_columns.append(col)
+            med = X_train[col].median()
+            if pd.isna(med):                 # boş çerçeve / tümü-null → dolgu yok
+                continue                     # (float(pd.NA) ve int(round(nan)) ikisi de patlar)
+            raw = float(med)
             numeric_median_raw[col] = raw
             if pd.api.types.is_integer_dtype(X_train[col]):
                 numeric_median[col] = int(round(raw))
@@ -80,22 +105,24 @@ class ImputeStep(DefaultFitTransform):
         for col in X_train.select_dtypes(include="object").columns:
             if only is not None and col not in only:
                 continue
-            if not X_train[col].isnull().any():
-                continue
+            if X_train[col].isnull().any():
+                null_columns.append(col)
             mode = X_train[col].mode()
             if not mode.empty:
                 object_mode[col] = mode[0]
 
         if numeric_median or object_mode:
             logger.info(
-                f"[impute] fit (train-only): {len(numeric_median)} numeric, "
-                f"{len(object_mode)} object kolon"
+                f"[impute] fit: {len(numeric_median)} numeric + {len(object_mode)} object kolon "
+                f"dolgu ÖĞRENDİ (fit çerçevesinde fiilen null taşıyan: {len(null_columns)}) — "
+                f"isnull() kapısı YOK (T3b-gate: serving'de null gelebilir)"
             )
         return {
             "numeric_median": numeric_median,
             "numeric_median_raw": numeric_median_raw,
             "integer_cols": integer_cols,
             "object_mode": object_mode,
+            "null_columns": null_columns,      # transform OKUMAZ — ayak izi/denetim kaydı
         }
 
     def transform(self, X: pd.DataFrame, params: dict) -> pd.DataFrame:
@@ -107,6 +134,160 @@ class ImputeStep(DefaultFitTransform):
         for col, fill in (params.get("object_mode") or {}).items():
             if col in X.columns:
                 X[col] = X[col].fillna(fill)
+        return X
+
+    def param_footprint(self, params: dict) -> dict:
+        """Kaç kolon için dolgu öğrenildiği — manifest'e opt-in beyan (bkz. ``_param_footprint_of``).
+
+        T3b-gate'in ÇIKTI'sı byte-nötr ama ``param_store``'u DEĞİL: kapı kalkınca dolgu
+        öğrenilen kolon sayısı büyüdü. Kullanılmayan bir dolgu da olsa bu bir davranış
+        değişikliğidir (serving'de o kolona null gelirse ARTIK medyan uygulanacak) →
+        manifest'te görünür olmalı, ölçüm sessizce kaymamalı.
+
+        ``gate_growth`` BÜYÜMENİN KENDİSİDİR: ``fit_null_columns`` eski ``isnull().any()``
+        kapısının öğreneceği küme, ``*_fill_learned`` ise şimdi öğrenilen. Fark = kapının
+        kaldırılmasının artifact üzerindeki tam etkisi (çıktıda görünmez, burada görünür)."""
+        num = params.get("numeric_median") or {}
+        obj = params.get("object_mode") or {}
+        nulls = params.get("null_columns") or []
+        return {"numeric_fill_learned": len(num), "object_fill_learned": len(obj),
+                "fill_columns": sorted([*num, *obj]),
+                "fit_null_columns": len(nulls),                     # eski kapının kümesi
+                "gate_growth": len(num) + len(obj) - len(nulls)}    # T3b-gate'in param deltası
+
+
+_POWER_EXP_BOUNDS = (-3.0, 3.0)   # feature_builder.py:1556 ile aynı — YALNIZ belgeleme amaçlı
+                                  # (clamp BEYAN anında uygulanır; bu adım YENİDEN clamp ETMEZ)
+
+
+def _prod_series(cols: list) -> "pd.Series":
+    out = cols[0]
+    for c in cols[1:]:
+        out = out * c
+    return out
+
+
+def _weighted_sum_series(cols: list, params: list) -> "pd.Series":
+    out = None
+    for w, c in zip(params, cols):
+        term = float(w) * c
+        out = term if out is None else out + term
+    return out
+
+
+# ``_FEATURE_OPS``'un ROWWISE altısının SELF-CONTAINED replikası (feature_builder.py:1578-1587).
+# Neden kopya: SELF-CONTAINED invariant'ı — ``transform`` (serving+eğitim) ``feature_builder``
+# import ETMEZ (protocol.py'deki gerekçe). Parametric ikili (zscore/normalize) BURADA YOK:
+# onlar fitted-state taşır ve ayrı adımlardır (ZScoreStep/NormalizeStep, #5 fiksi).
+_PLAN_ROWWISE_OPS = {
+    "ratio":        lambda cols, p: cols[0] / (_prod_series(cols[1:]).abs() + _FEATURE_SPEC_EPS),
+    "product":      lambda cols, p: _prod_series(cols),
+    "difference":   lambda cols, p: cols[0] - cols[1],
+    "log":          lambda cols, p: np.log1p(cols[0].clip(lower=0)),
+    "power":        lambda cols, p: cols[0] ** float(p[0]),
+    "weighted_sum": lambda cols, p: _weighted_sum_series(cols, p),
+}
+
+
+class PlanDerivedStep(DefaultFitTransform):
+    """Plan-güdümlü ROWWISE türev feature'lar (6 op) — rowwise / frozen config.
+
+    ``_FEATURE_OPS``'un fitted-state TAŞIMAYAN altı op'u: ``ratio · product · difference ·
+    log · power · weighted_sum``. Hepsi girdi kolonlarının + sabit parametrelerin element-bazlı
+    fonksiyonu → train'den öğrenilen istatistik YOK → **sızıntı yüzeyi YOK** (ölçüldü: paletteki
+    tek iki parametric op zaten portlu olan zscore/normalize).
+
+    Çıktı: ``series.replace([inf,-inf], 0).fillna(0)`` — ``_run_feature_specs``:1636 ile BİREBİR.
+
+    **KABUL KURALLARI BURADA DEĞİL, BEYANDA:** şekil doğrulaması, leakage denylist'i ve ``power``
+    clamp'i ``_admit_spec`` içinde uygulanır; config donmuş/temiz spec taşır. Adım yalnız iki
+    savunma yapar: adı zaten varsa üretme (idempotans), girdi kolonu yoksa atla.
+
+    Config: ``{"specs": [{"name","op","inputs","params"}, ...]}`` (sıra korunur).
+    """
+
+    id = "plan_derived"
+    type = "rowwise"
+    param_kind = None
+
+    def __init__(self, config: StepConfig | None = None):
+        self.config: StepConfig = config or {}
+
+    def fit(self, X_train: pd.DataFrame, y_train: "pd.Series | None" = None) -> None:
+        return None            # rowwise: train'den öğrenilen state YOK
+
+    def frozen_selection(self, params=None) -> dict:
+        specs = self.config.get("specs") or []
+        return {"kind": "plan_ops", "source": "feature_plan.derived_features (rowwise op'lar)",
+                "selection": [{"output": s["name"], "op": s["op"], "inputs": s["inputs"],
+                               "params": s.get("params") or [],
+                               **({"params_clamped": True,
+                                   "params_original": s["params_original"]}
+                                  if s.get("params_clamped") else {})}
+                              for s in specs]} if specs else {}
+
+    def transform(self, X: pd.DataFrame, params: "dict | None" = None) -> pd.DataFrame:
+        X = X.copy()
+        for spec in (self.config.get("specs") or []):
+            name, op = spec.get("name"), spec.get("op")
+            inputs, prm = spec.get("inputs") or [], spec.get("params") or []
+            if op not in _PLAN_ROWWISE_OPS or not name or name in X.columns:
+                continue
+            if any(c not in X.columns for c in inputs):
+                continue
+            cols = [pd.to_numeric(X[c], errors="coerce") for c in inputs]
+            seri = _PLAN_ROWWISE_OPS[op](cols, prm)
+            X[name] = seri.replace([np.inf, -np.inf], 0).fillna(0)   # 1636 ile birebir
+        return X
+
+
+class DateFeaturesStep(DefaultFitTransform):
+    """Timestamp kolonlarından DURUMSUZ rowwise türevler: ``_year`` · ``_month`` · ``_dayofweek``.
+
+    Eski inline blok (feature_builder date-extraction: ``pd.to_datetime`` + ``.dt``) SELF-CONTAINED
+    port'u — fitted-state YOK → sızıntı yüzeyi YOK (element-bazlı; train'den öğrenilen istatistik yok).
+    **§2.19 KAPSAM PORT'U:** eski ``date_features`` kapsam olgusu (kapsam kapısı reddederdi) ADIMA
+    çevrildi → ``_SCOPE_RULES``'tan çıkarıldı, timestamp taşıyan dataset artık orchestrator modda
+    deploy EDİLEBİLİR.
+
+    KONUM (pre-split): impute'tan SONRA, ``drop_columns``'tan ÖNCE — ham timestamp kolonu (imzada
+    ``required``) hâlâ çerçevede; türevler üretildikten sonra ham kolonu ``drop_columns`` düşürür.
+    İmpute SONRASI çalışır → NaT→NaN türev hücreleri burada DOLDURULMAZ (eski yol da doldurmuyordu;
+    downstream ``inf_impute``/select yakalar). Serving replay'inde ham satırdan aynen üretilir.
+
+    DİNAMİK: kolon adı GÖMÜLÜ DEĞİL. ``config["columns"]`` = genişletilecek timestamp kolonları
+    (``meta.get_by_type("timestamp")`` − leaky). Savunmalar: kolon yoksa atla; ``{col}_year`` zaten
+    varsa üretme (idempotans — shadow'da girdi çerçevesi çoktan genişletilmiş olabilir)."""
+
+    id = "date_features"
+    type = "rowwise"
+    param_kind = None
+
+    def __init__(self, config: StepConfig | None = None):
+        self.config: StepConfig = config or {}
+
+    def fit(self, X_train: pd.DataFrame, y_train: "pd.Series | None" = None) -> None:
+        return None                # rowwise: train'den öğrenilen state YOK
+
+    def frozen_selection(self, params=None) -> dict:
+        cols = self.config.get("columns") or []
+        return {"kind": "date_expand", "source": "meta.timestamp (non-leaky)",
+                "selection": [{"source": c,
+                               "emits": [f"{c}_year", f"{c}_month", f"{c}_dayofweek"]}
+                              for c in cols]} if cols else {}
+
+    def transform(self, X: pd.DataFrame, params: "dict | None" = None) -> pd.DataFrame:
+        X = X.copy()
+        for col in (self.config.get("columns") or []):
+            if col not in X.columns or f"{col}_year" in X.columns:
+                continue               # kolon yok → atla; türev zaten var → idempotans
+            try:                       # eski inline blok da try/except pass (parse patlarsa atla)
+                dt = pd.to_datetime(X[col], errors="coerce")
+                X[f"{col}_year"]      = dt.dt.year
+                X[f"{col}_month"]     = dt.dt.month
+                X[f"{col}_dayofweek"] = dt.dt.dayofweek
+            except Exception:
+                continue
         return X
 
 
@@ -1199,9 +1380,23 @@ class SelectDropStep(DefaultFitTransform):
         meta = cfg.get("meta")
         domain_report = cfg.get("domain_leakage_report") or {"dropped": [], "suspected": []}
         protected = cfg.get("protected_high_card")
+        if protected is None:
+            # T2 — `ts_protected_cols` TÜRETİMİ (plumbing yerine yapısal denklik).
+            # build_features'ta bu küme = ratio_finalize sonrası HAYATTA KALAN oran kolonları
+            # ∪ ts-lag kolonları. ts-lag `_SCOPE_RULES` tarafından REDDEDİLİYOR → desteklenen
+            # kapsamda küme = oran adları ∩ mevcut çerçeve. Türetim fit GİRİŞİNDE yapılır
+            # (aşağıdaki drop'lardan ÖNCE) — legacy'nin hesap anıyla aynı çerçeve içeriği.
+            # Kilit: `test_protected_high_card_derivation_matches_legacy`.
+            protected = {n for n in (cfg.get("ratio_names") or []) if n in X_train.columns}
 
         Xtr = X_train.copy()
         prov: dict = {}
+        # Zincirin yan-değerleri: build_features `feature_report`'a yazmak için bunlara İHTİYAÇ
+        # DUYAR (leakage_dropped/leakage_suspected/univariate_dropped). Eskiden burada sessizce
+        # atılıyorlardı → T2'de zincir devralınınca rapor alanları boşalırdı. `transform`
+        # DEĞİŞMEZ (yalnız `drop_cols` okur) → davranış-nötr ekleme.
+        _uni: list = []
+        _rep: dict = {"dropped": [], "suspected": []}
 
         def _diff(prev_cols: set, tag: str) -> None:
             for c in prev_cols - set(Xtr.columns):
@@ -1233,7 +1428,10 @@ class SelectDropStep(DefaultFitTransform):
         drop_cols = [c for c in X_train.columns if c not in surviving]   # orijinal sıra (deterministik)
         if drop_cols:
             logger.info(f"[select_drop] fit (train-only, DONDU): {len(drop_cols)} kolon düştü → {prov}")
-        return {"drop_cols": drop_cols, "provenance": prov, "surviving": list(Xtr.columns)}
+        return {"drop_cols": drop_cols, "provenance": prov, "surviving": list(Xtr.columns),
+                # ── zincir yan-değerleri (rapor girdisi; transform bunları OKUMAZ) ──
+                "leakage_report": _rep, "univariate_dropped": _uni, "domain_dropped": _dom,
+                "protected_high_card": sorted(protected or ())}
 
     def transform(self, X: pd.DataFrame, params: dict) -> pd.DataFrame:
         params = params or {}

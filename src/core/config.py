@@ -4,8 +4,11 @@ from dotenv import load_dotenv
 from src.core.logging_config import get_logger
 logger = get_logger(__name__)
 
-# Load environment variables from .env file
-load_dotenv(override=True)
+# Load environment variables from .env file.
+# override=False: GERÇEK env var .env'i EZER (api/core/database.py ile aynı disiplin). Aksi hâlde .env'deki
+# remote API_DATABASE_URL, testin/migration'ın açıkça set ettiği sqlite sandbox'ı ezerdi → koşu ortamı
+# prod'a bağlanırdı. Yapısal kapı (assert_connection_allowed) backstop; bu satır deliği baştan kapatır.
+load_dotenv(override=False)
 
 class Settings:
     # API & MCP Configuration
@@ -31,15 +34,114 @@ class Settings:
     EXTRA_MODELS_ENABLED : bool = os.getenv("EXTRA_MODELS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
 
     # Katman 1 terminus — feature pipeline'i KIM calistiriyor (gecici, T5'te KALDIRILACAK).
-    #   legacy       : eski build_features yolu (VARSAYILAN — uretim davranisi degismez)
+    #   legacy       : eski build_features yolu
     #   shadow       : eski yol CIKTIYI URETIR + orkestrator paralel kosar, fark LOGLANIR
     #                  (asla firlatilmaz). Amac: kapsam kapisini GERCEK veride sinamak.
-    #   orchestrator : orkestrator uretim yolu (T2+)
+    #   orchestrator : orkestrator uretim yolu (T2+) — VARSAYILAN (T5c cutover: date_features portlandi,
+    #                  kapsam reddi tek sebep de kalkti → orkestrator artik varsayilan uretim yolu).
     # DIKKAT: bu flag iki kod yolu demektir — A-refactor'unun yapisal olarak imkansiz
-    # kilmak istedigi sey. Bu yuzden CIKIS OLCUTU olay-tabanli ve backlog'da AYRI kalem:
-    # (a) golgede sifir divergence (b) T2 bit-birebir (c) T3/T4 A/B onaylanmis → T5'te
-    # flag + legacy dal BIRLIKTE silinir. Olcutsuz birakilirsa kalici ikize doner.
-    FEATURE_PIPELINE_MODE: str = os.getenv("FEATURE_PIPELINE_MODE", "legacy").strip().lower()
+    # kilmak istedigi sey. CIKIS OLCUTU olay-tabanli ve backlog'da AYRI kalem: T5d'de shadow dali +
+    # legacy dal + flag BIRLIKTE silinir. shadow modu T5d'ye kadar KORUNUR (silinmez) — yalnizca
+    # VARSAYILAN legacy'den orchestrator'a cevrildi (T5c). Olcutsuz birakilirsa kalici ikize doner.
+    FEATURE_PIPELINE_MODE: str = os.getenv("FEATURE_PIPELINE_MODE", "orchestrator").strip().lower()
+
+    # Katman 1 skorlama endpoint'i. SERVING_CACHE_MAX_ARTIFACTS: process-içi model cache
+    # kapasitesi (LRU). DÜŞÜK varsayılan (2): joblib.load sıkıştırılmışı TAM boyutta RAM'e açar
+    # (compress RAM'i DÜŞÜRMEZ) → 147MB×2 + API + transform frame'leri. İhtiyaç olursa artır.
+    SERVING_CACHE_MAX_ARTIFACTS: int = int(os.getenv("SERVING_CACHE_MAX_ARTIFACTS", "2"))
+    SERVING_MAX_ROWS: int = int(os.getenv("SERVING_MAX_ROWS", "10000"))
+
+    # Katman 2 monitoring — input_row ALAN-BAZLI örnekleme (yalnız PSI referansı için ham girdi
+    # saklanır; probability/prediction/input_warnings/actual_label HER satırda tam kalır → diğer
+    # üç monitör körleşmez). Karar deterministik hash-Bernoulli(prediction_id): içerikten/sıradan
+    # bağımsız uniform → sistematik-sapmasız, stateless (yarış yok). VARSAYILAN 1.0 (tam sakla):
+    # asimetri kuralı — atılan satır geri gelmez, saklanan sonra silinebilir → tersinir tarafı seç.
+    # Hacim şu an SIFIR (T5c açılmadı, üretimde champion yok); gerçek hacim gelince yeniden
+    # değerlendirilir (handoff §3 backlog). PII'yi p ÇÖZMEZ (maskeleme+retention işi) — p yalnız
+    # depolama sınırı. Mekanizma p<1.0 ile testli → tek config değişikliğiyle açılır.
+    SERVING_INPUT_ROW_SAMPLE_RATE: float = float(os.getenv("SERVING_INPUT_ROW_SAMPLE_RATE", "1.0"))
+    # Aggregator okuma-tarafı KESİN cap: pencerede saklanan input_row'dan en çok bu kadarı PSI'a
+    # girer (min_n=300'e 3× marj — per-feature null + champion-bölme pencereyi küçültür).
+    SERVING_INPUT_ROW_SAMPLE_TARGET: int = int(os.getenv("SERVING_INPUT_ROW_SAMPLE_TARGET", "1000"))
+
+    # Katman 2 monitoring aggregator (zamanlanmış worker, `run_maintenance` alt-görevi). Pencere
+    # başına satır sayısı bu eşiğin altındaysa status=insufficient_n. **PSI eşiği** (PSI ilk gerçek
+    # metrik; input_row DOLU satırları kullanır → n_sampled ile kıyaslanır). İsim şimdiden `_PSI` ekli:
+    # Parça 4'te `MONITORING_MIN_N_CBPE`(500)/`_QUALITY`(100) YANINA eklenir → yeniden-adlandırma borcu yok.
+    MONITORING_MIN_N_PSI: int = int(os.getenv("MONITORING_MIN_N_PSI", "300"))
+    # Parça 4 — CBPE (tahmini performans) + veri kalitesi min-n eşikleri. CBPE n_total (per-row
+    # probability), kalite n_total (per-row bayrak). PSI'ın n_sampled'ından FARKLI (PSI input_row örneklem).
+    MONITORING_MIN_N_CBPE: int = int(os.getenv("MONITORING_MIN_N_CBPE", "500"))
+    MONITORING_MIN_N_QUALITY: int = int(os.getenv("MONITORING_MIN_N_QUALITY", "100"))
+    # PSI sıfır-kova düzeltmesi: Laplace (add-α) pseudo-count, HEM referans HEM prod tarafına. Epsilon
+    # DEĞİL — epsilon keyfi + N-duyarsız; Laplace N-farkında (n=300'de boş kova ≠ n=10k) + ilkeli
+    # (Jeffreys α=0.5). Kategorik "other" kovası ref tarafında 0 olsa da (tail_mass=0) Laplace inf'i önler.
+    MONITORING_PSI_LAPLACE_ALPHA: float = float(os.getenv("MONITORING_PSI_LAPLACE_ALPHA", "0.5"))
+    # GERÇEKLEŞEN performans (actual_label backfill) min-n → labeled_n (etiketi GELEN satır sayısı),
+    # n_total DEĞİL. 200: gerçekleşen metrik CBPE'nin doğrulaması → 100'de ROC-AUC gürültülü, yanlış bir
+    # "gerçekleşen 0.79" CBPE'yi haksız şüpheli gösterir. accuracy 100'de yeterli ama ikisini ayrı eşiğe
+    # bölmek karmaşık → tek eşik 200. label_coverage min-n altında bile HER ZAMAN görünür.
+    MONITORING_MIN_N_REALIZED: int = int(os.getenv("MONITORING_MIN_N_REALIZED", "200"))
+    # Seçilim yanlılığı güven eşiği: label_coverage bunun altındaysa gerçekleşen metrik "geçici/olası-yanlı"
+    # işaretlenir (etiketler rastgele gelmez → düşük kapsam pozitif-ağırlıklı olabilir). Dashboard uygular.
+    MONITORING_LABEL_COVERAGE_TRUST: float = float(os.getenv("MONITORING_LABEL_COVERAGE_TRUST", "0.5"))
+    # Monitoring API (read-only, dashboard). `?days` varsayılanı + ÜST SINIR. Sınır ŞART: psi_per_feature
+    # her pencerede tam JSON → days=3650 tüm geçmişi + kolon×pencere JSON'u çeker → yanıt patlar. summary
+    # endpoint'i per_feature'ı DÖNDÜRMEZ (trend psi_overall/psi_max ile çizilir); per_feature yalnız latest +
+    # tek-pencere detay endpoint'inde. days > MAX → MAX'a kırpılır (hata değil; dashboard sınırı config'ten okur).
+    MONITORING_DEFAULT_WINDOW_DAYS: int = int(os.getenv("MONITORING_DEFAULT_WINDOW_DAYS", "30"))
+    MONITORING_MAX_WINDOW_DAYS: int = int(os.getenv("MONITORING_MAX_WINDOW_DAYS", "90"))
+    # FAZ 1 — schema (scoring playground formu) kategorik dropdown pratik-eşiği. raw_input_signature
+    # `known_values`'u ZATEN `_SIG_MAX_VOCAB=50`'ye cap'li (üstü None); ama 50 değerli bir dropdown da
+    # kullanışsız → form açısından pratik eşik DAHA DÜŞÜK. Bu eşiğin üstünde schema `known_values=null` +
+    # `known_values_truncated=true` döner → form serbest metin + uyarıya geçer (dropdown yerine). İCAT
+    # (form-ergonomisi kararı, literatür değil); env'den ayarlanır.
+    MONITORING_SCHEMA_MAX_KNOWN_VALUES: int = int(os.getenv("MONITORING_SCHEMA_MAX_KNOWN_VALUES", "20"))
+    # FAZ 1 — predictions log sayfa boyutu (keyset/cursor). DEFAULT istekte `limit` verilmezse; MAX üst-sınır
+    # (limit > MAX → kırp, hata değil — days deseni). predictions TEK büyüyen tablo → büyük limit yanıtı şişirir.
+    MONITORING_PREDICTIONS_PAGE_SIZE: int = int(os.getenv("MONITORING_PREDICTIONS_PAGE_SIZE", "50"))
+    MONITORING_PREDICTIONS_PAGE_MAX: int = int(os.getenv("MONITORING_PREDICTIONS_PAGE_MAX", "200"))
+    # MANUEL PROMOTION — artifact_events log sayfa boyutu (Deployments altı "Olaylar" paneli). Promotion
+    # NADİR olay (champion elle değişir) → küçük default yeter; MAX üst-sınır (limit > MAX → kırp, hata değil).
+    MONITORING_EVENTS_PAGE_SIZE: int = int(os.getenv("MONITORING_EVENTS_PAGE_SIZE", "50"))
+    MONITORING_EVENTS_PAGE_MAX: int = int(os.getenv("MONITORING_EVENTS_PAGE_MAX", "200"))
+    # ⚠️ LOOKBACK TUZAĞI (aggregator henüz tam-tarama, YAGNI): ileride `MONITORING_LOOKBACK_DAYS` alt-sınırı
+    # eklenirse BEKLENEN ETİKET GECİKMESİNDEN büyük olmalı — churn'de etiket AYLAR sonra gelir; lookback
+    # penceresi dışında kalan eski pencerenin geç etiketi asla recompute edilmez (dirty-kontrol onu görmez).
+
+    # ══════════════════════════════════════════════════════════════════════════════════════════════
+    # TRIAGE EŞİKLERİ (overall_status roll-up, `src/services/monitoring/triage.py`)
+    # ⚠️ BU BÖLÜMDEKİ EŞİKLER LİTERATÜR DEĞİL, BAŞLANGIÇ DEĞERİDİR — shadow koşusu verisiyle KALİBRE
+    # EDİLECEK (kalibrasyon turunda hepsi burada; dağınık olurlarsa bulmak zor). TEK İSTİSNA: PSI
+    # 0.10/0.25 bandı literatürdür (endüstri standardı), aşağıda ayrıca işaretli.
+    # ══════════════════════════════════════════════════════════════════════════════════════════════
+    # PSI drift bandı — LİTERATÜR (icat DEĞİL; standart PSI eşikleri, tüm sektörde ortak).
+    MONITORING_PSI_WARN: float = float(os.getenv("MONITORING_PSI_WARN", "0.10"))
+    MONITORING_PSI_CRITICAL: float = float(os.getenv("MONITORING_PSI_CRITICAL", "0.25"))
+    # Gerçekleşen performans düşüşü (baseline − realized) — İCAT, shadow-kalibre. En güçlü sinyal →
+    # critical üretebilen TEK eksen (ölçülmüş gerçek). accuracy/roc_auc'ta mutlak düşüş.
+    MONITORING_REALIZED_DROP_WARN: float = float(os.getenv("MONITORING_REALIZED_DROP_WARN", "0.05"))
+    MONITORING_REALIZED_DROP_CRITICAL: float = float(os.getenv("MONITORING_REALIZED_DROP_CRITICAL", "0.10"))
+    # Regresyon realized (rmse) — İCAT, shadow-kalibre. accuracy/roc 0-1 skalası regresyona uymaz →
+    # GÖRELİ rmse artışı: (rmse − baseline_rmse)/baseline_rmse. Regresyon banded olmazsa bozulan model
+    # sessizce "healthy" görünürdü (DEGEN_MASS'la aynı false-healthy riski) → banded tutulur.
+    MONITORING_REALIZED_RMSE_INCREASE_WARN: float = float(os.getenv("MONITORING_REALIZED_RMSE_INCREASE_WARN", "0.10"))
+    MONITORING_REALIZED_RMSE_INCREASE_CRITICAL: float = float(os.getenv("MONITORING_REALIZED_RMSE_INCREASE_CRITICAL", "0.25"))
+    # CBPE tahmini düşüşü (baseline − estimated) — İCAT, shadow-kalibre. CBPE bir TAHMİN + concept-drift'te
+    # iyimser sapar → şiddeti ne olursa olsun WARNING tavanı (asla critical); realized gelince devralır.
+    MONITORING_CBPE_DROP_WARN: float = float(os.getenv("MONITORING_CBPE_DROP_WARN", "0.05"))
+    # Drift ÖLÇÜM KAPSAMI yeterlilik eşikleri — İCAT, shadow-kalibre. importance_attributed_ratio bunun
+    # ALTINDA ya da degenerate_importance_mass bunun ÜSTÜNDE ise drift ölçümü EKSİK → drift ekseni healthy
+    # OLAMAZ (warning tabanı). DEGEN_MASS 0.15 (0.25 değil): modelin dörtte biri ölçülemezken "healthy"
+    # kabul edilemez; muhafazakâr taraf ucuz (yanlış warning rahatsız eder, yanlış healthy YANILTIR).
+    MONITORING_DRIFT_ATTR_MIN: float = float(os.getenv("MONITORING_DRIFT_ATTR_MIN", "0.75"))
+    MONITORING_DEGEN_MASS_MAX: float = float(os.getenv("MONITORING_DEGEN_MASS_MAX", "0.15"))
+    # Veri kalitesi alarm oranları — İCAT, shadow-kalibre. PSI'ın 0.10/0.25'i gibi bir LİTERATÜR STANDARDI
+    # YOK. İlkeli tail_mass-çapası bu sinyale oturmaz: quality SATIR-düzeyi agregat (has_unseen boolean),
+    # tail_mass KOLON-başına → eşlenemez; kolon-başına unseen toplamak örneklenmiş input_row körlüğünü geri
+    # getirir (Parça 1/4). → config sabiti. (Gelecek: kolon-başına kalite sinyali gerekirse ayrı iş.)
+    MONITORING_QUALITY_ALARM_UNSEEN_RATE: float = float(os.getenv("MONITORING_QUALITY_ALARM_UNSEEN_RATE", "0.05"))
+    MONITORING_QUALITY_ALARM_OOR_RATE: float = float(os.getenv("MONITORING_QUALITY_ALARM_OOR_RATE", "0.03"))
 
     # Deployment environment. When set to "local" (env ENVIRONMENT=local), the
     # default dataset DB points at data/financial.db so the MCP server serves the
