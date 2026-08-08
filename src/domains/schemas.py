@@ -63,7 +63,11 @@ class FeatureSpec(BaseModel):
 
     name: str = Field(description="Output column name, e.g. 'amount_to_balance_ratio'")
     op: FeatureOp = Field(description="Transform from the fixed palette (see FEATURE_OP_SPEC)")
-    inputs: list[str] = Field(description="Existing column name(s) the op consumes, in order")
+    inputs: list[str] = Field(
+        description=("Existing column name(s) the op consumes, in order. MUST be raw columns that "
+                     "already exist in the data — NEVER another FeatureSpec's output name "
+                     "(no chained/derived-of-derived features).")
+    )
     params: list[float] = Field(
         default_factory=list,
         description="Numeric constants the op needs: power→[exponent], weighted_sum→one weight per input. Empty otherwise.",

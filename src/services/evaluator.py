@@ -1724,6 +1724,54 @@ def evaluate_model(state: AgentState) -> dict:
     except Exception as e:
         logger.error(f"[evaluation] Deney loglanırken hata: {e}")
 
+    # ── KATMAN 1 FAZ C: baseline_metrics (CBPE çapası, prediction-space) + phase="complete" (FAIL-OPEN) ──
+    # training_reference.per_feature Faz A'da doldu (PSI, input drift, ORTOGONAL); burada CBPE çapası
+    # eklenir. `phase="complete"` YALNIZ model_ref DOLU ise (Faz B başarılı) → status yalan söylemez.
+    _art_id = state.get("inference_artifact_id")
+    if _art_id:
+        try:
+            from src.services.inference.serialize import load_artifact, update_artifact_fields
+            _art = load_artifact(_art_id)
+            _tref = dict(_art.training_reference or {})
+            # baseline_metrics = CBPE çapası (prediction-space). test_metrics'i SHALLOW COPY (mutate
+            # etme) + kalibrasyon KAPISI ekle. Yalnız kapı alanları (brier_score/brier_baseline/
+            # is_well_calibrated) — eğri (prob_true/prob_pred) rapor gösterimi, CBPE'ye gereksiz.
+            # calibration YOK (regresyon/multiclass/curve patladı) → None; CBPE monitörü bastırır
+            # (fail-closed YALNIZ CBPE için), PSI/veri-kalitesi bağımsız çalışır.
+            _bm = dict(evaluation_report.get("test_metrics", {}) or {})
+            _cal = evaluation_report.get("calibration")
+            _bm["calibration"] = ({
+                "brier_score": _cal.get("brier_score"),
+                "brier_baseline": _cal.get("brier_baseline"),
+                "is_well_calibrated": _cal.get("is_well_calibrated"),
+            } if _cal else None)
+            # GERÇEKLEŞEN performans (actual_label backfill) için: pozitif sınıf (roc_auc binarize) +
+            # prevalans (seçilim-yanlılığı sapma kanıtı). threshold_analysis YALNIZ binary'de dolu →
+            # regresyon/multiclass'ta None (realized roc_auc + pozitif-oran bastırılır, accuracy yine çalışır).
+            _ta = evaluation_report.get("threshold_analysis") or {}
+            _pos_label = _ta.get("positive_label")
+            _pos_ct, _neg_ct = _ta.get("pos_count"), _ta.get("neg_count")
+            _bm["positive_label"] = _pos_label
+            _bm["positive_rate"] = (round(_pos_ct / (_pos_ct + _neg_ct), 6)
+                                    if (_pos_ct is not None and _neg_ct is not None
+                                        and (_pos_ct + _neg_ct) > 0) else None)
+            _tref["baseline_metrics"] = _bm
+            # Parça 3b: importance (transformed-space {model_feature: value}) — PSI drift'in importance-
+            # ağırlıklı sıralaması için. baseline_metrics deseni (shallow, mutate yok). Yoksa None →
+            # PSI düz ortalamaya düşer (fallback). raw→transformed provenance PSI-anında manifest'ten kurulur.
+            _tref["feature_importance"] = evaluation_report.get("feature_importance") or None
+            _patch = {"training_reference": _tref}
+            if _art.model_ref:                       # Faz B başarılıysa complete'e ilerle
+                _patch["phase"] = "complete"
+            else:
+                logger.info("[eval] Faz C: model_ref BOŞ (Faz B başarısız) → baseline yazıldı, "
+                            "phase complete YAPILMADI (invariant: complete ⟹ model_ref dolu)")
+            update_artifact_fields(_art_id, _patch)
+            logger.info(f"[eval] Faz C baseline_metrics eklendi: artifact={_art_id} "
+                        f"phase={_patch.get('phase', 'model')}")
+        except Exception as _e:
+            logger.error(f"[eval] Faz C artifact güncellenemedi (fail-open, koşu sürüyor): {_e}")
+
     return {
         **state,
         "evaluation_report": evaluation_report,

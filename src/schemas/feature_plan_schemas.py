@@ -82,7 +82,9 @@ class FeaturePlan(BaseModel):
             "(ratio/product/difference/power/weighted_sum/zscore/log/normalize) bir op seçip "
             "MEVCUT sayısal kolonları girdi verir. Örn: hız = ratio(distance, time); "
             "alan = product(width, height); kare = power(x) params=[2]. "
-            "Hedef kolonu ve leakage şüphelilerini ASLA girdi olarak kullanma."
+            "Hedef kolonu ve leakage şüphelilerini ASLA girdi olarak kullanma. "
+            "Başka bir derived_feature'ın ÇIKTISINI girdi olarak ASLA kullanma — "
+            "zincirleme türetme YOK; her spec YALNIZ ham (mevcut) kolonlardan beslenir."
         )
     )
     reasoning: str = Field(

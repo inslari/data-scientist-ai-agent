@@ -8,7 +8,37 @@
 venv/
 env/
 ENV/
-data/
+data/*
+# Silinen model'lerin kalıcı sigorta kaydı — data/ ignore'una rağmen İZLENEBİLİR
+# (git: bir dosyayı geri-dahil için üst dizin `data/*` olmalı, `data/` değil).
+!data/_deleted_models_manifest.txt
+
+# Python Compiled Files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+
+# OS Generated Files
+.DS_Store
+# Environment Variables and Secret Keys (CRITICAL)
+.env
+.env.*
+!.env.example
+
+# Python Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+data/*
+# Silinen model'lerin kalıcı sigorta kaydı — data/ ignore'una rağmen İZLENEBİLİR
+# (git: bir dosyayı geri-dahil için üst dizin `data/*` olmalı, `data/` değil).
+!data/_deleted_models_manifest.txt
 
 # Python Compiled Files
 __pycache__/
@@ -30,3 +60,5 @@ Thumbs.db
 *.swp
 tests/data
 handoff.md
+shadow-.log
+shadow_data/

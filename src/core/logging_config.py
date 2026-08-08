@@ -57,6 +57,51 @@ _FORMAT = "%(asctime)s %(levelname)-7s %(name)s [project=%(project_id)s] %(messa
 _DATEFMT = "%H:%M:%S"
 
 
+class _EncodingSafeStreamHandler(logging.StreamHandler):
+    """Console handler — encoding/IO hatası ASLA çağıranı düşürmez (FAIL-OPEN).
+
+    Windows'ta stdout/pipe cp1252'dir; Türkçe harf (``ı``, ``ş``) ve durum simgeleri
+    (``▶``, ``✓``, ``▒``) içeren log satırları ``stream.write`` sırasında
+    ``UnicodeEncodeError`` fırlatır. Python'un varsayılan ``StreamHandler.emit``'i bunu
+    ``handleError`` ile yakalar ama (a) satırı düşürür ve (b) stderr'e binlerce
+    ``--- Logging error ---`` traceback'i basar (pipe'lanan log dosyasını da bozar).
+    Bir worker job'ı BUNUN yüzünden kesilmemeli — bu, loglamanın fail-open olması
+    gerektiği ilkesinin (PYTHONIOENCODING env'i yalnız SEMPTOM çözer) kod tarafı.
+
+    İki savunma:
+      1) stream'i ``utf-8`` + ``errors='backslashreplace'``e reconfigure et → encode
+         hatası YAPISAL olarak kalkar, Türkçe/simgeler düzgün yazılır.
+      2) buna rağmen bir yazım patlarsa (reconfigure'ı desteklemeyen/kapanmış stream):
+         satırı ASCII'ye indirip yeniden dene; o da patlarsa SESSİZCE düş — koşu SÜRER,
+         ``handleError`` çağrılmaz (spam yok).
+    """
+
+    def __init__(self, stream=None) -> None:
+        super().__init__(stream)
+        reconfigure = getattr(self.stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+            except (ValueError, OSError):
+                pass  # stream reconfigure desteklemiyor (detached/replaced) → emit fallback yakalar
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self.stream.write(msg + self.terminator)
+            self.flush()
+        except Exception:
+            # FAIL-OPEN: hiçbir log yazımı koşuyu düşüremez. Önce ASCII'ye indirilmiş
+            # sürümü dene; o da olmazsa bu satırı DÜŞÜR (koşu sürer). handleError'ın
+            # stderr spam'i bilinçli olarak devre dışı — satır kaybı > koşu kaybı.
+            try:
+                safe = self.format(record).encode("ascii", "backslashreplace").decode("ascii")
+                self.stream.write(safe + self.terminator)
+                self.flush()
+            except Exception:
+                pass
+
+
 class _ProjectContextFilter(logging.Filter):
     """Her log kaydına aktif `project_id`'yi ekler (contextvar'dan).
 
@@ -97,8 +142,9 @@ def _build_handlers(
     ctx_filter = _ProjectContextFilter()
     fmt = logging.Formatter(fmt=_FORMAT, datefmt=_DATEFMT)
 
-    # 1) Console — her zaman.
-    console = logging.StreamHandler(sys.stdout)
+    # 1) Console — her zaman. Encoding-güvenli: Windows cp1252 stdout'unda Türkçe/simge
+    #    içeren satır emit'i çökertmesin (fail-open, bkz. _EncodingSafeStreamHandler).
+    console = _EncodingSafeStreamHandler(sys.stdout)
     console.setLevel(console_level)
     console.setFormatter(fmt)
     console.addFilter(ctx_filter)

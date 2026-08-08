@@ -308,7 +308,10 @@ def _normalize_column_names(
 
 
 # Cleaning
-def _clean_data(df: pd.DataFrame) -> pd.DataFrame:
+def _clean_data(df: pd.DataFrame, impute_missing: bool = True) -> pd.DataFrame:
+    # T3a-1: ``impute_missing=False`` → impute BLOĞU atlanır; sahiplik orkestratörün pre-split
+    # ``ImputeStep``'ine geçer (aynı konum, tüm-df fit → metrik-NÖTR). string-cast/dedup/currency
+    # YERİNDE kalır. legacy/shadow modda ``True`` (mevcut davranış BİREBİR).
     # _load_data'daki convert_dtypes() kategorikleri pandas StringDtype yapar; ama tum
     # encoding/feature kodu select_dtypes(include="object") kullanir ve StringDtype'i
     # YAKALAMAZ → kategorikler encode edilmeden to_numeric ile 0'a coerce olur (olu
@@ -336,20 +339,22 @@ def _clean_data(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors='coerce')
             logger.info(f"[feature_eng] '{col}' kolonu metin bazli currency algilandi, numerik formata cevrildi.")
 
-    for col in df.select_dtypes(include="number").columns:
-        if df[col].isnull().any():
-            med_val = df[col].median()
-            if pd.api.types.is_integer_dtype(df[col]):
-                med_val = int(round(med_val))
-            df[col] = df[col].fillna(med_val)
+    if impute_missing:
+        for col in df.select_dtypes(include="number").columns:
+            if df[col].isnull().any():
+                med_val = df[col].median()
+                if pd.api.types.is_integer_dtype(df[col]):
+                    med_val = int(round(med_val))
+                df[col] = df[col].fillna(med_val)
 
-    for col in df.select_dtypes(include="object").columns:
-        if df[col].isnull().any():
-            mode = df[col].mode()
-            if not mode.empty:
-                df[col] = df[col].fillna(mode[0])
+        for col in df.select_dtypes(include="object").columns:
+            if df[col].isnull().any():
+                mode = df[col].mode()
+                if not mode.empty:
+                    df[col] = df[col].fillna(mode[0])
 
-    logger.info(f"[feature_eng] Temizlik sonrasi: {len(df):,} satır | null: {df.isnull().sum().sum()}")
+    logger.info(f"[feature_eng] Temizlik sonrasi: {len(df):,} satır | null: {df.isnull().sum().sum()}"
+                f"{' (impute orkestratörde)' if not impute_missing else ''}")
     return df
 
 
@@ -1197,63 +1202,41 @@ def _detect_leakage(
 def _encode_categorical_tt(
     X_train: pd.DataFrame, X_test: pd.DataFrame, y_train: pd.Series
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    cat_cols = X_train.select_dtypes(include="object").columns.tolist()
-    if not cat_cols:
-        return X_train, X_test
-    # Kardinalite karari TRAIN'e gore (test'e bakmadan).
-    low  = [c for c in cat_cols if X_train[c].nunique() <= 10]
-    high = [c for c in cat_cols if X_train[c].nunique() >  10]
-    if low:
-        X_train = pd.get_dummies(X_train, columns=low, drop_first=True, dtype=int)
-        X_test  = pd.get_dummies(X_test,  columns=low, drop_first=True, dtype=int)
-        # Test'i train kolon setine hizala: train'de olmayan dummy (gorulmeyen
-        # kategori) duser, test'te eksik dummy 0 ile doldurulur → ayni kolon seti.
-        X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
-        logger.info(f"[feature_eng] One-hot ({len(low)}, train-fit): {low}")
-    if high:
-        try:
-            enc = TargetEncoder(random_state=settings.RANDOM_SEED)
-            X_train[high] = enc.fit_transform(X_train[high], y_train)
-            X_test[high]  = enc.transform(X_test[high])
-            logger.info(f"[feature_eng] Target encoding ({len(high)}, train-fit): {high}")
-        except Exception as e:
-            logger.error(f"[feature_eng] Target encoding hatasi → kolonlar drop ediliyor: {e}")
-            X_train = X_train.drop(columns=high, errors="ignore")
-            X_test  = X_test.drop(columns=high, errors="ignore")
+    """**T5a — DELEGE (ikiz implementasyon tek noktaya indi).** Gövde artık orkestratörün
+    ``OneHotStep/TargetEncodeStep (+ decide_encode_route)`` adımını çağırır; algoritma TEK yerde yaşar. Çağrı yüzeyi (imza + dönüş şekli)
+    KORUNUR — çağıranlar ve testler değişmez. Doğrulama ZAMANSAL yapıldı: delegasyon öncesi
+    legacy çıktısı ``data/_t5a_baseline.json``'a alındı, sonrası onunla karşılaştırıldı
+    (modal kontrol arm'ı bu adımda öldüğü için tek geçerli ölçüt budur — bkz. handoff)."""
+    from src.services.inference.orchestrator import decide_encode_route
+    from src.services.inference.steps import OneHotStep, TargetEncodeStep
+    # LEGACY SEMANTİĞİ: bu fonksiyonun ``exclude`` parametresi YOKTU → boş küme geçilir
+    # (orkestratör yolunda ``encode_exclude`` ctx'ten gelir; burada gelmemeli).
+    route = decide_encode_route(X_train, exclude=None)
+    for anahtar, sinif in (("onehot", OneHotStep), ("target", TargetEncodeStep)):
+        step = sinif(config={"columns": route[anahtar]})
+        X_train, params = step.fit_transform(X_train, y_train)   # E: train cross-fit yolu
+        X_test = step.transform(X_test, params)                  # serving yolu
     return X_train, X_test
 
 
 def _scale_features_tt(
     X_train: pd.DataFrame, X_test: pd.DataFrame, outlier_cols: list[str]
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    num = X_train.select_dtypes(include="number").columns.tolist()
-    if not num:
-        return X_train, X_test
-    # inf temizligi: train median'i ile (test'e de TRAIN median uygulanir).
-    inf_cols = [
-        c for c in num
-        if np.isinf(pd.to_numeric(X_train[c], errors="coerce").to_numpy(dtype="float64")).any()
-        or np.isinf(pd.to_numeric(X_test[c],  errors="coerce").to_numpy(dtype="float64")).any()
-    ]
-    if inf_cols:
-        X_train[inf_cols] = X_train[inf_cols].replace([np.inf, -np.inf], np.nan)
-        X_test[inf_cols]  = X_test[inf_cols].replace([np.inf, -np.inf], np.nan)
-        med = X_train[inf_cols].median()
-        X_train[inf_cols] = X_train[inf_cols].fillna(med).fillna(0.0)
-        X_test[inf_cols]  = X_test[inf_cols].fillna(med).fillna(0.0)
-        logger.info(f"[feature_eng] inf temizlendi (train median, scaling oncesi): {inf_cols}")
-    robust   = [c for c in outlier_cols if c in num]
-    standard = [c for c in num if c not in robust]
-    if robust:
-        sc = RobustScaler().fit(X_train[robust])
-        X_train[robust] = sc.transform(X_train[robust])
-        X_test[robust]  = sc.transform(X_test[robust])
-        logger.info(f"[feature_eng] RobustScaler (train-fit): {len(robust)} kolon")
-    if standard:
-        sc = StandardScaler().fit(X_train[standard])
-        X_train[standard] = sc.transform(X_train[standard])
-        X_test[standard]  = sc.transform(X_test[standard])
-        logger.info(f"[feature_eng] StandardScaler (train-fit): {len(standard)} kolon")
+    """**T5a — DELEGE (ikiz implementasyon tek noktaya indi).** Gövde artık orkestratörün
+    ``InfImputeStep + Robust/StandardScaleStep (+ decide_scaler_route)`` adımını çağırır; algoritma TEK yerde yaşar. Çağrı yüzeyi (imza + dönüş şekli)
+    KORUNUR — çağıranlar ve testler değişmez. Doğrulama ZAMANSAL yapıldı: delegasyon öncesi
+    legacy çıktısı ``data/_t5a_baseline.json``'a alındı, sonrası onunla karşılaştırıldı
+    (modal kontrol arm'ı bu adımda öldüğü için tek geçerli ölçüt budur — bkz. handoff)."""
+    from src.services.inference.orchestrator import decide_scaler_route
+    from src.services.inference.steps import InfImputeStep, RobustScaleStep, StandardScaleStep
+    inf_step = InfImputeStep()
+    X_train, inf_params = inf_step.fit_transform(X_train, None)
+    X_test = inf_step.transform(X_test, inf_params)
+    route = decide_scaler_route(X_train, outlier_cols=outlier_cols)
+    for anahtar, sinif in (("robust", RobustScaleStep), ("standard", StandardScaleStep)):
+        step = sinif(config={"columns": route[anahtar]})
+        X_train, params = step.fit_transform(X_train, None)
+        X_test = step.transform(X_test, params)
     return X_train, X_test
 
 
@@ -1389,8 +1372,19 @@ def _leakage_exclude_cols(feature_plan: dict, meta, domain_leakage_report: dict)
     return {c for c in excl if c}
 
 
+# ── T5-D: HAM-SATIR SERVING CUTOVER ANAHTARI (geçici iskele) ──────────────────
+# İkiz borç üç üreticide devrediliyor: D1 missing_indicator · D2 ratio_construct · D3 zero_flag.
+# ÖLÇÜLDÜ: her devir, fully-built yolu O ADIM için BOZAR — eğitim kolonu artık adımda üretir
+# (`delta.added` dolu) ama fully-built X_test'te kolon zaten vardır → adım atlar → "eksik ekleme".
+# Yani ara durumlar üretimde koşulamaz. Bu yüzden devirler TEK anahtarla ATOMİK açılır:
+#   False → bugünkü davranış (inline yazma + fully-built X_test) — üretim her adımda ÇALIŞIR
+#   True  → tam ham-satır yolu (adımlar üretir + transform_pipeline ham satırdan başlar)
+# D3 bitip 6-dataset G1/G2 ölçümü yeşil olunca anahtar KALKAR, ham yol tek yol olur.
+SERVING_RAW_REPLAY = True    # T5-D3 sonrası CUTOVER: ham-satır serving tek yol
+
+
 def _add_missing_indicators(df: pd.DataFrame, max_cols: int = _MISSING_IND_MAX_COLS,
-                            exclude: set | None = None) -> list[str]:
+                            exclude: set | None = None, write: bool = True) -> list[str]:
     """fillna ONCESI cagrilir: null tasiyan kolonlar icin '<col>_isna' (0/1) ekler →
     eksiklik sinyalini korur (impute bu bilgiyi siler). Row-wise: capraz-satir istatistik
     YOK → leakage YOK, split'ten once guvenli. Cok az/cok cok null tasiyan kolonlar dusuk
@@ -1398,7 +1392,14 @@ def _add_missing_indicators(df: pd.DataFrame, max_cols: int = _MISSING_IND_MAX_C
 
     ``exclude``: target/identifier/leakage-suspect kolonlar — bunlardan '<col>_isna'
     TURETME (own-goal onleme): leaky bir kolon 'sadece pozitifte dolu' ise '<col>_isna'
-    target'i birebir kopyalar; bu kolonu hic uretmeyiz."""
+    target'i birebir kopyalar; bu kolonu hic uretmeyiz.
+
+    ``write=False`` (T5-D1, İKİZ BORÇ DEVRİ): SEÇİM yapılır, YAZMA yapılmaz — kolon adları
+    döndürülür ama ``df`` değişmez. Sahiplik orkestratörün ``MissingIndicatorStep``'ine geçer
+    (order 0). Gerekçe: inline üretim sürdükçe adım eğitimde "kolon zaten var" görüp ATLIYOR
+    (``delta.added=[]``) ama ham serving replay'inde ÜRETİYOR → adımın kolon sözleşmesi eğitimle
+    serving arasında AYRIŞIYOR. Delta-guard bunu yakaladı (§2.34). Seçim BURADA kalır (donmuş
+    karar, ``missing_indicator_meta``); devredilen yalnız YAZMA."""
     exclude = exclude or set()
     null_cols = [c for c in df.columns if c not in exclude and df[c].isnull().any()]
     null_cols = sorted(null_cols, key=lambda c: df[c].isnull().mean(), reverse=True)[:max_cols]
@@ -1407,10 +1408,12 @@ def _add_missing_indicators(df: pd.DataFrame, max_cols: int = _MISSING_IND_MAX_C
         name = f"{c}_isna"
         if name in df.columns:
             continue
-        df[name] = df[c].isnull().astype("int8")
+        if write:
+            df[name] = df[c].isnull().astype("int8")
         added.append(name)
     if added:
-        logger.info(f"[feature_eng] Missing-indicator ({len(added)}): {added}")
+        logger.info(f"[feature_eng] Missing-indicator ({len(added)}): {added}"
+                    f"{'' if write else ' (SEÇİM; yazma orkestratörde — T5-D1)'}")
     return added
 
 
@@ -1421,24 +1424,18 @@ def _count_encode_tt(
     Frekanslar SADECE train'den ogrenilir; test train frekansiyla maplenir, gorulmeyen
     kategori → 0. Leakage-safe (target kullanmaz); ucuz ama guclu kategorik sinyal
     (nadir/sik kategori ayrimi). Encode ONCESI calismali (ham kategorikleri kullanir).
-    ``exclude``: leakage-suspect/target kolonlardan 'count_' turetme (own-goal onleme)."""
-    exclude = exclude or set()
-    cat_cols = [c for c in X_train.select_dtypes(include="object").columns if c not in exclude]
-    added: list[str] = []
-    for c in cat_cols:
-        card = X_train[c].nunique()
-        if card < _COUNT_ENCODE_MIN_CARD or card > _COUNT_ENCODE_MAX_CARD:
-            continue
-        name = f"count_{c}"
-        if name in X_train.columns:
-            continue
-        freq = X_train[c].value_counts()
-        X_train[name] = X_train[c].map(freq).fillna(0).astype("int32")
-        X_test[name]  = X_test[c].map(freq).fillna(0).astype("int32")
-        added.append(name)
-    if added:
-        logger.info(f"[feature_eng] Count-encoding ({len(added)}, train-fit): {added}")
-    return X_train, X_test, added
+    ``exclude``: leakage-suspect/target kolonlardan 'count_' turetme (own-goal onleme).
+
+    **T5a — DELEGE (ikiz implementasyon tek noktaya indi).** Gövde artık orkestratörün
+    ``CountEncodeStep`` adımını çağırır; algoritma TEK yerde yaşar. Çağrı yüzeyi (imza + dönüş şekli)
+    KORUNUR — çağıranlar ve testler değişmez. Doğrulama ZAMANSAL yapıldı: delegasyon öncesi
+    legacy çıktısı ``data/_t5a_baseline.json``'a alındı, sonrası onunla karşılaştırıldı
+    (modal kontrol arm'ı bu adımda öldüğü için tek geçerli ölçüt budur — bkz. handoff).
+    """
+    from src.services.inference.steps import CountEncodeStep
+    step = CountEncodeStep(config={"exclude": list(exclude or [])})
+    X_train, params = step.fit_transform(X_train, None)
+    return X_train, step.transform(X_test, params), list(params.keys())
 
 
 def _groupby_deviation_tt(
@@ -1461,93 +1458,28 @@ def _groupby_deviation_tt(
 
     Patlama korumasi: dusuk-kardinaliteli cat'ler × en yuksek normalize-varyansli sayisallar,
     cift sayisi cap'li. Encode ONCESI calismali (ham kategorikleri grup anahtari yapar).
-    ``exclude``: leakage-suspect/target kolonlari ne grup anahtari ne sayisal girdi yap."""
-    exclude = exclude or set()
-    cat_cols = [c for c in X_train.select_dtypes(include="object").columns
-                if c not in exclude and _GROUPBY_MAX_CARD >= X_train[c].nunique() >= 2]
-    num_cols = X_train.select_dtypes(include="number").columns.tolist()
-    # Turetilmis kolonlari grup-deviation GIRDISI yapma → gurultu/dongu onle.
-    # zdev_/grpstd_ ayrica eklenir: startswith("dev_") 'zdev_'i YAKALAMAZ.
-    num_cols = [c for c in num_cols
-                if c not in exclude
-                and not c.startswith(("count_", "dev_", "zdev_", "grpstd_", "is_zero_", "ratio_"))
-                and not c.endswith("_isna")]
-    if not cat_cols or not num_cols:
-        return X_train, X_test, []
+    ``exclude``: leakage-suspect/target kolonlari ne grup anahtari ne sayisal girdi yap.
 
-    # cat secimi: dusuk kardinalite once (grup basina daha cok satir → stabil ortalama)
-    cat_cols = sorted(cat_cols, key=lambda c: X_train[c].nunique())[:_GROUPBY_MAX_CAT_COLS]
+    **T5a — DELEGE (ikiz implementasyon tek noktaya indi).** Gövde artık orkestratörün
+    ``GroupbyDeviationStep`` adımını çağırır; algoritma TEK yerde yaşar. Çağrı yüzeyi (imza + dönüş şekli)
+    KORUNUR — çağıranlar ve testler değişmez. Doğrulama ZAMANSAL yapıldı: delegasyon öncesi
+    legacy çıktısı ``data/_t5a_baseline.json``'a alındı, sonrası onunla karşılaştırıldı
+    (modal kontrol arm'ı bu adımda öldüğü için tek geçerli ölçüt budur — bkz. handoff).
+    """
+    from src.services.inference.steps import GroupbyDeviationStep
+    step = GroupbyDeviationStep(config={"exclude": list(exclude or [])})
+    X_train, params = step.fit_transform(X_train, None)
+    emitted = [name for rec in (params or []) for _, name in rec.get("emits", [])]
+    return X_train, step.transform(X_test, params), emitted
 
-    # num secimi: olcek-bagimsiz yayilim (min-max normalize varyans) yuksek olanlar once
-    def _norm_var(c: str) -> float:
-        s = pd.to_numeric(X_train[c], errors="coerce")
-        lo, hi = s.min(), s.max()
-        if pd.isna(lo) or pd.isna(hi) or hi == lo:
-            return 0.0
-        return float(((s - lo) / (hi - lo)).var())
-    num_cols = sorted(num_cols, key=lambda c: (-_norm_var(c), c))[:_GROUPBY_MAX_NUM_COLS]
-
-    added: list[str] = []
-
-    def _emit(name: str, tr: "pd.Series", te: "pd.Series") -> None:
-        if name in X_train.columns:
-            return
-        X_train[name] = tr.values
-        X_test[name]  = te.values
-        added.append(name)
-
-    for cat in cat_cols:
-        if len(added) >= _GROUPBY_MAX_FEATURES:
-            break
-        # Guvenilir grup kapisi: sadece >= N satirli gruplarin istatistigi kullanilir;
-        # kalanlar (ve gorulmeyen test kategorileri) global istatistige duser.
-        sizes = X_train[cat].value_counts()
-        reliable = set(sizes[sizes >= _GROUPBY_MIN_GROUP_SIZE].index)
-        if len(reliable) < 2:
-            continue  # >=2 guvenilir kontrast grubu yok → feature dejenere olurdu, atla
-        cat_tr, cat_te = X_train[cat], X_test[cat]
-        for num in num_cols:
-            if len(added) >= _GROUPBY_MAX_FEATURES:
-                break
-            xtr = pd.to_numeric(X_train[num], errors="coerce")
-            xte = pd.to_numeric(X_test[num], errors="coerce")
-            g = xtr.groupby(cat_tr)
-            grp_mean = g.mean()
-            grp_std  = g.std(ddof=0)   # ddof=0 → tek-degerli grup NaN degil 0 verir
-            global_mean = float(xtr.mean())
-            global_std  = float(xtr.std(ddof=0))
-            if pd.isna(global_mean):
-                global_mean = 0.0
-            if pd.isna(global_std):
-                global_std = 0.0
-            # guvenilmez gruplari global'e sabitle (index bazli where)
-            grp_mean = grp_mean.where(grp_mean.index.isin(reliable), global_mean)
-            grp_std  = grp_std.where(grp_std.index.isin(reliable), global_std)
-
-            mean_tr = cat_tr.map(grp_mean).fillna(global_mean)
-            mean_te = cat_te.map(grp_mean).fillna(global_mean)
-            std_tr  = cat_tr.map(grp_std).fillna(global_std)
-            std_te  = cat_te.map(grp_std).fillna(global_std)
-
-            # dev = x − grup ort.
-            _emit(f"dev_{num}_by_{cat}",
-                  (xtr - mean_tr).fillna(0.0), (xte - mean_te).fillna(0.0))
-            # zdev = (x − grup ort.) / grup std ; sigma=0/NaN → 0 (guvenli)
-            z_tr = ((xtr - mean_tr) / std_tr.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            z_te = ((xte - mean_te) / std_te.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            _emit(f"zdev_{num}_by_{cat}", z_tr, z_te)
-            # grpstd = grubun std'i (grup ici degiskenlik)
-            _emit(f"grpstd_{num}_by_{cat}", std_tr.fillna(0.0), std_te.fillna(0.0))
-
-    if added:
-        logger.info(f"[feature_eng] Groupby-stats ({len(added)}, train-fit, cap={_GROUPBY_MAX_FEATURES}): {added}")
-    return X_train, X_test, added
 
 
 # ── MAIN NODE ────────────────────────────────────────────────
+# NOT (T5b): bu iki sabit T5a'da gövde-devri sırasında KAZAEN silinmişti (script "bir sonraki
+# def'e kadar" temizlerken modül düzeyindeki bu atamaları da yuttu) → `_FEATURE_OPS` ve
+# `_sanitize_params` NameError verdi ve `tests/test_feature_specs.py` 7 testle KIRILDI.
+# Tam suite koşusu yakaladı; parity dosyası tek başına görmemişti (o yolu tetiklemiyor).
 _FEATURE_SPEC_EPS = 1e-9
-
-# Bounds keep the deterministic ops numerically safe regardless of what the LLM picks.
 _POWER_EXP_BOUNDS = (-3.0, 3.0)
 
 
@@ -1594,7 +1526,8 @@ def _sanitize_params(op: str, params: list) -> list:
     return out
 
 
-def _run_feature_specs(df: pd.DataFrame, specs: list, disallowed: set, *, source_label: str) -> list[str]:
+def _run_feature_specs(df: pd.DataFrame, specs: list, disallowed: set, *, source_label: str,
+                       skip_ops: "frozenset | set | None" = None) -> list[str]:
     """Validate + deterministically apply a list of ``FeatureSpec``s in place.
 
     Shared executor for both the agent-driven path (``merchant_analysis``) and the
@@ -1607,10 +1540,20 @@ def _run_feature_specs(df: pd.DataFrame, specs: list, disallowed: set, *, source
     from src.domains.schemas import validate_feature_spec_shape
 
     deny = {c for c in (disallowed or set()) if c}
+    skip = set(skip_ops or ())
     added: list[str] = []
     for spec in specs:
         try:
             if spec.op not in _FEATURE_OPS:
+                continue
+            if spec.op in skip:
+                # T4b — SAHİPLİK DEVRİ: bu op portlandı ve orkestratörün adımı üretiyor
+                # (train-fit, #5 fiksi). Burada da çalışsaydı kolon ZATEN var olur, adımın
+                # `name in X_train.columns` kapısı onu ATLAR ve fiks hiç devreye girmezdi
+                # (ÇİFT-ÇALIŞMA sessizce fiksi iptal ederdi). `_clean_data(impute_missing=False)`
+                # deseninin aynısı. Yalnız orchestrator modunda; legacy/shadow etkilenmez.
+                logger.info(f"[feature_eng] FeatureSpec '{spec.name}' atlandi: "
+                            f"'{spec.op}' orkestratorde (T4b sahiplik devri)")
                 continue
             params = _sanitize_params(spec.op, getattr(spec, "params", None))
             if params is None or not validate_feature_spec_shape(spec.op, len(spec.inputs), len(params)):
@@ -1656,7 +1599,8 @@ def _apply_feature_specs(df: pd.DataFrame, state: dict, disallowed: set) -> list
     return _run_feature_specs(df, specs, disallowed, source_label="Ajan")
 
 
-def _apply_plan_derived_features(df: pd.DataFrame, feature_plan: dict, disallowed: set) -> list[str]:
+def _apply_plan_derived_features(df: pd.DataFrame, feature_plan: dict, disallowed: set,
+                                 skip_ops: "frozenset | set | None" = None) -> list[str]:
     """Apply the generic, sector-independent ``feature_plan.derived_features``.
 
     The feature planner LLM proposes dataset-meaningful derived columns (e.g.
@@ -1675,7 +1619,7 @@ def _apply_plan_derived_features(df: pd.DataFrame, feature_plan: dict, disallowe
             logger.info(f"[feature_eng] derived_feature atlandi (parse): {e}")
     if not specs:
         return []
-    return _run_feature_specs(df, specs, disallowed, source_label="Plan")
+    return _run_feature_specs(df, specs, disallowed, source_label="Plan", skip_ops=skip_ops)
 
 
 def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata") -> list[str]:
@@ -1755,7 +1699,7 @@ def _target_distribution(y_arr, intent: str) -> "tuple[dict | None, dict | None]
 
 def _build_zero_missing_flags(
     df: pd.DataFrame, original_cols: set, intent: str, aggregated: bool,
-    force_zero_cols: "set | None" = None,
+    force_zero_cols: "set | None" = None, write: bool = True,
 ) -> tuple[pd.DataFrame, list[str]]:
     """DOKUNUS 2: is_zero (orijinal sayisal kolon) + was_missing (DOKUNUS 1 tasiyicisi)
     flag'lerini PLAIN INT olarak uret. Kapsam disi/aggregation/aday yok → tasiyicilari
@@ -1845,12 +1789,20 @@ def _build_zero_missing_flags(
                     f"{cap_normal} (forced={len(forced_added)}) → kirpildi")
         candidates = candidates[:cap_normal]
 
+    # T5-D3 (ikiz borç devri — EN DİKKATLİ olan): ``write=False`` → SEÇİM aynen yapılır,
+    # YAZMA ``ZeroFlagStep``'e (order 6) geçer. **KURAL: seçim BURADA kalır.** ``force_zero_cols``
+    # invariant'ı (oran motorunun sıfır-payda kolonları prevalence kapısından VE cap'ten MUAF,
+    # §2.18 / Faz 0) yukarıdaki seçim mantığının içinde yaşıyor ve adımın içinde YENİDEN
+    # KURULMAZ — kurulsaydı motorlar-arası kuplaj inference paketinde yeniden doğar (tam da
+    # kaçındığımız drift). Devredilen yalnız ``df[name] = s`` satırı.
     added: list[str] = []
     for name, s in forced_added:          # invariant flag'ler once (cap-muaf)
-        df[name] = s
+        if write:
+            df[name] = s
         added.append(name)
     for name, s, _ in candidates:
-        df[name] = s
+        if write:
+            df[name] = s
         added.append(name)
     logger.info(f"[feature_eng] zero/missing flag uretildi ({len(added)}): {added}")
     if forced_added:
@@ -1861,7 +1813,7 @@ def _build_zero_missing_flags(
 
 def _build_ratio_features(
     df: pd.DataFrame, original_cols: set, meta: "ColumnMetadata",
-    intent: str, aggregated: bool, leaky_cols_high: set,
+    intent: str, aggregated: bool, leaky_cols_high: set, write: bool = True,
 ) -> tuple[pd.DataFrame, list[str], set, dict]:
     """Deterministik oran (a/b) motoru — modelin yapamadigi olcek-carprazi sinyal.
     Yalniz ORIJINAL sayisal kolonlar; binary/sabit (nunique<3), ID-benzeri (nunique/n_rows>0.95
@@ -1963,7 +1915,12 @@ def _build_ratio_features(
     denom_zero_cols: set = set()   # sifir iceren + fiilen kullanilan payda → is_zero flag GARANTI
     ratio_meta: dict[str, tuple[str, str]] = {}   # {ratio_kolon: (pay, payda)} → etiket bundan kurulur
     for name, arr, _, num_name, denom in candidates:
-        df[name] = arr                       # HAM oran (NaN korunur; winsor/impute split sonrasi)
+        # T5-D2 (ikiz borç devri): ``write=False`` → SEÇİM + meta üretilir, KOLON YAZILMAZ.
+        # Sahiplik ``RatioConstructStep``'e (order 5) geçer; adım aynı çekirdeği uygular
+        # ((num/den) + inf→NaN). Seçim BURADA kalır — ``ratio_meta`` donmuş karar kaynağıdır
+        # ve ``denom_zero_cols`` üzerinden zero-flag invariant'ını besler (§2.18 kuplajı).
+        if write:
+            df[name] = arr                   # HAM oran (NaN korunur; winsor/impute split sonrasi)
         added.append(name)
         ratio_meta[name] = (num_name, denom)   # string-parse belirsizligine karsi kesin kaynak
         if zero_frac.get(denom, 0.0) > 0.0:
@@ -2018,11 +1975,18 @@ def _finalize_ratio_features_tt(
     X_train: pd.DataFrame, X_test: pd.DataFrame, cols: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Oran kolonlarini train'e FIT, train+test'e TRANSFORM et (leakage-safe). Winsor
-    sinirlari ve impute median X_train'den; X_test yalniz transform gorur."""
-    if not cols:
-        return X_train, X_test
-    stats = _fit_ratio_stats(X_train, cols)
-    return _apply_ratio_stats(X_train, stats), _apply_ratio_stats(X_test, stats)
+    sinirlari ve impute median X_train'den; X_test yalniz transform gorur.
+
+    **T5a — DELEGE (ikiz implementasyon tek noktaya indi).** Gövde artık orkestratörün
+    ``RatioFinalizeStep`` adımını çağırır; algoritma TEK yerde yaşar. Çağrı yüzeyi (imza + dönüş şekli)
+    KORUNUR — çağıranlar ve testler değişmez. Doğrulama ZAMANSAL yapıldı: delegasyon öncesi
+    legacy çıktısı ``data/_t5a_baseline.json``'a alındı, sonrası onunla karşılaştırıldı
+    (modal kontrol arm'ı bu adımda öldüğü için tek geçerli ölçüt budur — bkz. handoff).
+    """
+    from src.services.inference.steps import RatioFinalizeStep
+    step = RatioFinalizeStep(config={"columns": list(cols)})
+    X_train, params = step.fit_transform(X_train, None)
+    return X_train, step.transform(X_test, params)
 
 
 def _finalize_ratio_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -2033,12 +1997,101 @@ def _finalize_ratio_features(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return _apply_ratio_stats(df, _fit_ratio_stats(df, cols))
 
 
+def _admit_spec(s, deny: set) -> "dict | None":
+    """Tek spec'i KABUL KURALLARINDAN geçir → normalize edilmiş kayıt, ya da ``None``.
+
+    **TEK KAYNAK (§2.19'un 4. örneğinin gereği):** eski yolda (``_run_feature_specs``) her spec
+    çalışmadan önce leakage denylist'inden ve şekil doğrulamasından geçiyordu; o kapılar op'un
+    ÇEVRESİNDE yaşıyordu ve op emekli olunca kaybolacaktı. Kapılar burada, beyan yüzeyinde.
+    İki farklı ÇIKTI ŞEKLİ (parametric çift vs rowwise altılı) bu tek kabul mantığını paylaşır.
+
+    ``params`` BEYAN ANINDA clamp'lenir (``_sanitize_params``) ve clamp uygulandıysa ORİJİNAL
+    değer de kaydedilir: kullanıcının planı ``power=99`` derken biz ``3.0`` hesaplıyorsak bu
+    artifact'te GÖRÜNMELİ — sessizce başka bir şey hesaplamış olmayalım."""
+    from src.domains.schemas import validate_feature_spec_shape
+
+    op = s.get("op") if isinstance(s, dict) else getattr(s, "op", None)
+    name = s.get("name") if isinstance(s, dict) else getattr(s, "name", None)
+    inputs = s.get("inputs") if isinstance(s, dict) else getattr(s, "inputs", None)
+    ham_params = s.get("params") if isinstance(s, dict) else getattr(s, "params", None)
+    if not (op and name and inputs):
+        return None
+    params = _sanitize_params(op, ham_params)
+    if params is None or not validate_feature_spec_shape(op, len(inputs), len(params)):
+        logger.info(f"[pipeline_ctx] '{name}' beyan EDİLMEDİ: gecersiz sekil ({op})")
+        return None
+    leaky = [c for c in inputs if c in deny]
+    if leaky:
+        logger.info(f"[pipeline_ctx] '{name}' beyan EDİLMEDİ: leakage girdisi {leaky}")
+        return None
+    kayit = {"name": name, "op": op, "inputs": list(inputs), "params": list(params)}
+    orijinal = [float(v) for v in (ham_params or [])] if ham_params else []
+    if orijinal and orijinal != list(params):
+        kayit["params_clamped"] = True                 # clamp SESSİZ DEĞİL
+        kayit["params_original"] = orijinal
+        logger.info(f"[pipeline_ctx] '{name}' params clamp'lendi: {orijinal} → {list(params)}")
+    return kayit
+
+
+def _plan_specs(feature_plan: dict, disallowed: "set | None") -> list:
+    """Plan'daki TÜM derived_features spec'lerini kabul kurallarından geçir (sıra korunur)."""
+    deny = {c for c in (disallowed or set()) if c}
+    out = []
+    for s in ((feature_plan or {}).get("derived_features") or []):
+        k = _admit_spec(s, deny)
+        if k:
+            out.append(k)
+    return out
+
+
+def plan_op_specs(feature_plan: dict, op_name: str, disallowed: "set | None" = None) -> list:
+    """PARAMETRIC ikili (zscore/normalize) için ``[[çıktı_adı, girdi_kolonu], ...]``.
+
+    Şekil neden ayrı: bu iki op **parametric** (fitted μ/σ, min/max — #5 fiksi), diğer altısı
+    **rowwise**. Ayrım fitted-state ekseninde; tek listede toplamak ya rowwise adımı parametric
+    yapardı ya train-fit'i kaybederdi. Kova bütünlüğü testle çitlenir (her portlu op TAM OLARAK
+    bir beyan listesinde)."""
+    return [[k["name"], k["inputs"][0]] for k in _plan_specs(feature_plan, disallowed)
+            if k["op"] == op_name]
+
+
+def plan_derived_specs(feature_plan: dict, ops: "set | frozenset",
+                       disallowed: "set | None" = None) -> list:
+    """ROWWISE op'lar için tam şekil: ``[{name, op, inputs[], params[], params_clamped?}, ...]``."""
+    return [k for k in _plan_specs(feature_plan, disallowed) if k["op"] in ops]
+
+
+def plan_chained_specs(feature_plan: dict) -> list:
+    """ZİNCİRLEME spec'ler: girdisi BAŞKA bir spec'in çıktısı olanlar (§2.19'un 6. örneği).
+
+    Eski yolda ``_run_feature_specs`` tek ``df`` üzerinde PLAN SIRASINDA ilerliyor ve her spec'i
+    yazdıktan sonra bir sonrakinin girdisini ``df.columns``'a karşı denetliyor (1657) → zincir
+    ÇALIŞIYOR. Orkestratörde spec'ler op-kovalarına bölündüğü (parametric ↔ rowwise) ve sıra
+    PIPELINE'dan geldiği için zincir SESSİZCE kırılırdı: girdi kolonu o an yoktur, spec atlanır,
+    kolon hiç doğmaz. Garanti "tek df + plan sırası" YAPISINDAN geliyordu → açık beyana çevrildi.
+
+    **ÖLÇÜLEMEDİ (üçüncü kez):** planner'ın zincir üretip üretmediği bilinmiyor — elimizdeki tüm
+    gerçek plan verisi ``derived_features`` alanı eklenmeden ÖNCEYE ait (yerel app DB 2026-06-08→14,
+    alan 2026-06-25). Şema zinciri artık AÇIKÇA yasaklıyor (birinci savunma); bu, son savunma."""
+    derived = (feature_plan or {}).get("derived_features") or []
+    adlar = {(s.get("name") if isinstance(s, dict) else getattr(s, "name", None)) for s in derived}
+    adlar.discard(None)
+    zincirli = []
+    for s in derived:
+        nm = s.get("name") if isinstance(s, dict) else getattr(s, "name", None)
+        inp = s.get("inputs") if isinstance(s, dict) else getattr(s, "inputs", None)
+        hits = [c for c in (inp or []) if c in adlar]
+        if hits:
+            zincirli.append({"name": nm, "chained_inputs": hits})
+    return zincirli
+
+
 def assemble_pipeline_ctx(
     *, intent: str, modality: str, aggregated: bool, target_name: str,
     drop_columns: list, ratio_feature_meta: dict, missing_indicator_meta: dict,
     derived_flag_meta: dict, feature_plan: dict, encode_exclude: set,
     outlier_cols, timeseries_lag, domain_feature_cols: list, date_feature_cols: list,
-    column_renames: list,
+    column_renames: list, disallowed: "set | None" = None, date_source_cols: "list | None" = None,
 ) -> dict:
     """Katman 1 BEYAN YÜZEYİ (T0) — orkestratörün ihtiyacı olan her şeyi TEK yerde beyan eder.
 
@@ -2059,21 +2112,13 @@ def assemble_pipeline_ctx(
     SAF fonksiyon: ``build_features``'ın hesapladığı değerleri alır, hiçbir şey hesaplamaz →
     tek başına test edilebilir ve ``build_features``'tan bağımsız evrilir.
     """
-    from src.services.inference.orchestrator import PORTED_FEATURE_OPS
+    from src.services.inference.orchestrator import (PORTED_FEATURE_OPS,
+                                                     PORTED_ROWWISE_OPS)
 
     derived = (feature_plan or {}).get("derived_features") or []
 
     def _specs(op_name: str) -> list:
-        out = []
-        for s in derived:
-            op = s.get("op") if isinstance(s, dict) else getattr(s, "op", None)
-            if op != op_name:
-                continue
-            name = s.get("name") if isinstance(s, dict) else getattr(s, "name", None)
-            inputs = s.get("inputs") if isinstance(s, dict) else getattr(s, "inputs", None)
-            if name and inputs:
-                out.append([name, inputs[0]])
-        return out
+        return plan_op_specs(feature_plan, op_name, disallowed)
 
     ops_used = {(s.get("op") if isinstance(s, dict) else getattr(s, "op", None)) for s in derived}
     unported_ops = sorted(o for o in ops_used if o and o not in PORTED_FEATURE_OPS)
@@ -2092,9 +2137,17 @@ def assemble_pipeline_ctx(
         "zero_flag_cols": list((derived_flag_meta or {}).values()),
         "zscore_specs":   _specs("zscore"),
         "normalize_specs": _specs("normalize"),
+        # 6-OP PORTU: rowwise op'lar TAM ŞEKİLLE (op + tüm inputs + clamp'li params).
+        "derived_specs":  plan_derived_specs(feature_plan, PORTED_ROWWISE_OPS, disallowed),
         "encode_exclude": sorted(encode_exclude or set()),
         "outlier_cols":   sorted(outlier_cols or []),
         "intent":         intent,
+        # T5-(2): currency dönüşümü `_clean_data`'da, portlanmadı → serving girdisi ZATEN
+        # numerik olmalı. `build_features` bu dönüşümü kendi yaptığı için eğitim tarafında
+        # olgu SAĞLANMIŞ sayılır; olgunun değeri "girdi normalize edilmiş mi" sorusudur.
+        "currency_normalized": True,
+        # §2.19'un 6. örneği — zincirleme türev (bir spec'in girdisi başka spec'in çıktısı).
+        "chained_derived_features": plan_chained_specs(feature_plan),
         # ── 3. kapsam olguları ─────────────────────────────────
         # NORMALİZASYON (fail-open kapatma): build_features'ta boş modality "tabular"
         # demektir (`if modality == "timeseries"` else tabular yol). Boş bırakılsaydı
@@ -2104,10 +2157,125 @@ def assemble_pipeline_ctx(
         "aggregated":      bool(aggregated),
         "timeseries_lag":  timeseries_lag,
         "domain_features": list(domain_feature_cols or []),
-        "date_features":   list(date_feature_cols or []),
+        "date_features":   list(date_feature_cols or []),      # türev adları (raporlama; kapsam kuralı KALDIRILDI)
+        "date_source_cols": list(date_source_cols or []),      # DateFeaturesStep (order 2) config kaynağı
         "column_renames":  list(column_renames or []),
         "unported_ops":    unported_ops,
     }
+
+
+def _run_orchestrated_chain(
+    builder, X_train: pd.DataFrame, X_test: pd.DataFrame, y_train, pipeline_ctx: dict,
+    meta, domain_leakage_report: dict, raw_test: "pd.DataFrame | None" = None,
+) -> tuple:
+    """POST-split zinciri (``PIPELINE[7:]``) TEK ``builder``da devret; pre-split orders 0-6
+    (missing-indicator + impute + **drop_columns** (T4a) + **zscore + normalize** (T4b))
+    ``build_features``'ta ZATEN fit edildi → tek order uzayı.
+
+    ⚠️ **KAPI SIRASI (ÖLÇÜLDÜ, varsayılmadı):** ``check_scope`` BURADA çağrılır — yani split'ten
+    SONRA, pre-split adımlardan SONRA. ``ArtifactBuilder`` kurulumunda DEĞİL (dataclass'ın
+    ``__post_init__``'i yok; ``check_scope`` açık bir metottur). Sebep yapısal: ``pipeline_ctx``
+    ancak ratio/zeroflag'den sonra kurulabiliyor. T4a ile ``drop_columns`` + yapısal ön-koşul
+    denetimi pre-split'e kaydığı için **``check_scope``'un ÖNÜNE** geçtiler. Fail-closed HER İKİ
+    sırada da korunur (ikisi de fırlatır, artifact kurulmaz); değişen, ikisini birden ihlal eden
+    bir koşuda önce hangi teşhisin çıktığı. Kilit: ``test_control_gate_order_is_locked``.
+
+    ``ImputeStep`` pre-split (SAHİPLİK ``_clean_data``'dan orkestratöre geçti, T3a-1) ve **T3b-fit'ten
+    itibaren `fit_frame=df.iloc[_train_idx]`** → dolgu istatistiği YALNIZ train'den (#4 fiksi deploy).
+    Artık bit-birebir DEĞİL: sapma yüzeyi = train-medyanı full-medyandan farklı olan kolonların
+    TEST hücreleri (ölçüldü: yalnız housing/``total_bedrooms``, 207 hücre + ondan türeyen 3 oran).
+    ``_FEATURE_OPS`` zscore/normalize hâlâ eski leaky yolda (T4). Beyan dışı sapma = porting bug'ı.
+
+    KAPSAM/ÖN-KOŞUL REDDİ FIRLATIR (bilinçli): pre-split adımlar kapsam-kapısından ÖNCE koşar
+    (pipeline_ctx ancak ratio/zeroflag sonrası hazır) ama fail-closed KORUNUR — ihlal burada
+    ``check_scope``'ta firlar, artifact KURULMAZ. Desteklenen kapsamda (referans setler) fark yok.
+
+    Dönüş: ``(X_train, X_test, mid_train, mid_test, ce_cols, gd_cols,
+    univariate_dropped, leakage_report)`` — ``mid_*`` = ``ratio_finalize`` SONRASI, encode
+    ÖNCESİ çerçeveler (fairness taşıyıcısı + Veri İlişkileri onları ister).
+    """
+    from src.services.inference.orchestrator import transform_pipeline, PIPELINE
+
+    # ``pipeline_ctx`` YAYINLANAN beyan yüzeyidir (feature_report'a girer) ve JSON-temiz
+    # kalmalıdır → ``meta`` gibi canlı objeler YALNIZ burada, çağrı yerinde eklenir.
+    ctx_fit = {**pipeline_ctx, "meta": meta, "domain_leakage_report": domain_leakage_report}
+    builder.check_scope(ctx_fit)                 # KAPSAM KAPISI (ctx hazır; pre-split adımlardan sonra)
+
+    mid: dict = {}
+
+    def _catch(key: str):
+        def _obs(step_id, X):        # X = KOPYA (gözlemci yapısal olarak read-only)
+            if step_id == "ratio_finalize":
+                mid[key] = X
+        return _obs
+
+    # POST-split faz: PIPELINE[7:] (ratio_construct..select) X_train'de; builder order 6'dan devam eder
+    # (0-6 pre-split: missing_indicator, impute, **date_features**, drop_columns (T4a), zscore+normalize (T4b), plan_derived).
+    # Post-split adımlar T2'deki ile BİREBİR (X_train fully-built).
+    X_train_out = X_train.copy()
+    for spec in PIPELINE[7:]:
+        X_train_out = builder.fit_step(spec, X_train_out, y_train, ctx_fit, on_step=_catch("train"))
+    artifact = builder.finalize(X_train_out.columns)
+    # T5-(2): SERVING YOLU ARTIK ASIL YOL — `raw_test` verilmişse X_test HAM satırlardan
+    # baştan üretilir (manifest replay). Böylece "serving parity" dolaylı değil DOĞRUDAN
+    # ölçülür ve delta-guard incremental çerçevede fiilen çalışır (muafiyet gerekmez).
+    # `raw_test=None` → eski davranış (fully-built X_test); geriye-uyum için korunur.
+    X_test_out = transform_pipeline(
+        X_test if raw_test is None else raw_test, artifact, on_step=_catch("test"),
+        # ── ARA DURUM: girdi HAM DEĞİLSE iki denetim de anlamsız, AÇIKÇA kapatılır ──
+        # `verify_input`: imza HAM sözleşmeyi tarif eder; fully-built çerçeveye uygulanamaz.
+        # `verify_delta`: ÖLÇÜLDÜ (superstore) — pre-split adımların etkisi fully-built X_test'te
+        #   ZATEN olmuş olduğu için adımlar orada hiçbir şey yapamaz (`drop_columns` eğitimde
+        #   'Row ID' düşürür, fully-built çerçevede kolon zaten yoktur → `removed=[]`). Yani
+        #   delta-guard YALNIZ ham yolla tutarlıdır. Cutover (SERVING_RAW_REPLAY) açılınca ikisi
+        #   de kalıcı olarak AÇIK olacak. **Sessiz zayıflatma değil:** karar burada, gerekçesiyle.
+        verify_input=(raw_test is not None), verify_delta=(raw_test is not None))
+
+    # Yan-değerler: ÜRETİM SIRASIYLA params'tan (manifest'in ``columns_out``'u SIRALI
+    # olduğu için oradan türetmek `auto_features` liste sırasını alfabetikleştirir → rapor sapar).
+    ce_cols = list((artifact.param_store.get("count_encode") or {}).keys())
+    gd_cols = [name for rec in (artifact.param_store.get("groupby_deviation") or [])
+               for _, name in rec.get("emits", [])]
+    sel = artifact.param_store.get("select_drop") or {}
+    leakage_report = sel.get("leakage_report") or {"dropped": [], "suspected": []}
+    leakage_report["dropped"].extend(sel.get("domain_dropped") or [])
+
+    logger.info(f"[feature_eng] T3a-1 ORKESTRATOR: {len(artifact.manifest)} manifest kalemi "
+                f"(pre-split 7 + post-split {len(PIPELINE) - 7}), "
+                f"deployable={artifact.supported_scope.get('deployable')}")
+    # WIRING: artifact artık YEREL DEĞİL — Faz A persistence için çağırana döndürülür
+    # (build_features raw_train + save_artifact bağlamına sahip; burada disk I/O yapmıyoruz).
+    return (X_train_out, X_test_out, mid.get("train", X_train), mid.get("test", X_test),
+            ce_cols, gd_cols, sel.get("univariate_dropped") or [], leakage_report, artifact)
+
+
+def _apply_date_features(df: pd.DataFrame, timestamp_cols, leaky_cols_high: set, *, write: bool
+                         ) -> "tuple[list[str], list[str]]":
+    """Timestamp kolonlarından ``_year``/``_month``/``_dayofweek`` türet (DURUMSUZ). §2.19 KAPSAM
+    PORTU'nun legacy anchor'ı — ``DateFeaturesStep`` bunu devraldı (legacy_ref="_apply_date_features").
+
+    ``write=True`` (legacy/shadow): kolonları ``df``'e YAZAR (eski inline davranış birebir).
+    ``write=False`` (orchestrator+cutover): YALNIZ seçim döner; yazma order-2 adımında (ikiz borç deseni).
+    Döner: (date_feature_cols=türev adları [raporlama], date_source_cols=genişletilecek ts kolonları [step config])."""
+    date_feature_cols: list[str] = []
+    date_source_cols: list[str] = []
+    for col in timestamp_cols:
+        if col not in df.columns:
+            continue
+        if col in leaky_cols_high:
+            logger.info(f"[feature_eng] SKIP türev: '{col}' domain leakage (high) — year/month/dayofweek üretilmiyor")
+            continue
+        date_source_cols.append(col)
+        date_feature_cols.extend([f"{col}_year", f"{col}_month", f"{col}_dayofweek"])
+        if write:
+            try:
+                dt = pd.to_datetime(df[col], errors="coerce")
+                df[f"{col}_year"]      = dt.dt.year
+                df[f"{col}_month"]     = dt.dt.month
+                df[f"{col}_dayofweek"] = dt.dt.dayofweek
+            except Exception:
+                pass
+    return date_feature_cols, date_source_cols
 
 
 def build_features(state: dict) -> dict:
@@ -2209,7 +2377,21 @@ def build_features(state: dict) -> dict:
     # Missing-value indicator'lari (fillna ONCESI — _clean_data dolduruyor): null
     # sinyalini koru. Row-wise → leakage yok, split'ten once guvenli. Eklenen kolonlar
     # auto_feature_cols'ta birikir; supervised yolda count/deviation ile genisler.
-    auto_feature_cols: list[str] = _add_missing_indicators(df, exclude=leakage_exclude)
+    # Katman 1 T3a-1: pre-split adım SAHİPLİĞİ orkestratörde. ``orchestrator`` modunda
+    # missing-indicator (order 0) + impute (order 1) TEK ``ArtifactBuilder``'a fit edilir; split'in
+    # ÖTE yanında (post-split) AYNI builder devam eder → tek order uzayı (iki-fit_pipeline reddini
+    # ihlal etmez, bkz. ArtifactBuilder docstring). legacy/shadow yolu BİREBİR DEĞİŞMEZ (kontrol arm'ı).
+    _pipe_mode = settings.FEATURE_PIPELINE_MODE
+    _orch_mode = (_pipe_mode == "orchestrator")
+    _builder = None
+    if _orch_mode:
+        from src.services.inference.orchestrator import ArtifactBuilder, PIPELINE as _ORCH_PIPELINE
+        _builder = ArtifactBuilder()
+
+    # T5-D1: orchestrator modunda SEÇİM burada, YAZMA orkestratörde (ikiz borç devri).
+    auto_feature_cols: list[str] = _add_missing_indicators(
+        df, exclude=leakage_exclude,
+        write=not (_orch_mode and SERVING_RAW_REPLAY))
     # Katman 1 (T0): FILTRELENMEMIS kayit — {uretilen: kaynak}. `auto_features` alani
     # X_train'e gore filtreli yayinlanir (hayatta-kalan listesi) → orkestratorun donmus
     # secim kaynagi olarak YETERSIZ; select_drop'un dusurdukleri kaybolur ve groupby'in
@@ -2217,9 +2399,69 @@ def build_features(state: dict) -> dict:
     # NOT: burada ad-cozumleme guvenli — suffix SABIT (`f"{c}_isna"`), ratio'nun
     # `ratio_a_b` belirsizligi (hangi alt cizgi boluyor) yok.
     missing_indicator_meta: dict[str, str] = {n: n[: -len("_isna")] for n in auto_feature_cols}
+    if _orch_mode:
+        # order 0 — MissingIndicatorStep: **T5-D1 İKİZ BORÇ KAPANDI** — `*_isna` kolonlarını artık
+        # EĞİTİMDE DE bu adım üretiyor (inline yazma `write=False` ile kalktı). Sonuç: adımın kolon
+        # sözleşmesi (`delta.added`) eğitimde ve ham serving replay'inde AYNI → delta-guard geçer.
+        # Öncesinde adım eğitimde no-op'tu ve ayrışma SESSİZDİ (mutlak guard göremiyordu).
+        df = _builder.fit_step(_ORCH_PIPELINE[0], df,
+                               ctx={"missing_indicator_cols": list(missing_indicator_meta.values())})
 
-    # Temizlik
-    df = _clean_data(df)
+    # Temizlik — orchestrator modunda impute BLOĞU atlanır (builder yapar; T3a-2'de resolve_target
+    # + erken split ARADA → impute artık hedefi görmez, item(3) hedef null=0 → INERT).
+    df = _clean_data(df, impute_missing=not _orch_mode)
+    # ── T5-(2): SERVING GİRDİSİ ANLIK GÖRÜNTÜSÜ (ham-satır replay'in kaynağı) ──
+    # Yakalama noktası BİLİNÇLİ olarak `_clean_data` SONRASI (ölçüldü, iki sebep):
+    #  (1) DEDUP burada: credit'te 165 satır düşüyor → order-0 girdisinde yakalasaydık
+    #      pozisyonel/etiket hizalaması split'le tutmazdı (ölçüm: data/_t5_rowalign.json).
+    #  (2) CURRENCY burada: dönüşüm portlanmadı → daha erken yakalanan çerçevede para
+    #      kolonları hâlâ string olurdu ve pipeline'da onları çeviren adım YOK.
+    # Sözleşme böylece açık: **serving girdisi dedup'lanmış + currency-normalize edilmiş olmalı**
+    # (`deduplicated` + `currency_normalized` kapsam olguları).
+    # Inline üretilmiş `_isna` kolonları düşürülür — onları serving'de order 0 ÜRETİR (ikiz borç).
+    _df_raw = None
+    _resolved_early = False
+    _train_idx = _test_idx = None
+    if _orch_mode:
+        # ── T3a-2: resolve_target impute-ÖNCESİNE (missing-indicator + currency'den SONRA) ──
+        # Erken split indeksi stratify=y ister → resolve_target burada çözülür. ÖN-UÇUŞ (ölçüldü):
+        # alias YOK (item 2) + hedef null=0 (item 3) → reorder bit-birebir INERT. ts-lag/aggregation
+        # orch'ta kapsam-REDDİ (tabular) → hedefsiz koşmaları önemsiz (artifact zaten kurulmaz).
+        df, y, target_name = _resolve_target(df, feature_plan, intent)
+        _resolved_early = True
+        # ── SERVING GİRDİSİ ANLIK GÖRÜNTÜSÜ (ham-satır replay'in kaynağı) ──
+        # Konum BİLİNÇLİ: `_clean_data` SONRASI (dedup + currency portlanmadı → girdi zaten
+        # normalize gelmeli) ve `_resolve_target` SONRASI (**serving sözleşmesi ETİKETSİZDİR**).
+        # Inline üretilmiş `*_isna` düşürülür — serving'de onları order 0 ÜRETİR.
+        # id kolonları serving İMZASINDAN çıkarılır — model feature'ı DEĞİL (DropColumnsStep order-3'te
+        # zaten düşürür). Snapshot'ı "id-drop SONRASINA almak" = id'yi burada düş. **TIMESTAMP KORUNUR**
+        # (date türevleri ham ts'yi ister → imzada required kalmalı). Target zaten resolve_target'ta çıktı.
+        # Serving'de id gelmese bile delta-guard artık tolere eder (orchestrator eksik_silme: kolon _before'da
+        # yoksa "silinmedi" ihlali sayılmaz — "çıktıda yok" zaten sağlanır).
+        _sig_drop = [c for c in meta.get_by_type("identifier") if c in df.columns]
+        _df_raw = df.drop(columns=[c for c in missing_indicator_meta if c in df.columns] + _sig_drop,
+                          errors="ignore").copy()
+        # datetime_cols: meta'nın timestamp tiplediği + _df_raw'da mevcut kolonlar → imzada kind="datetime"
+        # (date portu sonrası ham ts kolonu required; string dtype de olsa authoritative işaretlenir).
+        _dt_cols = [c for c in meta.get_by_type("timestamp") if c in _df_raw.columns]
+        _builder.declare_raw_input(_df_raw, datetime_cols=_dt_cols)  # beyan; order-0'dan TÜRETME (ikiz borç)
+        # ERKEN SPLIT İNDEKSİ — geç split'i (aşağıda) df.iloc[idx] ile değiştirir. Partition + SIRA
+        # geç train_test_split(df,y,...) ile BİREBİR (kolon-bağımsız: C-ölçümü; G1 .equals() satır sırasını
+        # kanıtlar). Rows bu noktadan split'e kadar DEĞİŞMEZ (agg scope-reddi) → pozisyonel indeks geçerli.
+        _strat = y if intent.strip().lower() == "classification" else None
+        try:
+            _train_idx, _test_idx = train_test_split(
+                np.arange(len(df)), test_size=TEST_SIZE, random_state=settings.RANDOM_SEED, stratify=_strat)
+        except ValueError:
+            _train_idx, _test_idx = train_test_split(
+                np.arange(len(df)), test_size=TEST_SIZE, random_state=settings.RANDOM_SEED)
+        # order 1 — ImputeStep. **T3b-fit: #4 FİKSİ BURADA DEPLOY OLUYOR.** Dolgu istatistiği artık
+        # YALNIZ train indeksinden öğrenilir (`fit_frame`), uygulama tüm çerçevededir (`df`) — impute
+        # KONUMU korunur, yani Bulgu A'nın dört pre-split tüketicisi (resolve_target/plan-op/ratio/
+        # zeroflag) hâlâ null'suz çerçeve görür. Değişen TEK şey medyanın kaynağı (full → train).
+        # T3b-gate ön koşuldu: `isnull().any()` kapısı dursaydı train'de null'suz kolon (housing
+        # total_bedrooms, 207 null'un 207'si TEST'te) dolgu ÖĞRENMEZ ve terminal fillna(0)'a düşerdi.
+        df = _builder.fit_step(_ORCH_PIPELINE[1], df, fit_frame=df.iloc[_train_idx])
 
     # ── Time-series lag katmani (FAZ A) ──────────────────────────
     # Yalnizca modality==timeseries; tabular yol bu blogu hic gormez.
@@ -2245,8 +2487,9 @@ def build_features(state: dict) -> dict:
                 entity_col=resolved_entity_col or "",
             )
 
-    # Hedef değişken
-    df, y, target_name = _resolve_target(df, feature_plan, intent)
+    # Hedef değişken — T3a-2'de orch modunda ZATEN yukarıda (impute ÖNCESİ) çözüldü (erken split için).
+    if not _resolved_early:
+        df, y, target_name = _resolve_target(df, feature_plan, intent)
 
     # Aggregation — timeseries'te zaman eksenini korumak icin ATLANIR (kapatinca
     # domain recipe'leri de inert kalir: avg_/std_ kolonlari olusmaz → onlara dokunmuyoruz).
@@ -2272,23 +2515,16 @@ def build_features(state: dict) -> dict:
     if leaky_cols_high:
         logger.info(f"[feature_eng] High-confidence leaky kolonlar (türev üretilmeyecek): {leaky_cols_high}")
 
-    date_feature_cols: list[str] = []      # Katman 1 kapsam olgusu (asagida doldurulur)
-    # Date feature extraction — leaky olan timestamp kolonları atlanır
-    for col in meta.get_by_type("timestamp"):
-        if col in df.columns:
-            if col in leaky_cols_high:
-                logger.info(f"[feature_eng] SKIP türev: '{col}' domain leakage (high) — year/month/dayofweek üretilmiyor")
-                continue
-            try:
-                dt = pd.to_datetime(df[col], errors="coerce")
-                df[f"{col}_year"]      = dt.dt.year
-                df[f"{col}_month"]     = dt.dt.month
-                df[f"{col}_dayofweek"] = dt.dt.dayofweek
-                # Katman 1 KAPSAM OLGUSU: timestamp turevleri portlanmadi → uretildilerse
-                # kapsam kapisi bu kosuyu reddeder (sessizce eksik artifact dogmasin).
-                date_feature_cols.extend([f"{col}_year", f"{col}_month", f"{col}_dayofweek"])
-            except Exception:
-                pass
+    # Date feature extraction — §2.19 KAPSAM PORTU: DateFeaturesStep'in legacy anchor'ı. T5-D1 deseni:
+    # legacy/shadow (write=True) inline üretir; orchestrator+cutover (write=False) YALNIZ seçim döner,
+    # YAZMA order-2 adımında. date_feature_cols=türev adları (raporlama), date_source_cols=step config.
+    date_feature_cols, date_source_cols = _apply_date_features(
+        df, meta.get_by_type("timestamp"), leaky_cols_high,
+        write=not (_orch_mode and SERVING_RAW_REPLAY))
+    if _orch_mode:
+        # order 2 — DateFeaturesStep (§2.19 KAPSAM PORTU): YAZMA burada (inline write=False), impute
+        # SONRASI / drop ÖNCESİ. Ham ts kolonu hâlâ df'te (drop order 3'te düşürür). Rowwise → fit_frame yok.
+        df = _builder.fit_step(_ORCH_PIPELINE[2], df, ctx={"date_source_cols": date_source_cols})
 
     # Timeseries: kronolojik split anahtarını drop'tan ÖNCE yakala — aşağıdaki blok
     # timestamp kolonlarını drop ediyor + duckdb USING SAMPLE satır sırasını bozduğu
@@ -2338,7 +2574,16 @@ def build_features(state: dict) -> dict:
     related = _find_related_target_cols(df, target_col)
     cols_drop.update([c for c in related if c in df.columns and c != target_col])
     existing = [c for c in cols_drop if c in df.columns]
-    if existing:
+    if _orch_mode:
+        # T4a — SAHİPLİK DEVRİ: id/ts/target drop'u artık orkestratörün pre-split adımı yapıyor
+        # (order 2). KONUM birebir korunur (impute'tan SONRA, plan-türevi/#5'ten ÖNCE) → çerçeve
+        # aynı → bit-birebir beklenir; değişen yalnız SAHİPLİK. Yapısal ön-koşul denetimi
+        # (`check_structural_preconditions`) adımın içinde tetiklenir → o da buraya kayar.
+        # T4b'de ZScore/Normalize de pre-split'e taşınacağı için bu adımın önce taşınması ŞART:
+        # ön-ek bloğu bitişik olmalı (order uzayı monoton; drop, derived'dan ÖNCE gelmeli).
+        df = _builder.fit_step(_ORCH_PIPELINE[3], df,
+                               ctx={"drop_columns": existing, "target_col": target_name})
+    elif existing:
         df = df.drop(columns=existing, errors="ignore")
         logger.info(f"[feature_eng] Drop (id/ts/target): {existing}")
 
@@ -2350,7 +2595,33 @@ def build_features(state: dict) -> dict:
     # an op from the safe palette over REAL columns (e.g. velocity = ratio(x, t)).
     # Validated + deterministically executed — replaces the old raw df.eval path,
     # which let the LLM write code with no leakage guard.
-    derived_feature_cols = _apply_plan_derived_features(df, feature_plan, disallowed)
+    # 6-OP PORTU: orchestrator modunda plan'ın TÜM portlu op'ları (8/8) BURADA çalışmaz —
+    # sahiplik orkestratörün pre-split adımlarında (order 3-4 parametric, 5 rowwise).
+    # legacy/shadow arm'ında eski yol AYNEN çalışmaya devam eder (kontrol arm'ı bozulmaz).
+    from src.services.inference.orchestrator import (PORTED_FEATURE_OPS as _PORTED,
+                                                     PORTED_ROWWISE_OPS)
+    derived_feature_cols = _apply_plan_derived_features(
+        df, feature_plan, disallowed, skip_ops=(_PORTED if _orch_mode else None))
+    if _orch_mode:
+        # order 3-4-5 — ZScore/Normalize (parametric, **fit_frame = TRAIN indeksi**, #5 fiksi)
+        # + PlanDerived (rowwise, fitted-state yok → fit_frame gereksiz).
+        # havuzunda görünür, seçim sapmaz (Bulgu A dersi).
+        # ctx henüz kurulmadı (assemble_pipeline_ctx ratio/zeroflag'den sonra) → spec'ler
+        # AYNI TEK KAYNAKTAN (`_admit_spec` tabanlı yardımcılar) türetilir, kopyalanmaz.
+        _rowwise = plan_derived_specs(feature_plan, PORTED_ROWWISE_OPS, disallowed)
+        _pre_ctx = {"zscore_specs": plan_op_specs(feature_plan, "zscore", disallowed),
+                    "normalize_specs": plan_op_specs(feature_plan, "normalize", disallowed),
+                    "derived_specs": _rowwise}
+        for _spec_idx in (4, 5):        # parametric ikili → train-fit (date portu order 2'yi kaydırdı)
+            df = _builder.fit_step(_ORCH_PIPELINE[_spec_idx], df, ctx=_pre_ctx,
+                                   fit_frame=df.iloc[_train_idx])
+        df = _builder.fit_step(_ORCH_PIPELINE[6], df, ctx=_pre_ctx)   # rowwise altılı (fit yok)
+        # Yan-değer: eski op'un döndürdüğü liste artık eksik → adımlardan TAMAMLA
+        # (üretim sırasıyla; T2'nin `_ce_cols`/`_gd_cols` deseni).
+        for _sid in ("zscore_feature", "normalize_feature"):
+            derived_feature_cols = derived_feature_cols + list(
+                (_builder.param_store.get(_sid) or {}).keys())
+        derived_feature_cols = derived_feature_cols + [s["name"] for s in _rowwise]
     if derived_feature_cols:
         logger.info(f"[feature_eng] Plan turevli feature'lar: {derived_feature_cols}")
 
@@ -2379,10 +2650,14 @@ def build_features(state: dict) -> dict:
     # oran split sonrasi sentinel'den aritilirken (bkz. _finalize_ratio_features_tt)
     # sifir-payda bilgisi flag'de dururur. HAM oran degerleri (winsor/impute YOK) split
     # sonrasi train'e fit edilir; burada yalniz row-wise bolme + selection yapilir.
+    # T5-D2: orchestrator + cutover açıkken SEÇİM burada, YAZMA orkestratörde (order 5).
     df, ratio_feature_cols, ratio_denom_zero_cols, ratio_feature_meta = _build_ratio_features(
-        df, original_cols, meta, intent, aggregated, leaky_cols_high)
+        df, original_cols, meta, intent, aggregated, leaky_cols_high,
+        write=not (_orch_mode and SERVING_RAW_REPLAY))
+    # T5-D3: SEÇİM burada (force_zero invariant DAHİL), YAZMA orkestratörde (order 6).
     df, derived_flag_cols = _build_zero_missing_flags(
-        df, original_cols, intent, aggregated, force_zero_cols=ratio_denom_zero_cols)
+        df, original_cols, intent, aggregated, force_zero_cols=ratio_denom_zero_cols,
+        write=not (_orch_mode and SERVING_RAW_REPLAY))
     # Katman 1 (T0): FILTRELENMEMIS kayit — {uretilen: kaynak}. `derived_flags` alani
     # X_train'e gore filtreli (hayatta-kalan) → frozen kaynagi olarak yetersiz (yukaridaki
     # missing_indicator_meta ile ayni gerekce). Prefix SABIT → ad-cozumleme belirsiz degil.
@@ -2411,7 +2686,10 @@ def build_features(state: dict) -> dict:
         feature_plan=feature_plan, encode_exclude=(disallowed | leakage_exclude),
         outlier_cols=meta.get_outlier_cols(), timeseries_lag=ts_lag_info,
         domain_feature_cols=domain_feature_cols, date_feature_cols=date_feature_cols,
-        column_renames=column_renames)
+        date_source_cols=date_source_cols, column_renames=column_renames,
+        # T4 (3): eski op'un ÇEVRESİNDEKİ leakage denylist'i beyan yüzeyine taşınır — op
+        # emekli olunca kaybolmasın (bkz. assemble_pipeline_ctx içindeki gerekçe).
+        disallowed=disallowed)
     shadow_report: dict = {}             # T1 gölge koşu sonucu (yalnız shadow modunda dolar)
 
     # 14. Train/test split
@@ -2485,16 +2763,22 @@ def build_features(state: dict) -> dict:
             logger.info(f"[feature_eng] KRONOLOJIK split (timeseries): son %{int(TEST_SIZE*100)} = test "
                   f"(n_train={len(X_train)}, n_test={len(X_test)}), shuffle/stratify YOK")
         else:
-            stratify_arg = y if intent.strip().lower() == "classification" else None
             split_strategy = "random"
-            try:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    df, y, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED, stratify=stratify_arg
-                )
-            except ValueError:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    df, y, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED
-                )
+            if _resolved_early:
+                # T3a-2: ERKEN hesaplanan indeksle böl (yukarıda resolve_target sonrası). Aynı partition
+                # + SIRA → geç train_test_split ile bit-birebir (pozisyonel; G1 .equals() satır sırasını kanıtlar).
+                X_train, X_test = df.iloc[_train_idx], df.iloc[_test_idx]
+                y_train, y_test = y.iloc[_train_idx], y.iloc[_test_idx]
+            else:
+                stratify_arg = y if intent.strip().lower() == "classification" else None
+                try:
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        df, y, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED, stratify=stratify_arg
+                    )
+                except ValueError:
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        df, y, test_size=TEST_SIZE, random_state=settings.RANDOM_SEED
+                    )
 
         # Split sonrası kopyala: aşağıdaki transform'lar kolon-atamaları yapar;
         # iloc/train_test_split dilimleri üzerinde SettingWithCopy uyarısını önler.
@@ -2507,59 +2791,136 @@ def build_features(state: dict) -> dict:
         # ÖNCE: hepsi temiz sonlu değer görür, kuantiller test'ten sızmaz.
         # Katman 1 T1 — GÖLGE KOŞU kancası: post-split zincir ÖNCESİ X_train'i yakala.
         # Yalnız `shadow` modunda kopyalanır (legacy'de maliyet SIFIR). Bkz. inference/shadow.py.
-        _shadow_x_train = (X_train.copy()
-                           if settings.FEATURE_PIPELINE_MODE == "shadow" else None)
+        _mode = settings.FEATURE_PIPELINE_MODE
+        _shadow_x_train = (X_train.copy() if _mode == "shadow" else None)
 
-        X_train, X_test = _finalize_ratio_features_tt(X_train, X_test, ratio_feature_cols)
-        _dropped_ratio = set(ratio_feature_cols) - set(X_train.columns)
-        ratio_feature_cols = [c for c in ratio_feature_cols if c in X_train.columns]
-        ts_protected_cols -= _dropped_ratio   # finalize'ta düşen oranı korumadan çıkar
+        # Katman 1 wiring — varsayılan (legacy/shadow): artifact YOK. orchestrator branch üzerine yazar.
+        _artifact_id = None
+        _artifact_block = {"artifact_id": None, "deployable": False, "phase": None,
+                           "reason": "feature_pipeline_mode!=orchestrator"}
 
-        # ── Fairness segment taşıyıcısı — HAM hâlde, encode/scale'den ÖNCE ──
-        # Buradan sonraki her transform kolonları encode/scale ediyor; ham
-        # demografik değer bir daha erişilebilir olmayacak. Snapshot X_test ile
-        # POZİSYONEL hizalı: aşağıdaki transform'lar satır eklemez/çıkarmaz.
-        from src.services.segment_carrier import build_raw_test_carrier
-        _seg_df, segment_meta = build_raw_test_carrier(
-            X_test, state.get("db_intelligence", {}) or {},
-            exclude=disallowed | leakage_exclude | {target_name},
-        )
+        if _mode == "orchestrator":
+            # ── YAPISAL DEVİR — pre-split (builder orders 0-1) + post-split (PIPELINE[2:]) ──
+            # `ImputeStep` pre-split (T3a-1 sahiplik devri) + train-fit (T3b-fit, #4 deploy) → artık
+            # metrik-NÖTR DEĞİL; sapma beyan edilen yüzeyle sınırlı. zscore/normalize hâlâ eski leaky
+            # yolda (T4). `_builder` pre-split fazından (yukarıda) devralınır.
+            # T5-(2): X_test artık SERVING YOLUNDAN üretilir — ham satırlar `transform_pipeline`'a
+            # verilir. Hizalama **ETİKET-BAZLI** (`.loc`), pozisyonel DEĞİL: `_clean_data` dedup'ı
+            # satır üyeliğini değiştirebiliyor (credit −165) ve `drop_duplicates` orijinal etiketleri
+            # KORUYOR → etiketle seçim, satır üyeliği nerede değişirse değişsin doğru hizalar.
+            # ── ARA DURUM (ÖLÇÜLDÜ, kayda geçti): ham-satır yolu İKİZ BORÇ tarafından
+            # BLOKLU. `_add_missing_indicators`/`_build_zero_missing_flags`/`_build_ratio_features`
+            # eğitimde HÂLÂ inline üretiyor → order 0/5/6 adımları eğitimde "kolon zaten var"
+            # görüp ATLIYOR (delta.added=[]), ham replay'de ise ÜRETİYOR → delta-guard DOĞRU
+            # şekilde sapma raporluyor. Guard'ı zayıflatmak yerine ham yol ERTELENDİ; ikiz borç
+            # (§2.25 #2) kapanınca `_df_raw.loc[X_test.index]` verilecek. Ölçüm: fully-built
+            # yolda delta'lar TUTUYOR → guard bu turda da tam kapsamlı çalışıyor (muafiyet YOK).
+            _raw_test = (_df_raw.loc[X_test.index]
+                         if (_df_raw is not None and SERVING_RAW_REPLAY) else None)
+            (X_train, X_test, _mid_train, _mid_test, _ce_cols, _gd_cols,
+             univariate_dropped, leakage_report, _artifact) = _run_orchestrated_chain(
+                _builder, X_train, X_test, y_train, pipeline_ctx, meta, domain_leakage_report,
+                raw_test=_raw_test)
+            ratio_feature_cols = [c for c in ratio_feature_cols if c in _mid_train.columns]
+            auto_feature_cols = auto_feature_cols + _ce_cols + _gd_cols
+            # Zincir-ORTASI tüketiciler: gözlemcinin yakaladığı `ratio_finalize` sonrası
+            # çerçevelerden beslenir (legacy'deki kanca noktasının BİREBİR aynısı). İkisi de
+            # saf okuyucu ve RNG'yi seed'siz tüketmiyor (relations.py:267 `random_state=42`)
+            # → çağrı sırasının kaymış olması bit-birebirliği bozmaz.
+            from src.services.segment_carrier import build_raw_test_carrier
+            _seg_df, segment_meta = build_raw_test_carrier(
+                _mid_test, state.get("db_intelligence", {}) or {},
+                exclude=disallowed | leakage_exclude | {target_name},
+            )
+            from src.services.relations import compute_relations
+            relations_report = compute_relations(
+                _mid_train, y_train, target_name, generated_from="train_only",
+            )
 
-        # ── Veri İlişkileri — AYNI KANCA, aynı sebep ──
-        # Hesap GERÇEK train partisyonundan geçer → "train_only" provenance'ı bir
-        # iddia değil, yapısal olgu. Rapor anında split'i yeniden üretmek zaman
-        # serisi/agrege planlarda sessizce farklı satırlar verirdi (bkz. relations.py).
-        from src.services.relations import compute_relations
-        relations_report = compute_relations(
-            X_train, y_train, target_name, generated_from="train_only",
-        )
+            # ── KATMAN 1 FAZ A: artifact'i diske yaz (FAIL-OPEN) ──
+            # İLKE: pipeline guard'ları fail-CLOSED (koşuyu durdurur); artifact PERSISTENCE fail-OPEN.
+            # Serialize patlarsa kullanıcı raporunu KAYBETMEMELİ → logla, artifact_id=None, koşu SÜRER.
+            # Faz A doldurur: manifest/param_store/raw_input_signature (finalize'da) + training_reference
+            # .per_feature (raw TRAIN partisyonundan, imza.required kolonları). model_ref BOŞ (Faz B),
+            # baseline_metrics None (Faz C). phase="features".
+            try:
+                from src.services.inference.references import build_training_reference
+                from src.services.inference.serialize import save_artifact
+                _req = (_artifact.raw_input_signature or {}).get("required") or []
+                _raw_train = _df_raw.loc[X_train.index] if _df_raw is not None else None
+                if _raw_train is not None:
+                    # TİP-KARARI TEK KAYNAK: raw_input_signature (dtype değil) → ayrık int'ler
+                    # (products_number/tenure/binary) categorical kurulur, dejenere quantile+sahte PSI biter.
+                    _artifact.training_reference = build_training_reference(
+                        _raw_train, columns=_req, baseline_metrics=None,
+                        signature=_artifact.raw_input_signature)
+                # İŞ ANAHTARI (Katman 2 gerçekleşen-perf v2 erken-şartı): entity kolonu bildirildiyse
+                # skorlama onu predictions.business_key'e yazar. entity_col genelde model girdisi DEĞİL
+                # (dropped id) → v1'de çoğunlukla NULL; ama kolon+yazım ŞİMDİ kurulur (geçmiş düzeltilemez).
+                _artifact.business_key_column = entity_col or None
+                _artifact.phase = "features"
+                _dep = bool((_artifact.supported_scope or {}).get("deployable"))
+                _artifact_id = save_artifact(_artifact)
+                _artifact_block = {"artifact_id": _artifact_id, "deployable": _dep,
+                                   "phase": "features", "reason": None}
+                logger.info(f"[feature_eng] Faz A artifact yazıldı: id={_artifact_id} "
+                            f"deployable={_dep} phase=features")
+            except Exception as _e:
+                logger.error(f"[feature_eng] Faz A artifact YAZILAMADI (fail-open, koşu sürüyor): {_e}")
+                _artifact_id = None
+                _artifact_block = {"artifact_id": None, "deployable": False, "phase": None,
+                                   "reason": f"serialize_failed: {type(_e).__name__}: {str(_e)[:200]}"}
+        else:
+            X_train, X_test = _finalize_ratio_features_tt(X_train, X_test, ratio_feature_cols)
+            _dropped_ratio = set(ratio_feature_cols) - set(X_train.columns)
+            ratio_feature_cols = [c for c in ratio_feature_cols if c in X_train.columns]
+            ts_protected_cols -= _dropped_ratio   # finalize'ta düşen oranı korumadan çıkar
 
-        # ── (2) SONRA TRANSFORM — istatistik YALNIZCA X_train'den, X_test'e uygula ──
-        # Grandmaster feature aileleri: count-encoding + groupby-deviation. ENCODE
-        # ONCESI calisirlar (ham kategorikleri girdi/grup-anahtari olarak kullanirlar).
-        # Ikisi de train-fit → leakage-safe; target kullanmazlar.
-        _auto_exclude = disallowed | leakage_exclude
-        X_train, X_test, _ce_cols = _count_encode_tt(X_train, X_test, exclude=_auto_exclude)
-        X_train, X_test, _gd_cols = _groupby_deviation_tt(X_train, X_test, meta, exclude=_auto_exclude)
-        auto_feature_cols = auto_feature_cols + _ce_cols + _gd_cols
+            # ── Fairness segment taşıyıcısı — HAM hâlde, encode/scale'den ÖNCE ──
+            # Buradan sonraki her transform kolonları encode/scale ediyor; ham
+            # demografik değer bir daha erişilebilir olmayacak. Snapshot X_test ile
+            # POZİSYONEL hizalı: aşağıdaki transform'lar satır eklemez/çıkarmaz.
+            from src.services.segment_carrier import build_raw_test_carrier
+            _seg_df, segment_meta = build_raw_test_carrier(
+                X_test, state.get("db_intelligence", {}) or {},
+                exclude=disallowed | leakage_exclude | {target_name},
+            )
 
-        X_train, X_test = _encode_categorical_tt(X_train, X_test, y_train)
-        X_train, X_test = _scale_features_tt(X_train, X_test, meta.get_outlier_cols())
-        X_train, X_test = _select_features_tt(X_train, X_test)
-        # Final NaN/numeric temizliği (sabit fillna(0) — deterministik, sızıntısız)
-        X_train = X_train.apply(pd.to_numeric, errors="coerce").fillna(0)
-        X_test  = X_test.apply(pd.to_numeric, errors="coerce").fillna(0)
-        # Denetimli univariate seçim: hedefle alakasız feature'ları ele (train-fit).
-        # NaN/numeric temizliği SONRASI çalışır (ANOVA/f_regression NaN kabul etmez).
-        if intent.strip().lower() in ("classification", "regression"):
-            X_train, X_test, univariate_dropped = _select_univariate_tt(
-                X_train, X_test, y_train, intent)
-        # Leakage detection train'den öğrenir, test'ten de senkron düşürür
-        X_train, X_test, leakage_report = _detect_leakage_tt(
-            X_train, X_test, y_train, meta, protected_high_card=ts_protected_cols)
-        X_train, X_test, domain_dropped = _apply_domain_leakage_drops_tt(
-            X_train, X_test, domain_leakage_report)
-        leakage_report["dropped"].extend(domain_dropped)
+            # ── Veri İlişkileri — AYNI KANCA, aynı sebep ──
+            # Hesap GERÇEK train partisyonundan geçer → "train_only" provenance'ı bir
+            # iddia değil, yapısal olgu. Rapor anında split'i yeniden üretmek zaman
+            # serisi/agrege planlarda sessizce farklı satırlar verirdi (bkz. relations.py).
+            from src.services.relations import compute_relations
+            relations_report = compute_relations(
+                X_train, y_train, target_name, generated_from="train_only",
+            )
+
+            # ── (2) SONRA TRANSFORM — istatistik YALNIZCA X_train'den, X_test'e uygula ──
+            # Grandmaster feature aileleri: count-encoding + groupby-deviation. ENCODE
+            # ONCESI calisirlar (ham kategorikleri girdi/grup-anahtari olarak kullanirlar).
+            # Ikisi de train-fit → leakage-safe; target kullanmazlar.
+            _auto_exclude = disallowed | leakage_exclude
+            X_train, X_test, _ce_cols = _count_encode_tt(X_train, X_test, exclude=_auto_exclude)
+            X_train, X_test, _gd_cols = _groupby_deviation_tt(X_train, X_test, meta, exclude=_auto_exclude)
+            auto_feature_cols = auto_feature_cols + _ce_cols + _gd_cols
+
+            X_train, X_test = _encode_categorical_tt(X_train, X_test, y_train)
+            X_train, X_test = _scale_features_tt(X_train, X_test, meta.get_outlier_cols())
+            X_train, X_test = _select_features_tt(X_train, X_test)
+            # Final NaN/numeric temizliği (sabit fillna(0) — deterministik, sızıntısız)
+            X_train = X_train.apply(pd.to_numeric, errors="coerce").fillna(0)
+            X_test  = X_test.apply(pd.to_numeric, errors="coerce").fillna(0)
+            # Denetimli univariate seçim: hedefle alakasız feature'ları ele (train-fit).
+            # NaN/numeric temizliği SONRASI çalışır (ANOVA/f_regression NaN kabul etmez).
+            if intent.strip().lower() in ("classification", "regression"):
+                X_train, X_test, univariate_dropped = _select_univariate_tt(
+                    X_train, X_test, y_train, intent)
+            # Leakage detection train'den öğrenir, test'ten de senkron düşürür
+            X_train, X_test, leakage_report = _detect_leakage_tt(
+                X_train, X_test, y_train, meta, protected_high_card=ts_protected_cols)
+            X_train, X_test, domain_dropped = _apply_domain_leakage_drops_tt(
+                X_train, X_test, domain_leakage_report)
+            leakage_report["dropped"].extend(domain_dropped)
 
         # Katman 1 T1 — GÖLGE KARŞILAŞTIRMASI. Üretim çıktısı YUKARIDA tamamlandı; buradan
         # sonrası salt gözlem. `run_shadow_comparison` ASLA fırlatmaz (kendi içinde yutar) →
@@ -2650,6 +3011,10 @@ def build_features(state: dict) -> dict:
     out["raw_test_path"] = raw_path or ""
     out["raw_test_meta"] = segment_meta
     out["relations_report"] = relations_report
+    # Katman 1 wiring: artifact yolu (id) + durum bloğu (deployable/phase/reason) state'e.
+    # Ağır Artifact diske gitti; state YALNIZ string id + küçük blok taşır (checkpoint'e sığar).
+    out["inference_artifact_id"] = _artifact_id
+    out["inference_artifact"] = _artifact_block
     if not split_paths.get("X_train_path"):   # disk yazımı kısmen/tamamen başarısız → inline fallback
         out["X_train"] = X_train.to_dict(orient="records")
         out["X_test"]  = X_test.to_dict(orient="records")

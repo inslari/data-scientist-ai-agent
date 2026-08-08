@@ -14,6 +14,7 @@ Why sequential?
 """
 
 import asyncio
+import os
 import time
 import traceback
 import json
@@ -21,6 +22,7 @@ import json
 from api.core.database import SessionLocal
 from api.models.job import BackgroundJobModel
 from api.models.project import ProjectModel, ProjectStepModel
+from api.models.artifact import ArtifactModel
 from api.models.data_group import DataGroupModel
 from src.graph import build_graph
 from src.core.config import settings
@@ -472,6 +474,10 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             finally:
                 db_s.close()
 
+            # Katman 1: inference artifact'ini serving index'ine (artifacts tablosu) UPSERT (yalnız
+            # metadata; champion'a DOKUNMAZ — manuel promotion). Best-effort (helper hata YUTAR) → job'u DÜŞÜRMEZ.
+            _upsert_artifact_row(project_id, final_state)
+
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -561,6 +567,56 @@ async def _run_project_job(job: BackgroundJobModel) -> None:
             logger.warning(f"[Worker] llm_usage flush failed for project {project_id}: {_flush_err}")
 
     _mark_job(job.id, "failed" if error_trace else "completed", error_trace)
+
+
+def _upsert_artifact_row(project_id: int, final_state: dict) -> None:
+    """Koşu sonunda inference artifact'ini ``artifacts`` tablosuna UPSERT (yalnız metadata index'i).
+
+    DİSK = DOĞRULUK KAYNAĞI: Faz B/C phase'i state'i değil ``artifact.json``'u günceller → nihai
+    phase/model_ref/deployable diskten okunur (state'teki blok Faz-A snapshot'ı). Ağır .pkl blob'ları
+    OKUNMAZ — yalnız küçük JSON metadata.
+
+    ⚠️ CHAMPION'A DOKUNMAZ (MANUEL PROMOTION kararı): otomatik promotion KALDIRILDI. Yeniden eğitim
+    serving'i ANINDA değiştirmek = SESSİZ davranış değişikliği; hangi modelin canlı olduğuna kullanıcı
+    kendi karar verir (`POST .../artifacts/{id}/promote`). Yeni satır ``is_champion=False`` (model
+    default); var olan satırın champion durumu KORUNUR (yeniden koşu champion'ı düşürmez/yükseltmez).
+    İlk model de manuel (istisna yok) — güvenli çünkü üretim varsayılanı legacy, champion "uykuda".
+
+    BEST-EFFORT: hata YUTULUR (job zaten raporu üretti) ama serving index'ini etkilediği için ERROR log.
+    """
+    aid = (final_state or {}).get("inference_artifact_id")
+    if not aid:
+        return
+    try:
+        jpath = os.path.join("data", "artifacts", aid, "artifact.json")
+        with open(jpath, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        phase = meta.get("phase")
+        deployable = bool((meta.get("supported_scope") or {}).get("deployable"))
+        mref = meta.get("model_ref") or {}
+        model_path = mref.get("model_path")
+
+        db = SessionLocal()
+        try:
+            row = db.query(ArtifactModel).filter(ArtifactModel.id == aid).first()
+            if row is None:
+                row = ArtifactModel(id=aid, project_id=int(project_id))   # is_champion=False (default)
+                db.add(row)
+            # is_champion'a DOKUNMA — manuel promotion'ın alanı (yeniden koşu var olanı korur).
+            row.phase = phase
+            row.deployable = deployable
+            row.model_path = model_path
+            row.model_name = mref.get("model_name")
+            row.schema_version = meta.get("artifact_schema_version")
+            row.updated_at = int(time.time())
+            db.commit()
+            logger.info(f"[Worker] artifact upsert: id={aid} phase={phase} "
+                        f"deployable={deployable} (project={project_id}; champion=manuel, dokunulmadı)")
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.error(f"[Worker] artifact upsert BAŞARISIZ "
+                     f"(best-effort; serving index etkilenir): {exc}")
 
 
 def _mark_job(job_id: int, status: str, error: str | None = None) -> None:

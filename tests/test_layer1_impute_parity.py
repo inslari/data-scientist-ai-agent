@@ -29,6 +29,8 @@ from src.services.feature_builder import (
     _scale_features_tt, _select_features_tt, _select_univariate_tt,
 )
 from src.services.inference.orchestrator import (
+    RawInputSignatureViolation, StepDeltaDivergence, build_raw_input_signature, check_raw_input,
+    ArtifactBuilder,
     PIPELINE, StepSpec, _SCOPE_RULES, FrameShapeDivergence, MissingFeatureProduction,
     StructuralPreconditionViolation, UnsupportedPipelineScope, check_pipeline_scope,
     check_structural_preconditions,
@@ -41,8 +43,9 @@ from src.services.inference.pickle_io import (
 )
 from src.services.inference.protocol import DefaultFitTransform
 from src.services.inference.steps import (
+    PlanDerivedStep,
     CountEncodeStep, GroupbyDeviationStep, ImputeStep, InfImputeStep, NormalizeStep,
-    DropColumnsStep, MissingIndicatorStep, ZeroFlagStep, ZScoreStep,
+    DateFeaturesStep, DropColumnsStep, MissingIndicatorStep, ZeroFlagStep, ZScoreStep,
     OneHotStep, RatioConstructStep, RatioFinalizeStep, RobustScaleStep, SelectDropStep,
     StandardScaleStep, TargetEncodeStep, ZScoreStep, decide_encode_route, decide_scaler_route,
 )
@@ -98,7 +101,8 @@ def test_mod_b_delta_raw_vs_rounded():
     """Mod B: train-fit vs full-df median deltası — ham ve yuvarlanmış AYRI (İncelik 2)."""
     fx = _fixture()
     # split her iki null'u da train'e almalı (num_float idx2, num_int idx3) — aksi halde
-    # o kolonda train-null yok ve fit dolgu öğrenmez (doğru davranış, ama delta ölçülemez).
+    # o kolonda train-median FULL-median'la aynı çıkar ve delta ölçülemez. (T3b-gate'ten
+    # sonra dolgu HER durumda öğrenilir; ölçüm için gereken şey null değil, dağılım farkı.)
     train = fx.iloc[:4]                       # ilk 4 satır
     step = ImputeStep()
     p_train = step.fit(train.copy())
@@ -116,6 +120,132 @@ def test_mod_b_delta_raw_vs_rounded():
     assert "num_int" in p_full["integer_cols"], "int kolon round+int olarak işaretlenmeli"
     assert isinstance(p_full["numeric_median"]["num_int"], int)
     assert isinstance(p_full["numeric_median_raw"]["num_int"], float)
+
+
+# ── T3b-gate: ``isnull().any()`` kapısının kaldırılması ───────
+# İDDİA İKİ PARÇALI ve ikisi de ayrı ayrı kilitlenir:
+#   (1) BYTE-NÖTR — fit çerçevesi == transform çerçevesi iken çıktı BİREBİR aynı kalır
+#       (yeni öğrenilen kolonlar o çerçevede null'suzdur → fillna no-op).
+#   (2) DAVRANIŞ DEĞİŞİYOR — fit çerçevesinde null'suz, transform çerçevesinde null'lu
+#       kolon artık ÖĞRENİLMİŞ medyanla dolar; eskiden kapı onu atlar, terminal fillna(0)
+#       dağılım-dışı 0.0 yazardı (housing/total_bedrooms: 207 hücre 437.0 yerine 0.0).
+# (2) olmadan (1) "hiçbir şey yapmadık" demek olurdu; (1) olmadan (2) T3b-fit'in ölçüm
+# yüzeyini kirletirdi. Kapı ve fit-çerçevesi entangled olduğu için ayrı adımlar.
+
+
+def test_impute_gate_removal_is_byte_neutral_on_fit_frame():
+    """(1) Kapı kalktı ama fit==transform çerçevesinde ÇIKTI birebir; değişen yalnız param SAYISI."""
+    fx = _fixture()
+    oracle = _clean_data(fx.copy())               # kapılı referans (feature_builder'da HÂLÂ kapılı)
+    step = ImputeStep()
+    params = step.fit(fx.copy())
+    out = step.transform(fx.copy(), params)
+    for col in fx.columns:
+        assert _as_str(oracle[col]) == _as_str(out[col]), f"'{col}' byte-nötrlük kırıldı"
+
+    # Test vacuous DEĞİL: kapı gerçekten kalktı — null'suz 'full' kolonu ARTIK dolgu öğreniyor
+    # (eski kapıda öğrenmezdi), ama uygulandığında hiçbir hücreyi oynatmıyor.
+    assert "full" in params["numeric_median"], "null'suz kolon dolgu öğrenmeli (kapı kalktı)"
+    assert params["numeric_median"]["full"] == 3.0
+    assert _as_str(out["full"]) == _as_str(fx["full"]), "null'suz kolon oynatılmamalı"
+
+
+def test_impute_learns_fill_for_column_null_free_in_fit_frame():
+    """(2) housing/total_bedrooms vakası minyatürde — GATE'İN KALDIRILMA GEREKÇESİ.
+
+    Null'ların TAMAMI transform (test) tarafında; fit (train) çerçevesi null'suz. Eski
+    ``isnull().any()`` kapısı kolonu atlar → dolgu öğrenilmez → terminal ``fillna(0)``
+    dağılım-dışı 0.0 yazardı. Kapı kalktığı için train medyanı öğrenilir ve uygulanır."""
+    train = pd.DataFrame({"x": [10.0, 20.0, 30.0, 40.0, 50.0]})     # null YOK
+    test = pd.DataFrame({"x": [None, 60.0, None]})                  # null'lar YALNIZ burada
+    step = ImputeStep()
+    params = step.fit(train)
+    assert "x" in params["numeric_median"], \
+        "fit çerçevesinde null olmasa da dolgu öğrenilmeli (serving'de null gelebilir)"
+    assert params["numeric_median"]["x"] == 30.0, "dolgu FIT çerçevesinin medyanı olmalı"
+
+    out = step.transform(test, params)
+    assert out["x"].tolist() == [30.0, 60.0, 30.0], \
+        "öğrenilmiş medyan uygulanmalı — terminal fillna(0)'a düşmemeli"
+    assert not (out["x"] == 0.0).any(), "dağılım-dışı 0.0 üretilmemeli (kapının ısırdığı yer)"
+
+
+def test_impute_nan_median_column_is_skipped():
+    """Tümü-null kolon: medyan NaN → dolgu ÖĞRENİLMEZ. NaN dolgu zaten hiçbir hücreyi
+    doldurmaz; int kolonda ``int(round(nan))`` patlardı (kapı kalkınca bu yol açıldı)."""
+    df = pd.DataFrame({
+        "hepsi_null_f": pd.Series([None, None, None], dtype="float64"),
+        "hepsi_null_i": pd.array([None, None, None], dtype="Int64"),
+        "normal": [1.0, 2.0, 3.0],
+    })
+    params = ImputeStep().fit(df)               # patlamamalı
+    assert "hepsi_null_f" not in params["numeric_median"]
+    assert "hepsi_null_i" not in params["numeric_median"]
+    assert params["numeric_median"]["normal"] == 2.0
+
+
+def test_impute_param_footprint_visible_in_manifest():
+    """PARAM BÜYÜMESİ SESSİZ KALMAZ: manifest kalemi ``param_footprint`` taşır ve
+    ``param_store`` ile tutarlıdır (görünürlük katmanı, kopya değil türev).
+
+    T3b-gate'in çıktısı byte-nötr olduğu için ölçüm onu GÖREMEZ; artifact'in kendisi
+    (param_store) büyüdüğüne göre bu değişiklik bir yerde görünür olmak zorunda."""
+    fx = _fixture()
+    fx["y"] = [0, 1, 0, 1, 0]
+    y = fx.pop("y")
+    _, artifact = fit_pipeline(fx, y, ctx={"intent": "classification"})
+
+    entry = next(e for e in artifact.manifest if e["id"] == "impute_missing")
+    fp = entry.get("param_footprint")
+    assert fp, "impute kalemi param_footprint taşımalı (param_store boyutu davranışsaldır)"
+
+    params = artifact.param_store["impute_missing"]
+    assert fp["numeric_fill_learned"] == len(params["numeric_median"])
+    assert fp["object_fill_learned"] == len(params["object_mode"])
+    assert fp["fill_columns"] == sorted([*params["numeric_median"], *params["object_mode"]])
+    # Ayak izi kapının kalkışını GÖSTERİYOR: null'suz 'full' kolonu da listede.
+    assert "full" in fp["fill_columns"], "null'suz kolon ayak izinde görünmeli (kapı kalktı)"
+
+    # BÜYÜME ÖLÇÜLEBİLİR: fixture'da 3 kolon null taşıyor (num_float/num_int/cat), 4'ü de
+    # dolgu öğreniyor ('full' eklendi) → gate_growth = 1. Eski kapı olsaydı 0 olurdu.
+    assert fp["fit_null_columns"] == 3, "eski kapının öğreneceği küme (fiilen null'lu) 3 kolon"
+    assert fp["gate_growth"] == 1, "kapının kaldırılması tam olarak 1 kolonluk param büyümesi"
+
+
+# ── T3b-fit: #4 fiksinin fiili DEPLOY'u (fit_frame = train indeksi) ───
+# İstatistiğin KAYNAĞI (train) ile UYGULAMA yüzeyi (tüm çerçeve) ayrışır. İmpute KONUMU
+# korunur → Bulgu A'nın dört pre-split tüketicisi hâlâ null'suz çerçeve görür; oynayan
+# TEK değişken medyanın kaynağıdır.
+
+
+def test_builder_fit_frame_separates_statistic_from_application():
+    """T3b-fit MEKANİZMASI: ``fit_step(..., fit_frame=train)`` istatistiği YALNIZ train'den
+    öğrenir ama TÜM çerçeveye uygular. Sızıntı imza düzeyinde imkânsız: ``fit`` test satırını
+    hiç görmez, ``transform`` istatistik hesaplamaz."""
+    # train dilimi (ilk 4) medyanı 20.0; tüm çerçeve medyanı 25.0 → kaynak ayırt edilebilir
+    df = pd.DataFrame({"x": [10.0, 20.0, 20.0, 30.0, None, 90.0, 90.0]})
+    train_idx = np.array([0, 1, 2, 3])
+    assert df["x"].iloc[train_idx].median() == 20.0 and df["x"].median() == 25.0
+
+    b = ArtifactBuilder()
+    spec = next(s for s in PIPELINE if isinstance(s, StepSpec) and s.step_cls is ImputeStep)
+    out = b.fit_step(spec, df.copy(), fit_frame=df.iloc[train_idx])
+
+    assert b.param_store["impute_missing"]["numeric_median"]["x"] == 20.0, \
+        "medyan TRAIN dilimden gelmeli (full 25.0 DEĞİL) — #4 fiksi"
+    assert out["x"].tolist() == [10.0, 20.0, 20.0, 30.0, 20.0, 90.0, 90.0], \
+        "dolgu TÜM çerçeveye uygulanmalı (impute KONUMU pre-split korunur)"
+
+
+def test_build_features_impute_fits_on_train_index_only():
+    """KAYNAK KİLİDİ (drift): ``build_features`` pre-split impute'u train indeksiyle fit etmeli.
+    Biri ``fit_frame=df`` (FULL) hâline geri döndürürse #4 sızıntısı SESSİZCE geri gelir —
+    çıktı çoğu dataset'te aynı kalacağı için (train_med==full_med) hiçbir parity testi görmez."""
+    from src.services import feature_builder as fb
+    src = inspect.getsource(fb.build_features)
+    assert "fit_frame=df.iloc[_train_idx]" in src, \
+        "pre-split impute train indeksinden fit edilmeli (T3b-fit tek satırı geri alınmış olabilir)"
+    assert "fit_frame=df)" not in src, "FULL-df fit_frame kalıntısı — #4 sızıntısı geri gelir"
 
 
 # ── ratio_finalize adımı ─────────────────────────────────────
@@ -182,18 +312,6 @@ def _cat_fixture() -> pd.DataFrame:
     })
 
 
-def test_count_mod_a_equivalence():
-    """Fixture Mod A: CountEncodeStep(full) == eski _count_encode_tt train çıktısı birebir."""
-    fx = _cat_fixture()
-    step = CountEncodeStep()
-    params = step.fit(fx.copy())
-    out = step.transform(fx.copy(), params)
-    old_train, _, added = _count_encode_tt(fx.copy(), fx.copy())
-    assert set(added) == set(params.keys()), "aynı count_ kolonları üretilmeli"
-    for name in added:
-        assert _as_str(out[name]) == _as_str(old_train[name]), f"'{name}' count parity kırıldı"
-
-
 def test_count_unseen_maps_to_zero():
     """Görülmemiş-kategori → 0, params'taki KANONİK unseen kaydından sürülür (koda gömülü değil)."""
     train = pd.DataFrame({"country": ["FR", "FR", "DE", "ES", "DE"]})
@@ -207,26 +325,8 @@ def test_count_unseen_maps_to_zero():
     prod = pd.DataFrame({"country": ["FR", "US", "DE"]})   # US görülmemiş
     out = step.transform(prod.copy(), params)
     assert out["count_country"].tolist() == [2, 0, 2], "FR→2, US(unseen)→0, DE→2"
-    _, old_test, _ = _count_encode_tt(train.copy(), prod.copy())
-    assert out["count_country"].tolist() == old_test["count_country"].tolist(), "eski yol da unseen→0"
-
-
-def test_count_real_column_parity_credit_loan_grade():
-    """GERÇEK-KOLON parity: credit loan_grade (nadir G/F kategorileri fixture'da YOK).
-    Ölçek kenar-durumu + gerçek frekans dağılımı kanıtı — fixture yalnız 'mantık doğru' der."""
-    path = _find_csv("*credit_risk_dataset.csv")
-    if not path:
-        pytest.skip("credit_risk_dataset.csv yok (gitignored data) — gerçek-kolon parity atlandı")
-    df = pd.read_csv(path)[["loan_grade"]].copy()
-    step = CountEncodeStep()
-    params = step.fit(df.copy())
-    out = step.transform(df.copy(), params)
-    old_train, _, added = _count_encode_tt(df.copy(), df.copy())
-    assert "count_loan_grade" in params, "loan_grade count-encode edilmeli"
-    for name in added:
-        assert _as_str(out[name]) == _as_str(old_train[name]), f"gerçek-kolon '{name}' parity kırıldı"
-    known = params["count_loan_grade"]["unseen"]["known"]
-    assert any(g in known for g in ("F", "G")), "nadir grade'ler (F/G) bilinen sette olmalı"
+    # T5b: eski-yol karşılaştırması DÜŞTÜ (`_count_encode_tt` artık bu adıma delege → totoloji).
+    # İddia POLİTİKANIN KENDİSİNE taşındı: kanonik unseen kaydı + değer davranışı.
 
 
 # NOT: elle-zincir testleri (impute→ratio→count[→onehot], scaler-chain) SİLİNDİ — orkestratör
@@ -292,21 +392,6 @@ def _onehot_fixture() -> pd.DataFrame:
     })
 
 
-def test_onehot_mod_a_equivalence():
-    """Fixture Mod A: OneHotStep == eski _encode_categorical_tt düşük-dal (drop_first) birebir."""
-    fx = _onehot_fixture()
-    route = decide_encode_route(fx)
-    assert route["onehot"] == ["geo"] and route["target"] == []
-    oh = OneHotStep({"columns": route["onehot"]})
-    params = oh.fit(fx.copy())
-    out = oh.transform(fx.copy(), params)
-    old_train, _ = _encode_categorical_tt(fx.copy(), fx.copy(), _deterministic_y(len(fx)))
-    assert set(params["dummy_vocab"]).issubset(set(old_train.columns)), "aynı dummy kolonları"
-    for d in params["dummy_vocab"]:
-        assert _as_str(out[d]) == _as_str(old_train[d]), f"onehot '{d}' parity kırıldı"
-    assert _as_str(out["num"]) == _as_str(old_train["num"]), "numeric kolon dokunulmamalı"
-
-
 def test_onehot_unseen_all_zero_and_limitation():
     """Görülmemiş kategori → tüm-dummy-0; eski yolla parity. D: known_limitation onehot'un
     all_zero'sunu count'un OOD-sentinel'inden AYIRIR (unseen ≡ referans kategori, iyi huylu)."""
@@ -316,9 +401,8 @@ def test_onehot_unseen_all_zero_and_limitation():
     params = oh.fit(train.copy())
     prod = pd.DataFrame({"geo": ["FR", "US", "DE"]})            # US görülmemiş
     out = oh.transform(prod.copy(), params)
-    _, old_test = _encode_categorical_tt(train.copy(), prod.copy(), y)
-    for d in params["dummy_vocab"]:
-        assert _as_str(out[d]) == _as_str(old_test[d]), f"unseen parity '{d}' kırıldı"
+    # T5b: eski-yol parity'si DÜŞTÜ (`_encode_categorical_tt` bu adıma delege → totoloji).
+    assert list(params["dummy_vocab"]), "dummy vocab donmuş olmalı"
     us_row = out.iloc[1]
     assert all(int(us_row[d]) == 0 for d in params["dummy_vocab"]), "US (unseen) → all_zero"
     # D — kanonik unseen kaydı + count'tan ayrı known_limitation
@@ -326,24 +410,6 @@ def test_onehot_unseen_all_zero_and_limitation():
     assert params["unseen"]["monitor"] == "count_rows_with_unseen"
     lim = params["unseen"]["known_limitation"].lower()
     assert "referans" in lim and "ood" in lim, "onehot limitation count'tan AYRI (referans, OOD-değil)"
-
-
-def test_onehot_real_column_parity_credit():
-    """GERÇEK-KOLON parity: credit loan_grade/loan_intent/home_ownership (hepsi ≤10 → onehot)."""
-    path = _find_csv("*credit_risk_dataset.csv")
-    if not path:
-        pytest.skip("credit_risk_dataset.csv yok (gitignored) — gerçek-kolon onehot atlandı")
-    df = pd.read_csv(path)[["loan_grade", "loan_intent", "person_home_ownership"]].copy()
-    route = decide_encode_route(df)
-    assert set(route["onehot"]) == {"loan_grade", "loan_intent", "person_home_ownership"}
-    assert route["target"] == [], "credit'te yüksek-kardinalite kolon yok (target inert)"
-    oh = OneHotStep({"columns": route["onehot"]})
-    params = oh.fit(df.copy())
-    out = oh.transform(df.copy(), params)
-    y = pd.Series((df.index % 2).astype(int))
-    old_train, _ = _encode_categorical_tt(df.copy(), df.copy(), y)
-    for d in params["dummy_vocab"]:
-        assert _as_str(out[d]) == _as_str(old_train[d]), f"gerçek-kolon onehot '{d}' parity kırıldı"
 
 
 # ── E: fit_transform ≠ transform + serving imza-invariant'ı ───
@@ -401,12 +467,13 @@ def test_target_fixture_serving_and_train_parity():
     assert route["target"] == ["hi"], route
     step = TargetEncodeStep({"columns": route["target"]})
     Xtr_new, params = step.fit_transform(X.copy(), y)
-    old_train, old_test = _encode_categorical_tt(X.copy(), X.copy(), y)
-    # TRAIN-parity (cross-fitted)
-    assert np.allclose(Xtr_new["hi"].to_numpy(), old_train["hi"].to_numpy()), "train-parity (cross-fitted)"
-    # SERVING-parity (düz transform)
     out = step.transform(X.copy(), params)
-    assert np.allclose(out["hi"].to_numpy(), old_test["hi"].to_numpy()), "serving-parity (düz transform)"
+    # T5b: eski-yol parity'si DÜŞTÜ (delege → totoloji). Yerine **E İNVARIANT'ı** — bu testin
+    # ASIL içeriği zaten buydu: sklearn TargetEncoder'da `fit_transform` (cross-fitted) ile düz
+    # `transform` AYNI DEĞİLDİR. Aynı çıksalardı cross-fitting kaybolmuş demektir ve train-parity
+    # sessizce YANLIŞ şeyi kanıtlardı (§2.8 Keşif E).
+    assert not np.allclose(Xtr_new["hi"].to_numpy(), out["hi"].to_numpy()),         "cross-fitted fit_transform ile düz transform AYNI çıktı — E invariant'ı kaybolmuş"
+    assert len(Xtr_new) == len(X) and len(out) == len(X), "satır sayısı korunmalı"
 
 
 def test_target_unseen_maps_to_prior():
@@ -419,31 +486,7 @@ def test_target_unseen_maps_to_prior():
     out = step.transform(prod.copy(), params)
     prior = float(y.mean())
     assert np.isclose(out["hi"].iloc[1], prior), f"unseen → prior ({prior})"
-    _, old_test = _encode_categorical_tt(X.copy(), prod.copy(), y)
-    assert np.allclose(out["hi"].to_numpy(), old_test["hi"].to_numpy()), "unseen→prior eski yolla parity"
-
-
-def test_target_real_column_parity_superstore():
-    """GERÇEK yüksek-kardinalite: superstore 'Sub-Category' (~17). Referans set DEĞİL → y SENTETİK.
-    YARI-GERÇEK: bu test 'iki implementasyon aynı' kanıtlar, 'target-encoding gerçek target'ta
-    doğru' DEĞİL (y uydurma). Parity eski==yeni olduğundan geçerli (ikisi de aynı sahte y'yi görür)."""
-    path = _find_csv("*superstore*.csv") or _find_csv("*Superstore*.csv")
-    if not path:
-        pytest.skip("superstore yok (gitignored) — gerçek yüksek-kardinalite target parity atlandı")
-    df = pd.read_csv(path)
-    col = "Sub-Category"
-    if col not in df.columns or df[col].nunique() <= 10:
-        pytest.skip(f"{col} yüksek-kardinalite değil — gerçek-kolon target atlandı")
-    X = df[[col]].copy()
-    y = _deterministic_y(len(df))
-    route = decide_encode_route(X)
-    assert col in route["target"], f"{col} (card {df[col].nunique()}) target'a gitmeli"
-    step = TargetEncodeStep({"columns": route["target"]})
-    Xtr_new, params = step.fit_transform(X.copy(), y)
-    old_train, old_test = _encode_categorical_tt(X.copy(), X.copy(), y)
-    out = step.transform(X.copy(), params)
-    assert np.allclose(Xtr_new[col].to_numpy(), old_train[col].to_numpy()), "gerçek train-parity"
-    assert np.allclose(out[col].to_numpy(), old_test[col].to_numpy()), "gerçek serving-parity"
+    # T5b: eski-yol karşılaştırması DÜŞTÜ (delege → totoloji); iddia politikada kaldı.
 
 
 # ── C: sklearn-pickle sürüm kapısı (fail-closed) ─────────────
@@ -543,28 +586,6 @@ def test_inf_inference_stays_finite():
 
 
 # ── scaler real-column parity (family-internal; sentetik-chain SİLİNDİ → orkestratör devraldı) ──
-
-
-def test_scaler_real_column_parity_credit():
-    """GERÇEK-KOLON scaler parity: credit numeric kolonlar (aynı outlier_cols ikisine)."""
-    path = _find_csv("*credit_risk_dataset.csv")
-    if not path:
-        pytest.skip("credit_risk_dataset.csv yok (gitignored) — gerçek-kolon scaler atlandı")
-    df = pd.read_csv(path).select_dtypes(include="number").fillna(0.0)
-    cols = list(df.columns)[:5]
-    df = df[cols].copy()
-    outlier_cols = cols[:2]
-    xn = df.copy()
-    p_inf = InfImputeStep().fit(xn); xn = InfImputeStep().transform(xn, p_inf)
-    route = decide_scaler_route(xn, outlier_cols)
-    p_rob = RobustScaleStep({"columns": route["robust"]}).fit(xn)
-    xn = RobustScaleStep({"columns": route["robust"]}).transform(xn, p_rob)
-    p_std = StandardScaleStep({"columns": route["standard"]}).fit(xn)
-    xn = StandardScaleStep({"columns": route["standard"]}).transform(xn, p_std)
-    xo, _ = _scale_features_tt(df.copy(), df.copy(), outlier_cols)
-    for col in cols:
-        assert np.allclose(xn[col].to_numpy(dtype=float), xo[col].to_numpy(dtype=float)), \
-            f"gerçek-kolon scaler '{col}' parity kırıldı"
 
 
 # ── route invariant (şişmiş outlier → hâlâ standard) + shared shape ──
@@ -766,47 +787,28 @@ def test_groupby_deviation_fixture_parity():
     """dev/zdev/grpstd fixture parity: yeni GroupbyDeviationStep == eski _groupby_deviation_tt
     (train + test tarafı AYRI). Unseen (Z) + unguvenilir grup (C) → global fallback birebir."""
     train, test = _groupby_fixture()
-    xo_tr, xo_te, added = _groupby_deviation_tt(train.copy(), test.copy(), meta=None, exclude=set())
-    assert added, "fixture en az bir groupby feature üretmeli (2 güvenilir grup)"
-    assert (any(a.startswith("dev_") for a in added) and any(a.startswith("zdev_") for a in added)
-            and any(a.startswith("grpstd_") for a in added)), "üç aile de (dev/zdev/grpstd) üretilmeli"
-
     step = GroupbyDeviationStep({"exclude": []})
     params = step.fit(train.copy())
     emitted = [name for rec in params for _, name in rec["emits"]]
-    assert set(emitted) == set(added), f"emit seti eşleşmedi (seçim drift): {set(emitted) ^ set(added)}"
+
+    # T5b — DEĞERE KARŞI TEST (eski-yol karşılaştırması delege yüzünden totolojiye döndü).
+    # Beklenti fixture'ın YAPISINDAN türetilir, literal ad GÖMÜLMEZ (§4 madde 2).
+    beklenen = {f"{aile}_amount_by_grp" for aile in ("dev", "zdev", "grpstd")}
+    assert set(emitted) == beklenen, f"emit seti (seçim drift): {set(emitted) ^ beklenen}"
 
     xn_tr = step.transform(train.copy(), params)   # == fit_transform train tarafı (DefaultFitTransform)
     xn_te = step.transform(test.copy(), params)
-    for name in added:
-        assert np.allclose(xn_tr[name].to_numpy(dtype=float), xo_tr[name].to_numpy(dtype=float),
-                           equal_nan=True), f"train '{name}' parity kırıldı"
-        assert np.allclose(xn_te[name].to_numpy(dtype=float), xo_te[name].to_numpy(dtype=float),
-                           equal_nan=True), f"test '{name}' parity kırıldı"
+    # Güvenilir grup istatistiği: dev = x − grup_ortalaması (train'den öğrenilmiş, donmuş)
+    grp_mean = train.groupby("grp")["amount"].mean()
+    ilk = train.iloc[0]
+    assert np.isclose(xn_tr["dev_amount_by_grp"].iloc[0],
+                      float(ilk["amount"]) - float(grp_mean[ilk["grp"]])),         "güvenilir grupta dev = x − grup_ortalaması olmalı"
+    assert not xn_tr[list(beklenen)].isna().any().any(), "train tarafında NaN kalmamalı"
 
     # unseen (Z, son satır) → global: dev = amount − global_mean (0 sentinel DEĞİL, global istatistik)
     global_mean = float(pd.to_numeric(train["amount"], errors="coerce").mean())
     assert np.isclose(xn_te["dev_amount_by_grp"].iloc[-1], 50.0 - global_mean), \
         "unseen kategori → global mean (dev = x − global_mean), map_to_zero DEĞİL"
-
-
-def test_groupby_deviation_real_column_parity_credit():
-    """GERÇEK-KOLON groupby parity: credit cat+num (train=test=df → reimplementasyon sadakati)."""
-    path = _find_csv("*credit_risk_dataset.csv")
-    if not path:
-        pytest.skip("credit_risk_dataset.csv yok (gitignored) — gerçek-kolon groupby atlandı")
-    df = pd.read_csv(path)
-    xo_tr, _xo_te, added = _groupby_deviation_tt(df.copy(), df.copy(), meta=None, exclude=set())
-    if not added:
-        pytest.skip("credit'te güvenilir grup üretilmedi — veri parity için uygun değil")
-    step = GroupbyDeviationStep({"exclude": []})
-    params = step.fit(df.copy())
-    emitted = [name for rec in params for _, name in rec["emits"]]
-    assert set(emitted) == set(added), f"gerçek-kolon emit seti eşleşmedi: {set(emitted) ^ set(added)}"
-    xn = step.transform(df.copy(), params)
-    for name in added:
-        assert np.allclose(xn[name].to_numpy(dtype=float), xo_tr[name].to_numpy(dtype=float),
-                           equal_nan=True), f"gerçek-kolon groupby '{name}' parity kırıldı"
 
 
 def test_groupby_deviation_in_orchestrator():
@@ -848,7 +850,12 @@ def _select_fixture() -> pd.DataFrame:
 
 def test_select_drop_frozen_drop_parity():
     """SelectDropStep (delege) çıktısı == build_features selection dizisi (AYNI fonksiyonlar/sıra/fillna).
-    Wiring doğrulaması: low-var (const) + high-corr (corr_a|corr_b) düşer, değerler birebir."""
+    Wiring doğrulaması: low-var (const) + high-corr (corr_a|corr_b) düşer, değerler birebir.
+
+    **T5b NOTU — bu bir PARITY testi DEĞİL, WIRING KİLİDİ.** `SelectDropStep.fit` bu fonksiyonlara
+    §2.12'den beri DELEGE ediyor (bilinçli karar), dolayısıyla "adım == fonksiyon" karşılaştırması
+    zaten totoloji olurdu. Test bunun yerine FIXTURE DEĞERİNE karşı çalışır (sabit kolon → low-var
+    düşer, korele çift → high-corr düşer) ve delege dizisinin doğru KURULDUĞUNU doğrular."""
     fx = _select_fixture()
     y = _deterministic_y(len(fx))
     # oracle: build_features tail (intent yok → univariate atla; meta/domain yok)
@@ -972,65 +979,6 @@ def _orchestrator_fixture() -> "tuple[pd.DataFrame, pd.Series, dict]":
     return fx, y, ctx
 
 
-def _old_oracle_sequence(fx: pd.DataFrame, y: pd.Series, ctx: dict) -> pd.DataFrame:
-    """Eski feature_builder fonksiyon dizisi = PIPELINE'ın TAM karşılığı (split-first sırada, X_train'de).
-    Config-tam: her adım ctx'ten (zscore/normalize, ratio, exclude, outlier, intent/univariate, meta/domain).
-    fit_pipeline bununla birebir olmalı (terminus'un uçtan-uca sadakat referansı). 8-satır fixture'da
-    ekstra config yok → mevcut davranışla aynı (zscore/univariate no-op)."""
-    exclude = set(ctx.get("encode_exclude", []))
-    xo = _clean_data(fx.copy())                                                # ImputeStep
-    for name, src in ctx.get("zscore_specs", []):                             # ZScoreStep (train-fit: frame=X_train)
-        if src in xo.columns and name not in xo.columns:
-            s = pd.to_numeric(xo[src], errors="coerce")
-            xo[name] = ((s - s.mean()) / (s.std(ddof=0) + 1e-9)).replace([np.inf, -np.inf], 0).fillna(0)
-    for name, src in ctx.get("normalize_specs", []):                          # NormalizeStep
-        if src in xo.columns and name not in xo.columns:
-            s = pd.to_numeric(xo[src], errors="coerce")
-            xo[name] = ((s - s.min()) / ((s.max() - s.min()) + 1e-9)).replace([np.inf, -np.inf], 0).fillna(0)
-    for name, num, den in ctx.get("ratio_pairs", []):                         # RatioConstructStep (rowwise)
-        if num in xo.columns and den in xo.columns and name not in xo.columns:
-            n = pd.to_numeric(xo[num], errors="coerce"); d = pd.to_numeric(xo[den], errors="coerce")
-            xo[name] = (n / d).replace([np.inf, -np.inf], np.nan)
-    xo = _finalize_ratio_features(xo, [n for n, _, _ in ctx.get("ratio_pairs", [])])   # RatioFinalizeStep (train=frame)
-    xo, _, _ = _count_encode_tt(xo, xo.copy(), exclude=exclude)               # CountEncodeStep
-    xo, _, _ = _groupby_deviation_tt(xo, xo.copy(), meta=None, exclude=exclude)  # GroupbyDeviationStep
-    xo, _ = _encode_categorical_tt(xo, xo.copy(), y)                          # encode route (OneHot+Target)
-    xo, _ = _scale_features_tt(xo, xo.copy(), ctx.get("outlier_cols", []))    # InfImpute + scaler route
-    # TERMINUS selection (SelectDropStep = fit dizisi + terminal cleanup)
-    xo, _ = _select_features_tt(xo, xo.copy())
-    xo = xo.apply(pd.to_numeric, errors="coerce").fillna(0)
-    intent = (ctx.get("intent") or "").strip().lower()
-    if intent in ("classification", "regression"):
-        xo, _, _ = _select_univariate_tt(xo, xo.copy(), y, intent)
-    xo, _, _ = _detect_leakage_tt(xo, xo.copy(), y, ctx.get("meta"),
-                                  protected_high_card=ctx.get("protected_high_card"))
-    xo, _, _ = _apply_domain_leakage_drops_tt(
-        xo, xo.copy(), ctx.get("domain_leakage_report") or {"dropped": [], "suspected": []})
-    return xo.apply(pd.to_numeric, errors="coerce").fillna(0)   # terminal cleanup (step transform)
-
-
-def test_orchestrator_multistep_parity():
-    """Orkestratör çok-adım parity: fit_pipeline == eski-oracle-dizisi; transform_pipeline ==
-    fit çıktısı (serving==training, target YOK). Bu, 4 elle-zinciri DEĞİŞTİRECEK test (silme ÖNCESİ yeşil)."""
-    fx, y, ctx = _orchestrator_fixture()
-    X_fit, artifact = fit_pipeline(fx, y, ctx)
-    xo = _old_oracle_sequence(fx, y, ctx)
-
-    # (1) fit_pipeline == eski build_features ara çıktısı (o 8 adıma karşılık)
-    common = [c for c in xo.columns if c in X_fit.columns]
-    assert set(X_fit.columns) == set(xo.columns), f"kolon seti farklı: {set(X_fit.columns) ^ set(xo.columns)}"
-    for col in common:
-        assert np.allclose(X_fit[col].to_numpy(dtype=float), xo[col].to_numpy(dtype=float)), \
-            f"orkestratör fit '{col}' eski-oracle'dan farklı"
-
-    # (2) transform_pipeline (serving) == fit çıktısı (target yok → cross-fit farkı yok)
-    X_serve = transform_pipeline(fx, artifact)
-    assert list(X_serve.columns) == artifact.final_features
-    for col in artifact.final_features:
-        assert np.allclose(X_serve[col].to_numpy(dtype=float), X_fit[col].to_numpy(dtype=float)), \
-            f"serving '{col}' != training (serving==training kırıldı)"
-
-
 def test_orchestrator_manifest_order_is_enumerate():
     """Manifest-sadakat invariant: order ELLE atanmaz, fiili fit-döngüsü indeksinden türer →
     manifest[i].order == i (kesintisiz, sıralı)."""
@@ -1136,16 +1084,17 @@ def _real_dataset_parity_harness(csv_glob: str, intent: str) -> None:
     }
 
     X_fit, artifact = fit_pipeline(X_train.copy(), y_train, ctx)
-    xo = _old_oracle_sequence(X_train.copy(), y_train, ctx)
 
-    # (1) UÇTAN-UCA parity: fit_pipeline == oracle (aynı feature_builder fonksiyonları) — gerçek veride birebir
-    assert set(X_fit.columns) == set(xo.columns), \
-        f"[{csv_glob}] kolon seti farklı: {(set(X_fit.columns) ^ set(xo.columns))}"
-    for c in X_fit.columns:
-        assert np.allclose(X_fit[c].to_numpy(dtype=float), xo[c].to_numpy(dtype=float), equal_nan=True), \
-            f"[{csv_glob}] uçtan-uca '{c}' fit_pipeline ≠ oracle (gerçek veri)"
+    # ── T5b: ORACLE KARŞILAŞTIRMASI DÜŞTÜ (§2.16(e)'nin öngördüğü kendiliğinden düşme) ──
+    # `_old_oracle_sequence` eski `_tt`'lerin ELLE rekonstrüksiyonuydu; T5a'da o `_tt`'ler
+    # Step'lere delege olunca karşılaştırma "adım == adım"a döndü (totoloji). Kaldırıldı.
+    # GERİYE KALAN İDDİA GERÇEKTİR: gerçek veride fit → artifact → **serving replay** çalışıyor
+    # ve donmuş params'la `final_features`'ı üretiyor. Bu, parity değil YOL doğrulamasıdır ve
+    # delegasyondan etkilenmez (serving yolu bağımsız kod: manifest replay + guard'lar).
+    assert X_fit.shape[0] == len(X_train), f"[{csv_glob}] fit satır sayısı korunmalı"
+    assert artifact.final_features, f"[{csv_glob}] artifact final_features üretmeli"
 
-    # (2) SERVING yolu gerçek veride: transform_pipeline(X_test) donmuş params'la çalışır, final_features üretir
+    # SERVING yolu gerçek veride: transform_pipeline donmuş params'la çalışır, final_features üretir
     X_serve = transform_pipeline(X_test.copy(), artifact)
     assert list(X_serve.columns) == artifact.final_features, f"[{csv_glob}] serving final_features uyuşmadı"
     assert len(X_serve) == len(X_test), f"[{csv_glob}] serving satır sayısı korunmalı"
@@ -1279,9 +1228,12 @@ def test_scope_gate_rejects_every_declared_unsupported_path():
     fx, y, ctx = _orchestrator_fixture()
     tetikleyici = {
         "modality": "timeseries", "aggregated": True, "timeseries_lag": {"lag_columns": ["x"]},
-        "domain_features": ["dom_x"], "date_features": ["d_year"],
-        "column_renames": [{"a": "b"}], "unported_ops": ["log"],
+        "domain_features": ["dom_x"],
+        # date_features KALDIRILDI — artık kapsam olgusu değil (DateFeaturesStep'e portlandı, §2.19)
+        "column_renames": [{"a": "b"}],
+        "chained_derived_features": [{"name": "z2", "chained_inputs": ["z1"]}],
         "deduplicated": False,        # YAPISAL ön-koşul: dedup'sız çerçeve fitted_stat'ları kaydırır
+        "currency_normalized": False,  # T5-(2): metin-para portlanmadı → serving'de çeviren adım yok
     }
     for fact, deger in tetikleyici.items():
         with pytest.raises(UnsupportedPipelineScope) as ei:
@@ -1305,8 +1257,9 @@ def test_scope_gate_fully_declared_clean_is_deployable():
     """Tüm olgular beyan edilmiş ve hiçbiri ihlal değilse → deployable=True."""
     fx, y, ctx = _orchestrator_fixture()
     temiz = {"modality": "tabular", "aggregated": False, "timeseries_lag": None,
-             "domain_features": [], "date_features": [], "column_renames": [], "unported_ops": [],
-             "deduplicated": True}
+             "domain_features": [], "date_features": [], "column_renames": [],
+             "deduplicated": True, "currency_normalized": True,
+             "chained_derived_features": []}
     _, artifact = fit_pipeline(fx, y, {**ctx, **temiz})
     assert artifact.supported_scope["deployable"] is True
     assert artifact.supported_scope["undeclared"] == []
@@ -1471,14 +1424,17 @@ def test_target_in_frame_creates_target_derived_feature():
 
 
 def test_symmetric_guard_catches_extra_column():
-    """FAZLA mevcudiyet artık hata — eskiden sessizdi. Serving'de eğitimde olmayan bir kolon
-    ara çerçevede duruyorsa sapma vardır; beyansız geçemez."""
+    """FAZLA mevcudiyet hata — beyansız geçemez. **T5-(2): kontrolün YERİ değişti, kendisi değil.**
+
+    Delta-guard adım-başına kolon SÖZLEŞMESİNİ doğrular; "hiçbir adımın dokunmadığı fazladan
+    kolon" onun KÖR NOKTASIDIR (hiçbir delta bozulmaz, kolon sonda reindex ile sessizce düşerdi).
+    Bu yüzden kontrol GİRİŞ NOKTASINA taşındı (`check_raw_input` + `raw_input_signature`)."""
     fx, y, ctx = _orchestrator_fixture()
     _, artifact = fit_pipeline(fx, y, ctx)
     kirli = fx.copy()
     kirli["beklenmeyen_kolon"] = 1.0
 
-    with pytest.raises(FrameShapeDivergence) as ei:
+    with pytest.raises(RawInputSignatureViolation) as ei:
         transform_pipeline(kirli, artifact)
     assert "beklenmeyen_kolon" in ei.value.extra
     assert ei.value.missing == [], "bu senaryoda eksik yok, yalnız fazla"
@@ -1496,24 +1452,247 @@ def test_symmetric_guard_extra_can_be_declared_tolerated():
 
 
 def test_symmetric_guard_localizes_divergence_to_step():
-    """Sapma ADIM düzeyinde raporlanır (sonda değil) → hangi adımdan sonra ayrıldığı belli."""
+    """Sapma ADIM düzeyinde lokalize — **artifact KURCALANARAK** doğrulanır (guard'ın yeşil
+    geçmesi değil, fiilen ÇALIŞTIĞI kanıtlanır).
+
+    T5-(2): MUAF ADIM YOK → sapma, sözleşmesi bozulan adımın TA KENDİSİNDE yakalanır.
+    GEVŞETME (2026-08-06, customer_id imza fix'i): "eksik silme" YALNIZ kolon girdide MEVCUTKEN
+    ihlaldir. Girdide HİÇ YOKSA "bu kolon çıktıda yok" invariant'ı trivial sağlanır → ihlal değil
+    (id serving satırında gönderilmese de guard patlamaz). Test İKİ yönü de kilitler."""
     fx, y, ctx = _orchestrator_fixture()
     _, artifact = fit_pipeline(fx, y, ctx)
-    kirli = fx.copy()
-    kirli["beklenmeyen_kolon"] = 1.0
-    with pytest.raises(FrameShapeDivergence) as ei:
-        transform_pipeline(kirli, artifact)
-    ilk_adim = min(artifact.manifest, key=lambda e: e["order"])
-    assert ei.value.step_id == ilk_adim["id"], "ilk sapan adımda patlamalı"
+    kalem = next(e for e in artifact.manifest
+                 if e["id"] == "drop_columns" and e["type"] != "route")
+
+    # (1) MEVCUT ama silinmemiş kolon → HÂLÂ yakalanır (sızıntı koruması BOZULMAZ), kendi adımında lokalize.
+    #     'b' drop step'te çerçevede VAR ve drop_columns onu düşürmez → "silinmeli ama silinmedi".
+    kalem["delta"] = {"added": [], "removed": ["b"]}
+    with pytest.raises(StepDeltaDivergence) as ei:
+        transform_pipeline(fx, artifact)
+    assert ei.value.step_id == "drop_columns", "sapma KENDİ adımında lokalize olmalı"
+    assert "b" in ei.value.eksik_silme
+
+    # (2) GİRDİDE OLMAYAN kolonun "silinmiş" iddiası → TOLERE (gevşetme; id-imzadan-çıkarma yolunun temeli).
+    #     'olmayan_kolon' fx'te yok → eksik_silme'ye girmez → divergence YOK (invariant zaten sağlı).
+    kalem["delta"] = {"added": [], "removed": ["olmayan_kolon"]}
+    out = transform_pipeline(fx, artifact)                 # patlamamalı
+    assert "olmayan_kolon" not in out.columns
 
 
-def test_manifest_records_training_columns_per_step():
-    """Simetrik karşılaştırmanın referansı: her adım kaleminde eğitim kolon-seti kayıtlı."""
+def test_manifest_records_step_delta_contract():
+    """Delta-guard'ın referansı: HER kalem kolon SÖZLEŞMESİ taşır (``added``/``removed``),
+    istisnasız — muaf adım kavramı kalktı. Deterministik sıra korunur (kümeler sıralı yazılır)."""
     fx, y, ctx = _orchestrator_fixture()
     _, artifact = fit_pipeline(fx, y, ctx)
     for e in artifact.manifest:
-        assert e.get("columns_out") is not None, f"{e['id']} columns_out taşımıyor"
-        assert e["columns_out"] == sorted(e["columns_out"]), "deterministik sıra"
+        d = e.get("delta")
+        assert d is not None, f"{e['id']} delta taşımıyor"
+        assert set(d) == {"added", "removed"}, f"{e['id']} delta şekli bozuk: {d}"
+        assert d["added"] == sorted(d["added"]) and d["removed"] == sorted(d["removed"]),             "deterministik sıra (kümeler sıralı serileşir)"
+        assert "columns_out" not in e and "columns_out_skipped" not in e,             "mutlak kolon seti kalıntısı — delta'ya geçildi, artık yanıltıcı olur"
+
+
+def test_pre_split_prefix_is_contiguous_and_matches_chain_slice():
+    """T4a KİLİDİ — ÖN-EK BÜTÜNLÜĞÜ. Pre-split adımlar PIPELINE'ın BİTİŞİK ön-eki olmak
+    zorunda (builder ``order``'ı monoton; pre-split faz build_features'ta, post-split faz
+    ``_run_orchestrated_chain``'de fit edilir — kronoloji araya adım sokulmasına izin vermez).
+    Ve ``_run_orchestrated_chain``'in dilim indeksi ön-ek UZUNLUĞUNA eşit olmalı.
+
+    Bu ikisi ayrışırsa sessiz bozulma: indeks küçük kalırsa adım İKİ KEZ fit edilir (order
+    uzayı bozulur), büyük kalırsa adım HİÇ fit edilmez (kolon üretilmez). İkisi de parity
+    testlerinde geç ve dolaylı görünür — burada doğrudan yakalanır."""
+    import inspect as _inspect
+    from src.services import feature_builder as _fb
+
+    pre = [i for i, s in enumerate(PIPELINE)
+           if isinstance(s, StepSpec) and getattr(s, "pre_split", False)]
+    assert pre == list(range(len(pre))), \
+        f"pre_split adımları BİTİŞİK ön-ek olmalı, bulunan indeksler: {pre}"
+    assert [PIPELINE[i].step_cls for i in pre] == [
+        MissingIndicatorStep, ImputeStep, DateFeaturesStep, DropColumnsStep,
+        ZScoreStep, NormalizeStep, PlanDerivedStep], \
+        ("pre-split ön-eki legacy KAYNAK sırasını izlemeli: missing_indicator → impute → "
+         "date_features (§2.19 kapsam portu, impute SONRASI/drop ÖNCESİ) → drop_columns → zscore/normalize")
+
+    src = _inspect.getsource(_fb._run_orchestrated_chain)
+    assert f"PIPELINE[{len(pre)}:]" in src, \
+        (f"post-split dilimi ön-ek uzunluğuyla ({len(pre)}) eşleşmiyor — "
+         f"adım ya iki kez fit edilir ya hiç edilmez")
+
+
+def test_t4b_legacy_op_is_retired_in_orchestrator_mode():
+    """T4b — ÇİFT-ÇALIŞMA KALDIRILDI (kaynak-düzeyi çit). Portlu op'lar orchestrator modunda
+    eski `_FEATURE_OPS` yolundan ATLANIR; legacy/shadow'da çalışmaya devam eder."""
+    import inspect as _inspect
+    from src.services import feature_builder as _fb
+
+    assert "skip_ops" in _inspect.signature(_fb._run_feature_specs).parameters
+    src = _inspect.getsource(_fb.build_features)
+    assert "skip_ops=(_PORTED if _orch_mode else None)" in src, \
+        "portlu op'lar YALNIZ orchestrator modunda atlanmalı (legacy arm'ı bozulmaz)"
+
+
+def test_t4b_step_actually_learns_when_spec_declared():
+    """T4b — DAVRANIŞSAL KİLİT (kaynak metni DEĞİL). Eski op geri gelirse kolon çerçevede
+    ZATEN var olur, ``ZScoreStep.fit``'in ``name in X_train.columns`` kapısı onu ATLAR,
+    ``params`` BOŞ kalır ve çıktı yine "doğru" görünür — hiçbir parity testi fark etmez.
+    Bu yüzden iddia doğrudan sorulur: **adım fiilen ÖĞRENDİ Mİ?**"""
+    fx, y, ctx = _orchestrator_fixture()
+    src = fx.select_dtypes(include="number").columns[0]        # dinamik, hardcode yok
+    ctx = {**ctx, "zscore_specs": [["z_probe", src]], "normalize_specs": [["n_probe", src]]}
+    _, artifact = fit_pipeline(fx, y, ctx)
+
+    zp = artifact.param_store.get("zscore_feature") or {}
+    np_ = artifact.param_store.get("normalize_feature") or {}
+    assert zp.get("z_probe"), "zscore adımı ÖĞRENMEDİ — eski op geri gelmiş olabilir (çift-çalışma)"
+    assert np_.get("n_probe"), "normalize adımı ÖĞRENMEDİ"
+    assert zp["z_probe"]["input"] == src and {"mean", "std"} <= set(zp["z_probe"])
+    assert {"min", "max"} <= set(np_["n_probe"])
+
+
+def test_t4b_serving_replay_produces_derived_column():
+    """T4b — DEPLOYMENT GEREKÇESİNİN DOĞRUDAN KANITI. İddia: *artifact `zscore_specs` taşımalı,
+    çünkü serving'de o kolon ÜRETİLMEK zorunda* (selection'dan düşse bile ara çerçevede var
+    olmalı). Bu ancak replay'de gösterilir: ham satır → `transform_pipeline` → kolon doğuyor mu?"""
+    fx, y, ctx = _orchestrator_fixture()
+    src = fx.select_dtypes(include="number").columns[0]
+    ctx = {**ctx, "zscore_specs": [["z_probe", src]]}
+    _, artifact = fit_pipeline(fx, y, ctx)
+
+    ara = {}
+    transform_pipeline(fx.head(1), artifact, on_step=lambda sid, X: ara.__setitem__(sid, list(X.columns)))
+    assert "z_probe" in (ara.get("zscore_feature") or []), \
+        "serving replay'i türev kolonu ÜRETMELİ (artifact'in taşıdığı spec'ten) — T4'ün gerekçesi"
+
+
+def test_control_gate_order_is_locked():
+    """T4a — KAPI SIRASI ÖLÇÜLDÜ, KİLİTLENDİ (varsayım değil).
+
+    ``check_scope`` **``__post_init__``'te DEĞİL**: ``ArtifactBuilder`` sade bir dataclass,
+    ``check_scope`` açık bir metot ve üretim yolunda ``_run_orchestrated_chain``'in başında
+    (yani SPLIT'ten sonra) çağrılıyor — sebebi yapısal: ``pipeline_ctx`` ancak ratio/zeroflag'den
+    sonra kurulabiliyor.
+
+    T4a SONUCU (ölçüldü): drop + yapısal ön-koşul denetimi pre-split'e kaydı → ``check_scope``'un
+    ÖNÜNE geçtiler. Fiili sıra: ``drop → precondition → SPLIT → scope``.
+    Fail-closed HER İKİ sırada korunur (ikisi de fırlatır, artifact kurulmaz); değişen yalnız
+    ikisini birden ihlal eden koşuda önce çıkan teşhis. Bu test o kararı SABİTLER."""
+    from src.services import feature_builder as _fb
+    import inspect as _inspect
+
+    # (a) Kurulum kapı çalıştırmaz — scope boş gelir (yani "builder kurulurken kontrol" YANLIŞ).
+    b = ArtifactBuilder()
+    assert not hasattr(ArtifactBuilder, "__post_init__"), \
+        "ArtifactBuilder'a __post_init__ eklenmiş — kapı sırası varsayımı değişir"
+    assert b.scope == {}, "kurulum kapsam kapısını ÇALIŞTIRMAZ (açık check_scope çağrısı gerekir)"
+
+    # (b) Üretim yolunda kapı _run_orchestrated_chain'de (post-split), build_features'ta değil.
+    assert "check_scope" in _inspect.getsource(_fb._run_orchestrated_chain), \
+        "kapsam kapısı post-split zincirin başında çağrılmalı"
+    # (c) drop pre-split → ön-koşul denetimi de pre-split (adımın içinde tetikleniyor)
+    drop_spec = next(s for s in PIPELINE if isinstance(s, StepSpec) and s.step_cls is DropColumnsStep)
+    assert drop_spec.pre_split is True, "T4a: drop_columns pre-split"
+    assert "check_structural_preconditions" in _inspect.getsource(ArtifactBuilder.fit_step), \
+        "ön-koşul denetimi drop adımının içinde tetiklenmeli (konumu adımı takip eder)"
+
+
+def test_legacy_tt_bodies_delegate_to_steps():
+    """T5b — DELEGASYON KİLİDİ (tautoloji temizliğinin karşılığı).
+
+    T5a'da beş `_tt` gövdesi Step'lere delege edildi; o beşine karşı yazılmış parity testleri
+    "adım == adım" dediği için SİLİNDİ ya da politika/değer iddiasına çevrildi. Yerine geçen
+    savunma budur: **gövdeler HÂLÂ delege ediyor mu?** Biri delegasyonu geri alıp eski algoritmayı
+    yeniden yazarsa ikiz implementasyon geri gelir ve bunu artık hiçbir parity testi görmez —
+    bu test görür. (Port DOĞRULUĞUNU kanıtlamaz; delegasyonun GERİ ALINMASINI yakalar.)"""
+    import inspect as _inspect
+    from src.services import feature_builder as _fb
+
+    beklenen = {
+        "_finalize_ratio_features_tt": "RatioFinalizeStep",
+        "_count_encode_tt": "CountEncodeStep",
+        "_groupby_deviation_tt": "GroupbyDeviationStep",
+        "_encode_categorical_tt": "decide_encode_route",
+        "_scale_features_tt": "decide_scaler_route",
+    }
+    for fn_adi, iz in beklenen.items():
+        src = _inspect.getsource(getattr(_fb, fn_adi))
+        assert iz in src, f"{fn_adi} artık {iz}'e delege ETMİYOR — ikiz implementasyon geri gelmiş olabilir"
+        # gövde İNCE olmalı: delege eden fonksiyon algoritma taşımaz
+        govde = [l for l in src.split("\n") if l.strip() and not l.strip().startswith(("#", '"'))]
+        assert len(govde) < 30, f"{fn_adi} gövdesi şişmiş ({len(govde)} satır) — delege mi ediyor?"
+
+
+def test_guard_verification_is_bound_to_cutover_switch():
+    """T5-D KİLİDİ — "guard'ı açmayı unutma" riskini YAPISAL olarak kaldırır (kullanıcı şartı 1).
+
+    Ara durumda `verify_input`/`verify_delta` kapalı, çünkü fully-built çerçevede ikisi de
+    anlamsız (imza HAM sözleşmeyi tarif eder; pre-split adımların etkisi orada ZATEN olmuştur →
+    ölçüldü: superstore `drop_columns` `removed=[]`). Risk: cutover'da guard'ı elle açmayı
+    unutmak. Çözüm: denetim ELLE DEĞİL, `raw_test`in varlığına bağlı — o da yalnız
+    ``SERVING_RAW_REPLAY`` açıkken dolar. İKİNCİ bir bayrak YOK, unutulacak bir kol YOK."""
+    import inspect as _inspect
+    from src.services import feature_builder as _fb
+
+    src = _inspect.getsource(_fb._run_orchestrated_chain)
+    assert "verify_input=(raw_test is not None), verify_delta=(raw_test is not None)" in src, \
+        "denetim raw_test'e BAĞLI olmalı — elle bayrak cutover'da unutulur"
+    bf = _inspect.getsource(_fb.build_features)
+    assert "if (_df_raw is not None and SERVING_RAW_REPLAY) else None" in bf, \
+        "raw_test YALNIZ cutover anahtarı açıkken dolmalı"
+    # Anahtar tek kaynak: inline yazma devri de aynı anahtara bağlı (yarı-açık durum imkânsız)
+    assert "write=not (_orch_mode and SERVING_RAW_REPLAY)" in bf, \
+        "missing-indicator yazma devri aynı anahtara bağlı olmalı"
+    assert "write=not (_orch_mode and SERVING_RAW_REPLAY))" in bf, \
+        "ratio yazma devri aynı anahtara bağlı olmalı"
+
+
+def test_missing_feature_production_active_without_delta_check():
+    """Kullanıcı şartı 3: delta denetimi KAPALI olsa da terminal üretim-kanıtı ağı GÖREVDE.
+    "Bu kolon hiç üretilmedi" hatası ara durumda da kaçmaz."""
+    fx, y, ctx = _orchestrator_fixture()
+    _, artifact = fit_pipeline(fx, y, ctx)
+    artifact.final_features = list(artifact.final_features) + ["hayalet_kolon"]
+    with pytest.raises(MissingFeatureProduction) as ei:
+        transform_pipeline(fx, artifact, verify_input=False, verify_delta=False)
+    assert "hayalet_kolon" in ei.value.never_produced
+
+
+def test_no_step_is_exempt_from_guard():
+    """T5-(2): **GUARD MUAFİYETİ TAMAMEN KALKTI** — §2.25 borç kalemi 1 kapandı; bu testin
+    iddiası tersine döndü.
+
+    Eskiden (T3a-1 → T4b): pre_split adımlar simetrik guard'dan MUAFTI (2 → 3 → 5 adım) çünkü
+    incremental çerçeveleri fully-built X_test'le uyuşmuyordu; muaf küme açık liste tutuluyordu
+    ki büyümesi bilinçli karar gerektirsin. Şimdi: delta YEREL invariant → incremental çerçevede
+    de çalışıyor → **hiçbir adımın muaf olmasına gerek yok**. ``pre_split`` yalnız FİT SIRASI
+    bilgisi olarak kaldı, guard anlamı YOK."""
+    fx, y, ctx = _orchestrator_fixture()
+    _, artifact = fit_pipeline(fx, y, ctx)
+    assert not any(e.get("columns_out_skipped") for e in artifact.manifest), \
+        "muafiyet kaydı kalmamalı (gerekçesi kalkan kayıt yanıltıcı artık olur)"
+    assert all(e.get("delta") is not None for e in artifact.manifest), \
+        "HER adım — pre_split dahil — delta ile doğrulanır"
+    # pre_split bayrağı manifest'te BİLGİ olarak durur; hangi adımlar olduğu hâlâ dar kapı
+    pre_ids = {e["id"] for e in artifact.manifest if e.get("pre_split")}
+    assert pre_ids <= {"missing_indicator", "impute_missing", "date_features", "drop_columns",
+                       "zscore_feature", "normalize_feature", "plan_derived"}, \
+        f"beklenmeyen adım pre_split beyan ediyor: {pre_ids}"
+
+
+def test_missing_feature_production_survives_pre_split_exemption():
+    """ÜRETİM-KANITI AĞI delta-guard'a geçişte ZAYIFLAMADI (kullanıcı şartı).
+    ``ever_produced`` order 0'dan biriktiği için 'hiç üretilmedi' hatası KAÇMAZ.
+
+    T5-(2) ÖN-KOŞULU: artık HİÇBİR adım guard'dan muaf değil — muafiyet kaydı da kalkmalı,
+    yoksa gerekçesi olmayan yanıltıcı bir artık kalır."""
+    fx, y, ctx = _orchestrator_fixture()
+    _, artifact = fit_pipeline(fx, y, ctx)
+    assert not any(e.get("columns_out_skipped") for e in artifact.manifest),         "muafiyet kaydı kalkmalı (delta-guard incremental çerçevede de çalışıyor)"
+    assert all("delta" in e for e in artifact.manifest), "her kalem kolon sözleşmesi taşımalı"
+    artifact.final_features = list(artifact.final_features) + ["hayalet_kolon"]
+    with pytest.raises(MissingFeatureProduction) as ei:
+        transform_pipeline(fx, artifact)
+    assert "hayalet_kolon" in ei.value.never_produced, "muafiyete rağmen üretim-kanıtı yakalamalı"
 
 
 def test_symmetric_guard_does_not_false_positive():
@@ -1552,12 +1731,20 @@ def test_structural_precondition_drop_list_must_be_effective():
 
 
 def test_structural_precondition_passes_when_wired():
-    """Doğru kablolandığında (ctx drop listesi → DropColumnsStep) ön-koşul sağlanır."""
+    """Doğru kablolandığında (ctx drop listesi → DropColumnsStep) ön-koşul sağlanır ve kolon
+    FİİLEN düşer.
+
+    İddia manifest kaydı yerine **fiili çerçeve** üzerinden kurulur — daha güçlü: "kayıt öyle
+    diyor" değil "kolon gitti". T5-(2): adımın SÖZLEŞMESİ de (delta) doğrulanır."""
     fx, y, ctx = _orchestrator_fixture()
     fx = fx.assign(cust_id=[f"C{i}" for i in range(len(fx))])
-    _, artifact = fit_pipeline(fx, y, {**ctx, "drop_columns": ["cust_id"]})
+    X_out, artifact = fit_pipeline(fx, y, {**ctx, "drop_columns": ["cust_id"]})
+    assert "cust_id" not in X_out.columns, "drop adımından sonra kolon çerçevede olmamalı"
+    assert "cust_id" not in artifact.final_features, "düşen kolon final_features'a giremez"
     kalem = next(e for e in artifact.manifest if e["id"] == "drop_columns")
-    assert "cust_id" not in kalem["columns_out"], "drop adımından sonra kolon çerçevede olmamalı"
+    assert kalem["delta"]["removed"] == ["cust_id"], \
+        "adımın SÖZLEŞMESİ: cust_id düşürülür (delta-guard bunu serving'de doğrular)"
+    assert kalem["config"] == {"columns": ["cust_id"]}, "donmuş drop listesi manifest'te taşınmalı"
 
 
 def test_unique_id_target_encoded_reproduces_y_exactly():
@@ -1620,20 +1807,67 @@ def test_pipeline_ctx_is_deployable_and_normalizes_modality():
     assert check_pipeline_scope(ctx)["deployable"] is True, "tam beyan → deploy edilebilir"
 
 
-def test_pipeline_ctx_flags_unported_ops():
-    """Plan portlanmamış bir op seçerse kapsam kapısı reddetmeli (zscore/normalize portlu)."""
+def test_pipeline_ctx_declares_all_eight_ops_ported():
+    """6-OP PORTU: palet 8/8 PORTLU → `unported_ops` kapsam kuralı KALKTI (port → guard 0 →
+    kuralı kaldır deseni). Spec'ler iki KOVAYA ayrılır: parametric (zscore/normalize, fitted
+    μ/σ-min/max) ve rowwise (diğer 6, fitted-state YOK)."""
     plan = {"derived_features": [
         {"op": "zscore", "name": "z_a", "inputs": ["a"]},
-        {"op": "log",    "name": "l_b", "inputs": ["b"]},      # PORTLANMAMIŞ
+        {"op": "log",    "name": "l_b", "inputs": ["b"]},      # ARTIK PORTLU
     ]}
     ctx = assemble_pipeline_ctx(
         intent="classification", modality="tabular", aggregated=False, target_name="y",
         drop_columns=[], ratio_feature_meta={}, missing_indicator_meta={},
         derived_flag_meta={}, feature_plan=plan, encode_exclude=set(), outlier_cols=[],
         timeseries_lag=None, domain_feature_cols=[], date_feature_cols=[], column_renames=[])
-    assert ctx["unported_ops"] == ["log"], "portlanmamış op beyan edilmeli"
-    assert ctx["zscore_specs"] == [["z_a", "a"]], "portlu op spec'e çevrilmeli"
-    assert check_pipeline_scope(ctx)["violations"], "portlanmamış op → kapsam ihlali"
+    assert ctx["zscore_specs"] == [["z_a", "a"]], "parametric op parametric kovada"
+    assert [s["name"] for s in ctx["derived_specs"]] == ["l_b"], "rowwise op rowwise kovada"
+    assert not any(v["fact"] == "unported_ops" for v in check_pipeline_scope(ctx)["violations"]),         "unported_ops kuralı KALKTI (palet 8/8)"
+    assert "unported_ops" not in {f for f, _, _ in _SCOPE_RULES}, "kural tablosundan da kalkmalı"
+
+
+def test_pipeline_ctx_applies_leakage_denylist_to_specs():
+    """T4 (3) — §2.19'un DÖRDÜNCÜ örneği: garanti adımın DIŞINDA yaşıyordu, çıkarınca kaybolurdu.
+
+    Eski yolda (`_run_feature_specs`) girdisi `disallowed`'da olan spec HİÇ ÇALIŞMAZ. O kapı
+    op'un ÇEVRESİNDE; T4'te op emekli olunca ``ZScoreStep`` onu göremez ve leaky girdiyi
+    hesaplardı — **eski yolda İMKÂNSIZ** bir sızıntı yüzeyi. Kapı artık beyan yüzeyinde:
+    ctx'e girmeyen spec'i hiçbir adım göremez (tek kaynak)."""
+    plan = {"derived_features": [
+        {"op": "zscore",    "name": "z_temiz", "inputs": ["temiz_kolon"]},
+        {"op": "zscore",    "name": "z_leaky", "inputs": ["sizinti_kolonu"]},   # DENYLIST
+        {"op": "normalize", "name": "n_leaky", "inputs": ["hedef"]},            # DENYLIST (hedef)
+    ]}
+    ctx = assemble_pipeline_ctx(
+        intent="classification", modality="tabular", aggregated=False, target_name="hedef",
+        drop_columns=[], ratio_feature_meta={}, missing_indicator_meta={},
+        derived_flag_meta={}, feature_plan=plan, encode_exclude=set(), outlier_cols=[],
+        timeseries_lag=None, domain_feature_cols=[], date_feature_cols=[], column_renames=[],
+        disallowed={"hedef", "sizinti_kolonu"})
+    assert ctx["zscore_specs"] == [["z_temiz", "temiz_kolon"]], \
+        "leaky girdili zscore spec'i BEYAN EDİLMEMELİ (eski yol da çalıştırmıyor)"
+    assert ctx["normalize_specs"] == [], "hedef girdili normalize spec'i beyan edilmemeli"
+
+    # Beyan yüzeyi TEK KAYNAK: ctx'te olmayan spec adım tarafından da üretilemez.
+    df = pd.DataFrame({"temiz_kolon": [1.0, 2.0, 3.0, 4.0], "sizinti_kolonu": [9.0, 8.0, 7.0, 6.0]})
+    out, _ = ZScoreStep(config={"specs": ctx["zscore_specs"]}).fit_transform(df.copy(), None)
+    assert "z_temiz" in out.columns and "z_leaky" not in out.columns
+
+
+def test_pipeline_ctx_rejects_invalid_spec_shape():
+    """Aynı kapının ikinci yarısı: eski yol `validate_feature_spec_shape`'ten geçmeyen spec'i
+    çalıştırmıyor. zscore TEK girdi alır; iki girdili spec beyan edilmemeli (yoksa adım
+    sessizce ``inputs[0]``'ı kullanır ve plan'ın demediği bir şeyi hesaplar)."""
+    plan = {"derived_features": [
+        {"op": "zscore", "name": "z_iyi",  "inputs": ["a"]},
+        {"op": "zscore", "name": "z_kotu", "inputs": ["a", "b"]},     # yanlış arite
+    ]}
+    ctx = assemble_pipeline_ctx(
+        intent="classification", modality="tabular", aggregated=False, target_name="y",
+        drop_columns=[], ratio_feature_meta={}, missing_indicator_meta={},
+        derived_flag_meta={}, feature_plan=plan, encode_exclude=set(), outlier_cols=[],
+        timeseries_lag=None, domain_feature_cols=[], date_feature_cols=[], column_renames=[])
+    assert ctx["zscore_specs"] == [["z_iyi", "a"]], "geçersiz şekilli spec beyan edilmemeli"
 
 
 def test_flag_metas_are_unfiltered_supersets():
@@ -1681,7 +1915,8 @@ def _shadow_ctx() -> dict:
             "drop_columns": [], "missing_indicator_cols": [], "zero_flag_cols": [],
             "modality": "tabular", "aggregated": False, "timeseries_lag": None,
             "domain_features": [], "date_features": [], "column_renames": [],
-            "unported_ops": [], "deduplicated": True, "target_col": None}
+            "deduplicated": True, "currency_normalized": True,
+            "chained_derived_features": [], "target_col": None}
 
 
 def test_shadow_reports_identical_when_paths_agree():
@@ -1736,10 +1971,13 @@ def test_shadow_detects_column_and_value_divergence():
 
 
 def test_shadow_is_off_by_default():
-    """Varsayılan `legacy` — gölge maliyeti SIFIR, feature_report'ta boş kalır."""
+    """T5c CUTOVER (2026-08-05): varsayılan `legacy`→`orchestrator`. Gölge YİNE kapalı (maliyet SIFIR):
+    shadow AÇIKÇA seçilmedikçe koşmaz. Bu test artık İKİ şeyi pinler — (1) üretim yolu orchestrator,
+    (2) shadow default DEĞİL. (T5d tam collapse'ta flag'le birlikte kalkacak.)"""
     from src.core.config import settings
-    assert settings.FEATURE_PIPELINE_MODE == "legacy", \
-        "varsayılan legacy OLMALI (üretim davranışı flag'siz değişmez)"
+    assert settings.FEATURE_PIPELINE_MODE == "orchestrator", \
+        "T5c: varsayılan orchestrator OLMALI (date_features portlandı, kapsam reddi kalktı)"
+    assert settings.FEATURE_PIPELINE_MODE != "shadow", "gölge asla varsayılan olamaz (maliyet SIFIR kalmalı)"
 
 
 def test_zscore_step_is_inert_in_shadow():
@@ -1752,6 +1990,143 @@ def test_zscore_step_is_inert_in_shadow():
     assert params == {}, "çıktı kolonu zaten varsa adım ATLAMALI (gölgede inert)"
     params2 = ZScoreStep(config={"specs": [["z_a", "a"]]}).fit(fx.drop(columns=["z_a"]))
     assert "z_a" in params2, "kolon yoksa adım fiilen çalışmalı (T4'teki hâli)"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T2 — YAPISAL CUTOVER (build_features post-split zinciri → orkestratör)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _ctx_min(df: pd.DataFrame) -> dict:
+    """T2 testleri için minimum ctx (mevcut testlerdeki `ctx = {...}` deseniyle aynı)."""
+    return {"ratio_pairs": [["ratio_borc_gelir", "borc", "gelir"]],
+            "encode_exclude": [], "outlier_cols": [], "intent": ""}
+
+
+def _t2_fixture():
+    """Küçük ama T2'nin dokunduğu her yolu tetikleyen çerçeve (ratio + cat + num)."""
+    n = 60
+    return pd.DataFrame({
+        "gelir":  [100.0 + i for i in range(n)],
+        "borc":   [10.0 + (i % 7) for i in range(n)],
+        "sehir":  ["A", "B", "C"] * (n // 3),
+        "ratio_borc_gelir": [(10.0 + (i % 7)) / (100.0 + i) for i in range(n)],
+    })
+
+
+def _t2_y(df: pd.DataFrame) -> pd.Series:
+    """`fit_pipeline` hedefsiz çağrılamaz — `TargetEncodeStep.fit_transform` y'yi ZORUNLU
+    kılar (E invariant'ı: cross-fitting serving'e sızamaz). Mevcut orkestratör testleriyle
+    aynı desen."""
+    return pd.Series([0, 1] * (len(df) // 2), index=df.index)
+
+
+def test_on_step_observer_cannot_mutate_frame():
+    """GÖZLEMCİ YAPISAL OLARAK READ-ONLY — yeni bir kaçış deliği açılmamalı.
+
+    Gözlemci içinde çerçeveyi mutasyona uğratmak, pipeline'ın DIŞINDA gizli bir dönüşüm
+    yolu doğururdu: eğitimde çalışan ama serving replay'inde OLMAYAN bir adım — A
+    refactor'unun imkânsız kılmak için var olduğu şeyin ta kendisi. `_notify` gözlemciye
+    KOPYA geçer (assert değil, YAPI) → saldırgan gözlemci etkisiz kalır."""
+    from src.services.inference.orchestrator import fit_pipeline, transform_pipeline
+
+    fx = _t2_fixture()
+    ctx, y = _ctx_min(fx), _t2_y(fx)
+
+    def _saldirgan(step_id, X):
+        X["ZARARLI_KOLON"] = 1.0          # kopyayı kirletir
+        if len(X.columns):
+            X[X.columns[0]] = -999.0       # kopyadaki değerleri ezer
+
+    temiz, art_temiz = fit_pipeline(fx.copy(), y, dict(ctx))
+    kirli, art_kirli = fit_pipeline(fx.copy(), y, dict(ctx), on_step=_saldirgan)
+
+    assert "ZARARLI_KOLON" not in kirli.columns, "gözlemci pipeline çerçevesini KİRLETTİ"
+    assert list(temiz.columns) == list(kirli.columns)
+    pd.testing.assert_frame_equal(temiz, kirli)
+    assert art_temiz.final_features == art_kirli.final_features
+
+    # transform tarafı da aynı garantiyi taşımalı (serving yolu)
+    s_temiz = transform_pipeline(fx.copy(), art_temiz)
+    s_kirli = transform_pipeline(fx.copy(), art_temiz, on_step=_saldirgan)
+    pd.testing.assert_frame_equal(s_temiz, s_kirli)
+
+
+def test_on_step_observer_sees_every_step_in_order():
+    """Gözlemci fiili yürütme sırasını görür (kanca noktası güvenilir olmalı)."""
+    from src.services.inference.orchestrator import fit_pipeline
+
+    fx, gorulen = _t2_fixture(), []
+    fit_pipeline(fx.copy(), _t2_y(_t2_fixture()), _ctx_min(fx),
+                 on_step=lambda sid, X: gorulen.append(sid))
+    assert "ratio_finalize" in gorulen, "T2'nin kanca noktası gözlemciye görünmeli"
+    assert gorulen.index("ratio_finalize") < gorulen.index("select_drop")
+    assert gorulen[-1] == "select_drop", "TERMINUS en son görünmeli"
+
+
+def test_select_drop_publishes_chain_side_values():
+    """T2 ZORUNLULUĞU: zincirin yan-değerleri params'a YAYINLANIR.
+
+    Eskiden `_uni`/`_rep`/`_dom` sessizce atılıyordu; T2'de build_features zinciri
+    devralınca `feature_report`'un leakage_dropped/leakage_suspected/univariate_dropped
+    alanları BOŞALIRDI (bit-birebir şartı bunu yakalar ama sebebi burada kilitlenir)."""
+    fx = _t2_fixture()
+    y = pd.Series([0, 1] * (len(fx) // 2))
+    params = SelectDropStep(config={"intent": "classification"}).fit(fx, y)
+
+    for anahtar in ("leakage_report", "univariate_dropped", "domain_dropped"):
+        assert anahtar in params, f"'{anahtar}' params'ta YAYINLANMALI (rapor girdisi)"
+    assert set(params["leakage_report"]) >= {"dropped", "suspected"}
+    assert isinstance(params["univariate_dropped"], list)
+    # transform bunları OKUMAZ → ekleme davranış-nötr
+    assert params["drop_cols"] == SelectDropStep(
+        config={"intent": "classification"}).fit(fx, y)["drop_cols"]
+
+
+def test_protected_high_card_derivation_matches_legacy():
+    """`ts_protected_cols` TÜRETİMİ == legacy'nin finalize-sonrası kümesi (deterministik).
+
+    Legacy: `set(ratio_feature_cols) - dropped_by_finalize` (ts-lag kolonları kapsam
+    kapısınca reddedildiği için desteklenen kapsamda YOK). Türetim: oran adları ∩ çerçeve.
+    Beyan edilmiş `protected_high_card` varsa o KAZANIR (türetim yalnız yokluğunda)."""
+    fx = _t2_fixture()
+    ratio_adlari = ["ratio_borc_gelir", "ratio_dusmus_olan"]   # ikincisi çerçevede YOK
+
+    step = SelectDropStep(config={"intent": "", "ratio_names": ratio_adlari})
+    params = step.fit(fx, None)
+    assert params["protected_high_card"] == ["ratio_borc_gelir"], \
+        "türetim yalnız ÇERÇEVEDE OLAN oran kolonlarını korumalı (finalize'ta düşen hariç)"
+
+    beyanli = SelectDropStep(config={"intent": "", "ratio_names": ratio_adlari,
+                                     "protected_high_card": {"elle_beyan"}}).fit(fx, None)
+    assert beyanli["protected_high_card"] == ["elle_beyan"], \
+        "açık beyan türetimi EZMELİ (build_features ileride kendi kümesini geçebilir)"
+
+
+def test_auto_feature_order_comes_from_params_not_manifest():
+    """`auto_features` SIRASI params'tan gelmeli — manifest'in kolon kaydı SIRALI (alfabetik).
+
+    Manifest'ten türetmek listeyi alfabetikleştirir; `feature_report["auto_features"]`
+    rapora giriyor → sessizce sıra değişir ve bit-birebir şartı KIRILIR. Bu test o
+    kısayolun bir daha alınmamasını kilitler. (T5-(2): kayıt `columns_out` → `delta.added`
+    oldu; argüman DEĞİŞMEDİ — ikisi de sıralı, ikisi de sıra kaynağı olamaz.)"""
+    from src.services.inference.orchestrator import fit_pipeline
+
+    fx = _t2_fixture()
+    fx["zzz_kategori"] = ["p", "q"] * (len(fx) // 2)      # alfabetik olarak SONDA
+    fx["aaa_kategori"] = ["r", "s"] * (len(fx) // 2)      # alfabetik olarak BAŞTA
+    _, artifact = fit_pipeline(fx.copy(), _t2_y(fx), _ctx_min(fx))
+
+    ce_params = artifact.param_store.get("count_encode") or {}
+    ce_cols = list(ce_params.keys())
+    if len(ce_cols) < 2:
+        pytest.skip("bu fixture'da 2'den az count kolonu üretildi")
+    # params sırası = X_train kolon sırası (legacy `_count_encode_tt` ile aynı iterasyon)
+    assert ce_cols != sorted(ce_cols), \
+        "params sırası alfabetik ÇIKTI — kısayol geri gelmiş olabilir, kaynağı doğrula"
+    manifest_ce = next(e for e in artifact.manifest if e["id"] == "count_encode")
+    assert manifest_ce["delta"]["added"] == sorted(manifest_ce["delta"]["added"]), \
+        "delta.added SIRALI olmalı (bu yüzden sıra kaynağı olarak kullanılamaz)"
 
 
 if __name__ == "__main__":

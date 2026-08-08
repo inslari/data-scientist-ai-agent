@@ -35,24 +35,43 @@ _CHECKPOINT_TABLES = ("checkpoint_writes", "checkpoint_blobs", "checkpoints")
 _SQLITE_CHECKPOINT_PATH = "data/checkpoints.sqlite"
 
 
-def run_maintenance() -> dict:
+# AYRIK ÇAĞRI YÜZEYİ: subtask'lar İSİMLE seçilebilir. Katman 2 monitoring aggregation'ı YIKICI GC'den
+# (app_logs/background_jobs/checkpoints/intelligence_cache silme) BAĞIMSIZ çağırmak için — farklı kadanslar
+# (aggregation SIK, GC SEYREK) ya da ad-hoc pencere kapatma (bkz. scripts/run_monitoring_aggregation.py).
+GC_SUBTASKS = ("app_logs", "background_jobs", "checkpoints", "intelligence_cache_orphans")
+MONITORING_SUBTASKS = ("monitoring_aggregate",)
+
+
+def run_maintenance(only: "set[str] | None" = None) -> dict:
     """
-    Tüm temizlik alt görevlerini çalıştırır ve silinen satır sayılarını döner.
-    Senkron çalışır; çağıran (worker) event loop'u bloklamamak için ayrı thread'de
-    çağırmalıdır (asyncio.to_thread).
+    Temizlik alt görevlerini çalıştırır ve silinen satır sayılarını döner. Senkron; çağıran (worker)
+    event loop'u bloklamamak için ayrı thread'de çağırmalıdır (asyncio.to_thread).
+
+    ``only``: verilirse YALNIZ o isimli subtask'lar koşar (aksi hâlde hepsi). Örn.
+    ``run_maintenance(only=MONITORING_SUBTASKS)`` = GC'siz yalnız Katman 2 aggregation → yıkıcı budama
+    (log/job/checkpoint silme) tetiklenmez. Bilinmeyen isim atlanır (sessizce değil — log).
     """
     is_postgres = SQLALCHEMY_DATABASE_URL.startswith("postgresql")
     now = int(time.time())
     results: dict = {}
 
-    logger.info(f"[maintenance] Temizlik başlıyor (postgres={is_postgres})...")
-
-    for name, fn in (
+    all_tasks = (
         ("app_logs", _prune_app_logs),
         ("background_jobs", lambda: _prune_background_jobs(now)),
         ("checkpoints", lambda: _prune_checkpoints(now, is_postgres)),
         ("intelligence_cache_orphans", _prune_intelligence_cache_orphans),
-    ):
+        ("monitoring_aggregate", _run_monitoring_aggregate),   # Katman 2 — izole (patlarsa GC sürer)
+    )
+    if only is not None:
+        unknown = set(only) - {n for n, _ in all_tasks}
+        if unknown:
+            logger.warning(f"[maintenance] bilinmeyen subtask(lar) atlandı: {sorted(unknown)}")
+        tasks = [(n, f) for n, f in all_tasks if n in only]
+    else:
+        tasks = list(all_tasks)
+
+    logger.info(f"[maintenance] Temizlik başlıyor (postgres={is_postgres}, subtask={[n for n,_ in tasks]})...")
+    for name, fn in tasks:
         try:
             results[name] = fn()
         except Exception as e:
@@ -202,6 +221,15 @@ def _prune_checkpoints_sqlite(now: int) -> int:
         conn.close()
     logger.info(f"[maintenance] checkpoints (sqlite): {total} satır silindi.")
     return total
+
+
+# ── 5. Katman 2 monitoring aggregator (metrik iskeleti) ────────────────────────
+
+def _run_monitoring_aggregate() -> int:
+    """Monitoring özet iskeletini koşturur (pencereleme + champion-bölme + idempotanslık).
+    run_maintenance'in per-subtask try/except'i altında → patlarsa diğer budamalar sürer."""
+    from src.services.monitoring.aggregator import run_monitoring_aggregation
+    return run_monitoring_aggregation()
 
 
 # ── 4. db_intelligence_cache orphans ───────────────────────────────────────────

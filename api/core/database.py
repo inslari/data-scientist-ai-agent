@@ -44,6 +44,12 @@ _pool_kwargs = (
     else {}
 )
 
+# ── YAPISAL BAĞLANTI KAPISI (fail-closed) — create_engine'DEN ÖNCE ──
+# Remote (prod) app DB'ye ancak açık token'la bağlanılır; workstation'daki ad-hoc koşular
+# (worker/test/shadow) .env'deki prod URL'e DEFAULT bağlanamaz. Uyarı değil, SystemExit.
+from api.core.db_safety import assert_connection_allowed
+assert_connection_allowed(SQLALCHEMY_DATABASE_URL, context="app DB engine (database.py)")
+
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=_connect_args, **_pool_kwargs)
 
 # SQLite foreign key'leri VARSAYILAN OLARAK ZORLAMAZ. Bu, ondelete="CASCADE" /
