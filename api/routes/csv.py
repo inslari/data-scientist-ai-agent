@@ -1,7 +1,4 @@
-import io
 import os
-import time
-import uuid
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, RedirectResponse
@@ -9,7 +6,13 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from typing import List
 
-from api.core.database import get_db, DATA_DIR
+from api.core.database import get_db
+from api.core.csv_ingest import (
+    create_csv_record,
+    get_or_create_data_group,
+    profile_csv_bytes,
+    store_csv_bytes,
+)
 from api.core.jobs import enqueue_ttd_suggestions, enqueue_viz_suggestions
 from api.core.storage import storage
 from api.models.csv import CSVFileModel
@@ -28,10 +31,6 @@ from api.routes.data_group import _clear_db_cache
 
 router = APIRouter(prefix="/csv", tags=["CSV Upload and Analysis"])
 
-# Local fallback directory (used when MinIO is not configured)
-CSV_STORAGE_DIR = os.path.join(DATA_DIR, "csvs")
-os.makedirs(CSV_STORAGE_DIR, exist_ok=True)
-
 @router.post("/upload", response_model=CSVUploadResponse)
 async def upload_csv(
     files: List[UploadFile] = File(...), 
@@ -45,69 +44,37 @@ async def upload_csv(
     and saves the metadata to the database under a DataGroup.
     If data_group_id is provided, adds to the existing data group.
     """
-    data_group = None
-    if data_group_id:
-        data_group = db.query(DataGroupModel).filter(
-            DataGroupModel.id == data_group_id,
-            DataGroupModel.user_id == current_user.id
-        ).first()
-        if not data_group:
-            raise HTTPException(status_code=404, detail="Data group not found")
-            
-    if not data_group:
-        if not group_name:
-            group_name = f"CSV Upload - {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            
-        data_group = DataGroupModel(
-            name=group_name,
-            source_type="csv",
+    try:
+        data_group, _ = get_or_create_data_group(
+            db,
             user_id=current_user.id,
-            created_at=int(time.time())
+            data_group_id=data_group_id,
+            group_name=group_name,
         )
-        db.add(data_group)
-        db.commit()
-        db.refresh(data_group)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Data group not found")
 
     uploaded_files = []
     errors = []
-    
+    # Yükleme başarılı ama dosya yanlış okunmuş olabilir (bkz. detect_csv_warnings).
+    warnings = []
+
     for file in files:
         filename = file.filename or ""
         if not filename.endswith('.csv'):
             errors.append({"filename": filename or "unknown", "error": "Only .csv files are allowed."})
             continue
 
-        unique_filename = f"{uuid.uuid4()}_{filename}"
-        # Object key for MinIO, or absolute path for local storage
-        object_key = f"csvs/{unique_filename}" if storage.using_minio else os.path.join(CSV_STORAGE_DIR, unique_filename)
-
         contents = await file.read()
         file_size = len(contents)
 
         # Upload to storage (MinIO or local disk). storage.upload senkron (boto3 put /
         # disk yazma) → event loop'u bloklamamak için threadpool'da çalıştır.
-        file_ref = await run_in_threadpool(storage.upload, contents, object_key)
-
-        # Process CSV (schema + stats) using a temp file when using MinIO
-        def process_csv_bytes(csv_bytes: bytes):
-            df = pd.read_csv(io.BytesIO(csv_bytes))
-            row_count = len(df)
-            columns_schema = [
-                {"name": col, "type": str(df[col].dtype)}
-                for col in df.columns
-            ]
-            stats_df = df.describe(include='all').T
-            stats_df['null_count'] = df.isnull().sum()
-            stats_df['dtype'] = df.dtypes.astype(str)
-            stats_df = stats_df.where(pd.notnull(stats_df), None)  # type: ignore
-            stats_df.reset_index(inplace=True)
-            stats_df.rename(columns={'index': 'column_name'}, inplace=True)
-            stats_list = stats_df.to_dict(orient="records")
-            return row_count, columns_schema, stats_list
+        file_ref = await run_in_threadpool(store_csv_bytes, contents, filename)
 
         try:
-            row_count, columns_schema, column_stats_cache = await run_in_threadpool(
-                process_csv_bytes, contents
+            row_count, columns_schema, column_stats_cache, file_warnings = await run_in_threadpool(
+                profile_csv_bytes, contents
             )
         except Exception as e:
             # If parsing fails, remove from storage and record error
@@ -115,22 +82,19 @@ async def upload_csv(
             errors.append({"filename": filename, "error": f"Failed to parse CSV file: {str(e)}"})
             continue
 
-        new_csv = CSVFileModel(
+        new_csv = create_csv_record(
+            db,
             filename=filename,
-            file_path=file_ref,   # object key (MinIO) or local path
+            file_ref=file_ref,
             file_size=file_size,
             row_count=row_count,
             columns_schema=columns_schema,
-            column_stats_cache=column_stats_cache,
-            created_at=int(time.time()),
+            column_stats=column_stats_cache,
             data_group_id=data_group.id,
-            user_id=current_user.id
+            user_id=current_user.id,
         )
-
-        db.add(new_csv)
-        db.commit()
-        db.refresh(new_csv)
         uploaded_files.append(new_csv)
+        warnings.extend({"filename": filename, **w} for w in file_warnings)
 
     # Clear cache if adding to an existing data group
     if data_group_id and uploaded_files:
@@ -146,7 +110,8 @@ async def upload_csv(
         "status": "success" if uploaded_files else "error",
         "message": f"Successfully uploaded {len(uploaded_files)} files." + (f" ({len(errors)} errors)" if errors else ""),
         "data": uploaded_files,
-        "errors": errors
+        "errors": errors,
+        "warnings": warnings,
     }
 
 @router.get("/files", response_model=List[CSVFileResponse])

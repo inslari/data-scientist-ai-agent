@@ -14,11 +14,19 @@ class CSVFileResponse(BaseModel):
     
     model_config = ConfigDict(from_attributes=True)
 
+class CSVUploadWarning(BaseModel):
+    """Dosya yüklendi ama yanlış okunmuş olabilir — arayüz i18n koduyla gösterir."""
+    filename: str
+    code: str
+    params: Dict[str, Any] = {}
+
+
 class CSVUploadResponse(BaseModel):
     status: str
     message: str
     data: Optional[List[CSVFileResponse]] = None
     errors: Optional[List[Dict[str, str]]] = None
+    warnings: Optional[List[CSVUploadWarning]] = None
 
 class CSVSchemaResponse(BaseModel):
     status: str

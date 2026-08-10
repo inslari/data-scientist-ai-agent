@@ -39,6 +39,7 @@ assert_schema_current(engine, Base.metadata, logger=_get_logger("schema_drift"))
 
 from api.routes.mcp import router as mcp_router
 from api.routes.csv import router as csv_router
+from api.routes.convert import router as convert_router
 from api.routes.data_group import router as data_group_router
 from api.routes.data_viz import router as data_viz_router, themes_router as viz_themes_router
 from api.routes.project import router as project_router
@@ -107,6 +108,7 @@ app.include_router(monitoring_router)
 app.include_router(monitoring_portfolio_router)   # cross-project (prefix="/monitoring", AYRI router)
 app.include_router(mcp_router)
 app.include_router(csv_router)
+app.include_router(convert_router)
 app.include_router(auth_router)
 app.include_router(domain_pack_router)
 app.include_router(admin_ai_router)
