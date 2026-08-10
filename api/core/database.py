@@ -3,6 +3,11 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 
+# URL'in KAYNAĞINI (gerçek env değişkeni mi, .env mi) ancak load_dotenv'DEN ÖNCE tespit
+# edebiliriz: .env yüklendikten sonra ikisi de os.environ'da görünür ve ayrım kaybolur.
+# Başlangıç logunda gösteriliyor — "neden bu DB'ye bağlandı?" sorusunun ilk cevabı bu.
+_URL_FROM_REAL_ENV = os.getenv("API_DATABASE_URL") is not None
+
 # .env dosyasını yükle.
 # override=False: GERÇEK ortam değişkenleri .env'i EZMELİDİR. Eskiden override=True idi
 # ve bir testin/subprocess'in açıkça verdiği API_DATABASE_URL'i .env'deki remote URL ile
@@ -67,6 +72,54 @@ if _is_sqlite:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+# ── BAŞLANGIÇ TEŞHİSİ: hangi DB? ────────────────────────────────────────────────
+# "Ayağa kalkan süreç hangi veritabanına bağlandı?" sorusu bu projede tekrar tekrar
+# soruldu (yerel worker'ın prod'a kaçması, .env ↔ gerçek env değişkeni önceliği). Cevabı
+# tahmin ettirmek yerine her başlangıçta konsola yazıyoruz.
+#
+# Burada LOG ATMIYORUZ, yalnız dizgiyi üretiyoruz: bu modül `setup_logging()` ÇAĞRILMADAN
+# ÖNCE import ediliyor (main.py'de model import'ları üzerinden), o yüzden import anında
+# atılan bir INFO handler'sız kalır ve hiç görünmez. Çağrı sahibi süreç (main.py /
+# worker_main.py) logging'i kurduktan SONRA çağırır.
+def describe_db_target() -> str:
+    """Bağlanılan app DB'sini tek satırda, PAROLASIZ özetler.
+
+    Parola asla dizgiye girmez: host/port/db alanları URL nesnesinden tek tek okunur,
+    ``render_as_string`` gibi tam-URL üretimi kullanılmaz.
+    """
+    from sqlalchemy.engine import make_url
+    from api.core.db_safety import is_local_target
+
+    u = make_url(SQLALCHEMY_DATABASE_URL)
+    backend = u.get_backend_name()
+
+    if backend.startswith("sqlite"):
+        where = u.database or ":memory:"
+    else:
+        host = u.host or "?"
+        port = f":{u.port}" if u.port else ""
+        where = f"{host}{port}/{u.database or '?'}"
+
+    parts = [f"{backend} · {where}"]
+
+    # Postgres search_path (?options=-csearch_path%3Dapp) — hangi şemaya yazdığımız,
+    # aynı DB içinde birden fazla ortam varsa kritik.
+    opts = u.query.get("options")
+    if isinstance(opts, str) and "search_path=" in opts:
+        parts.append(f"şema={opts.split('search_path=', 1)[1].split(' ', 1)[0]}")
+
+    parts.append("LOCAL" if is_local_target(u) else "REMOTE")
+
+    if not _URL_FROM_REAL_ENV and os.getenv("API_DATABASE_URL") is not None:
+        parts.append("kaynak=.env")
+    elif _URL_FROM_REAL_ENV:
+        parts.append("kaynak=env değişkeni")
+    else:
+        parts.append("kaynak=sqlite fallback (API_DATABASE_URL tanımsız)")
+
+    return " · ".join(parts)
 
 # DB Dependency
 def get_db():

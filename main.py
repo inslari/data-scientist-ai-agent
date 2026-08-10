@@ -26,6 +26,12 @@ from api.models.monitoring_summary import MonitoringSummaryModel  # Katman 2 —
 from src.core.logging_config import setup_logging
 setup_logging(process="api")
 
+# Hangi app DB'sine bağlandık? create_all'dan ÖNCE yazılır ki şema-drift kapısı ya da bir
+# bağlantı hatası başlatmayı durdurduğunda bile hedef DB konsolda görünmüş olsun.
+from api.core.database import describe_db_target
+from src.core.logging_config import get_logger as _get_logger
+_get_logger("api.core.database").info(f"Uygulama DB'si → {describe_db_target()}")
+
 # Create all DB tables
 Base.metadata.create_all(bind=engine)
 
