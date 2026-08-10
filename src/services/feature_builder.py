@@ -1622,20 +1622,33 @@ def _apply_plan_derived_features(df: pd.DataFrame, feature_plan: dict, disallowe
     return _run_feature_specs(df, specs, disallowed, source_label="Plan", skip_ops=skip_ops)
 
 
-def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata") -> list[str]:
+def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata",
+                          *, defer_to_orchestrator: bool = False) -> "tuple[list[str], list[dict], list[str]]":
     """Run the active domain pack's deterministic FeatureRecipes on ``df`` in place.
 
-    Returns the names of columns actually added. No-op (returns ``[]``) when no
-    pack is active. Each recipe is individually guarded so one bad recipe can
+    Returns ``(added, frozen_specs, unported)``:
+      * ``added``        — names of the columns this call is responsible for (written here,
+        or — when deferred — declared for :class:`DomainFeaturesStep` to write).
+      * ``frozen_specs`` — the ``FeatureRecipe.specs`` declarations, non-empty ONLY when the
+        write was deferred to the orchestrator.
+      * ``unported``     — bu koşuda orkestratöre DEVREDİLMEYEN kolonlar → Katman 1 kapsamı
+        DIŞI (``unported_domain_features`` kapsam olgusu). Devir olduysa boştur.
+
+    No-op when no pack is active. Each recipe is individually guarded so one bad recipe can
     never block the others or the pipeline.
-    """
+
+    **SEÇİM/YAZMA AYRIMI (ikiz borç deseni, ratio + zero-flag ile aynı).** ``defer_to_orchestrator``
+    yalnız TÜM uygulanabilir recipe'ler spec beyan ettiğinde fiilen devreye girer ("ya hepsi ya
+    hiçbiri"): kısmi devir, kapsam reddi hâlinde yarı-yazılmış çerçeve bırakırdı. Devir olduğunda
+    kolonları ``DomainFeaturesStep`` (order 7, pre-split) yazar — konum eskisiyle AYNI noktadır,
+    çünkü ratio/zero-flag motorlarının seçimi bu kolonların varlığına bakar."""
     from src.domains import get_active_pack
     from src.domains.base import MerchantContext
     from src.domains.schemas import MerchantAnalysis
 
     pack = get_active_pack(state.get("domain_pack"))
     if pack.name == "none":
-        return []
+        return [], [], []
 
     ctx = MerchantContext.from_dict(state.get("merchant_context"))
     analysis = MerchantAnalysis.from_dict(state.get("merchant_analysis"))
@@ -1643,22 +1656,55 @@ def _apply_domain_recipes(df: pd.DataFrame, state: dict, meta: "ColumnMetadata")
         recipes = pack.feature_recipes(ctx, state.get("db_intelligence"), analysis) or []
     except Exception as e:
         logger.error(f"[feature_eng] feature_recipes() hatasi ({e}); atlaniyor.")
-        return []
+        return [], [], []
 
-    added: list[str] = []
+    # 1. GEÇİŞ — her recipe'nin çıktısı + (varsa) donmuş spec beyanı. Hiçbir şey YAZILMAZ:
+    # devir kararı ancak TÜM recipe'ler görüldükten sonra verilebilir.
+    plan: list[tuple[str, dict, "list | None"]] = []
     for r in recipes:
+        ad = getattr(r, "name", "?")
         try:
             if not r.applies(df, meta):
                 continue
-            cols = r.build(df, meta) or {}
-            for name, series in cols.items():
-                if name in df.columns:
-                    continue
-                df[name] = series
-                added.append(name)
+            cols = {n: s for n, s in (r.build(df, meta) or {}).items() if n not in df.columns}
+            if not cols:
+                continue
+            try:
+                specs = r.specs(df, meta)
+            except Exception as e:                    # spec beyanı patlarsa recipe PORTSUZ sayılır
+                logger.error(f"[feature_eng] Recipe '{ad}' specs() hatasi ({e}); portsuz sayiliyor.")
+                specs = None
+            plan.append((ad, cols, specs))
         except Exception as e:
-            logger.error(f"[feature_eng] Recipe '{getattr(r, 'name', '?')}' hatasi: {e}")
-    return added
+            logger.error(f"[feature_eng] Recipe '{ad}' hatasi: {e}")
+
+    spec_yok = [n for _, cols, specs in plan if specs is None for n in cols]
+    devret = bool(defer_to_orchestrator and plan and not spec_yok)
+
+    added: list[str] = []
+    frozen: list[dict] = []
+    for ad, cols, specs in plan:
+        if devret:
+            frozen.extend(specs)
+            added.extend(s["name"] for s in specs)
+            continue
+        for name, series in cols.items():
+            if name in df.columns:
+                continue
+            df[name] = series
+            added.append(name)
+    # PORTSUZ = "bu koşuda orkestratöre DEVREDİLMEYEN her kolon" — spec beyan etmeyenler değil.
+    # Fark kritik: devir kapalıyken (ör. SERVING_RAW_REPLAY=False) kolonlar inline yazılır ve
+    # artifact'te onları üretecek adım YOKTUR; "spec'i vardı" demek kapsamı yanlış genişletirdi
+    # ve serving'de kolon sessizce doğmazdı (fully-built X_test ile guard bunu göremez).
+    unported = [] if devret else list(added)
+    if devret:
+        logger.info(f"[feature_eng] Domain recipe'leri orkestratore DEVREDILDI "
+                    f"({len(frozen)} donmus spec): {[s['name'] for s in frozen]}")
+    elif unported:
+        logger.info(f"[feature_eng] Domain recipe kolonları inline yazıldı (portsuz sayılır"
+                    + (f"; spec beyan etmeyen: {spec_yok}" if spec_yok else "") + f"): {unported}")
+    return added, frozen, unported
 
 
 def _target_distribution(y_arr, intent: str) -> "tuple[dict | None, dict | None]":
@@ -2086,12 +2132,61 @@ def plan_chained_specs(feature_plan: dict) -> list:
     return zincirli
 
 
+def assemble_scope_facts(
+    *, modality: str, aggregated: bool, timeseries_lag, unported_domain_features: list,
+    column_renames: list, feature_plan: dict,
+) -> dict:
+    """``_SCOPE_RULES``'un baktığı olguların TEK kaynağı — ``check_pipeline_scope`` girdisi.
+
+    NEDEN AYRI FONKSİYON (ÖN-UÇUŞ): kapsam kapısı ``_run_orchestrated_chain``'de, yani
+    ratio/zero-flag SEÇİMİNDEN sonra çalışıyor. O noktada ``_orch_mode`` pre-split adımların
+    sahipliğini ÇOKTAN devralmıştır (``write=False``) → orada reddetmek geri dönüşü olmayan bir
+    yerde patlamak demekti: istisna node'a kadar çıkıyor ve **kullanıcı raporunu da götürüyordu**
+    (ölçüldü: banking-churn koşusu, domain pack recipe'leri → `feature_engineering_node` FAIL).
+    Oysa kapının anlamı "bu koşu DEPLOY edilemez", "bu koşu ÇALIŞAMAZ" değil.
+
+    Bu olguların HEPSİ ratio/zero-flag'den ÖNCE bilinir (modality/aggregated erken, ts-lag
+    ``_build_timeseries_features``'ta, domain feature'ları domain-pack bloğunda). Dolayısıyla
+    kapsam ÖN-UÇUŞU orada yapılabilir ve ihlal hâlinde ``_orch_mode`` kapatılıp legacy zincire
+    TEMİZ dönülür. Fonksiyonun ayrı olması, ön-uçuş ile asıl kapının AYNI değerleri görmesini
+    yapısal olarak garantiler (kopyala-yapıştır sapması imkânsız).
+
+    KİLİT: ``test_scope_facts_cover_all_rules`` — burada üretilen anahtar kümesi ``_SCOPE_RULES``'un
+    tüm olgularını KAPSAMAK zorunda; kapsamazsa ön-uçuş bir ihlali göremez ve kapı yine geç patlar.
+    """
+    return {
+        # dedup: _clean_data split ÖNCESİ tüm df'te yapar. Konumu orkestratörde YENİDEN
+        # ÜRETİLEMEZ ("tüm df'i dedup'la sonra böl" ≠ "böl sonra train'i dedup'la") →
+        # karar kuralı gereği ADIM değil ÖN-KOŞUL olarak beyan edilir.
+        "deduplicated":   True,
+        # T5-(2): currency dönüşümü `_clean_data`'da, portlanmadı → serving girdisi ZATEN
+        # numerik olmalı. `build_features` bu dönüşümü kendi yaptığı için eğitim tarafında
+        # olgu SAĞLANMIŞ sayılır; olgunun değeri "girdi normalize edilmiş mi" sorusudur.
+        "currency_normalized": True,
+        # §2.19'un 6. örneği — zincirleme türev (bir spec'in girdisi başka spec'in çıktısı).
+        "chained_derived_features": plan_chained_specs(feature_plan),
+        # NORMALİZASYON (fail-open kapatma): build_features'ta boş modality "tabular"
+        # demektir (`if modality == "timeseries"` else tabular yol). Boş bırakılsaydı
+        # kapsam kuralı `bool(v)` üzerinden onu SESSİZCE geçerdi — beyan var ama değer
+        # yok = en kötü hâl. Burada niyet açıkça yazılır.
+        "modality":        (modality or "tabular"),
+        "aggregated":      bool(aggregated),
+        "timeseries_lag":  timeseries_lag,
+        # KAPSAM PORTU: reddedilen artık "domain feature ÜRETİLDİ" değil, "domain feature'ı
+        # üretip DONMUŞ SPEC beyan ETMEYEN yol kullanıldı". Beyan edenleri DomainFeaturesStep
+        # replay ediyor (bkz. FeatureRecipe.specs).
+        "unported_domain_features": list(unported_domain_features or []),
+        "column_renames":  list(column_renames or []),
+    }
+
+
 def assemble_pipeline_ctx(
     *, intent: str, modality: str, aggregated: bool, target_name: str,
     drop_columns: list, ratio_feature_meta: dict, missing_indicator_meta: dict,
     derived_flag_meta: dict, feature_plan: dict, encode_exclude: set,
     outlier_cols, timeseries_lag, domain_feature_cols: list, date_feature_cols: list,
     column_renames: list, disallowed: "set | None" = None, date_source_cols: "list | None" = None,
+    domain_specs: "list | None" = None, unported_domain_features: "list | None" = None,
 ) -> dict:
     """Katman 1 BEYAN YÜZEYİ (T0) — orkestratörün ihtiyacı olan her şeyi TEK yerde beyan eder.
 
@@ -2125,10 +2220,12 @@ def assemble_pipeline_ctx(
 
     return {
         # ── 1. yapısal ön-koşullar ──────────────────────────────
-        # dedup: _clean_data split ÖNCESİ tüm df'te yapar. Konumu orkestratörde YENİDEN
-        # ÜRETİLEMEZ ("tüm df'i dedup'la sonra böl" ≠ "böl sonra train'i dedup'la") →
-        # karar kuralı gereği ADIM değil ÖN-KOŞUL olarak beyan edilir.
-        "deduplicated":   True,
+        # `deduplicated` + `currency_normalized` + kapsam olgularının TAMAMI TEK kaynaktan
+        # (`assemble_scope_facts`) gelir — ön-uçuş ile asıl kapı aynı değerleri görsün diye.
+        **assemble_scope_facts(
+            modality=modality, aggregated=aggregated, timeseries_lag=timeseries_lag,
+            unported_domain_features=unported_domain_features, column_renames=column_renames,
+            feature_plan=feature_plan),
         "target_col":     target_name,
         "drop_columns":   list(drop_columns),
         # ── 2. donmuş seçimler (pre-split sabit kararlar) ───────
@@ -2139,27 +2236,17 @@ def assemble_pipeline_ctx(
         "normalize_specs": _specs("normalize"),
         # 6-OP PORTU: rowwise op'lar TAM ŞEKİLLE (op + tüm inputs + clamp'li params).
         "derived_specs":  plan_derived_specs(feature_plan, PORTED_ROWWISE_OPS, disallowed),
+        # DOMAIN PACK PORTU: recipe'lerin dondurulmuş per-row spec'leri (DomainFeaturesStep
+        # config kaynağı). Seçim fit-anında donduğu için serving'de YENİDEN TÜRETİLMEZ.
+        "domain_specs":   list(domain_specs or []),
         "encode_exclude": sorted(encode_exclude or set()),
         "outlier_cols":   sorted(outlier_cols or []),
         "intent":         intent,
-        # T5-(2): currency dönüşümü `_clean_data`'da, portlanmadı → serving girdisi ZATEN
-        # numerik olmalı. `build_features` bu dönüşümü kendi yaptığı için eğitim tarafında
-        # olgu SAĞLANMIŞ sayılır; olgunun değeri "girdi normalize edilmiş mi" sorusudur.
-        "currency_normalized": True,
-        # §2.19'un 6. örneği — zincirleme türev (bir spec'in girdisi başka spec'in çıktısı).
-        "chained_derived_features": plan_chained_specs(feature_plan),
         # ── 3. kapsam olguları ─────────────────────────────────
-        # NORMALİZASYON (fail-open kapatma): build_features'ta boş modality "tabular"
-        # demektir (`if modality == "timeseries"` else tabular yol). Boş bırakılsaydı
-        # kapsam kuralı `bool(v)` üzerinden onu SESSİZCE geçerdi — beyan var ama değer
-        # yok = en kötü hâl. Burada niyet açıkça yazılır.
-        "modality":        (modality or "tabular"),
-        "aggregated":      bool(aggregated),
-        "timeseries_lag":  timeseries_lag,
-        "domain_features": list(domain_feature_cols or []),
+        # (modality/aggregated/ts-lag/domain/rename + dedup/currency/chained → yukarıdaki
+        #  `assemble_scope_facts` bloğu; aşağıdakiler kapsam KURALI olmayan beyanlar.)
         "date_features":   list(date_feature_cols or []),      # türev adları (raporlama; kapsam kuralı KALDIRILDI)
         "date_source_cols": list(date_source_cols or []),      # DateFeaturesStep (order 2) config kaynağı
-        "column_renames":  list(column_renames or []),
         "unported_ops":    unported_ops,
     }
 
@@ -2168,7 +2255,7 @@ def _run_orchestrated_chain(
     builder, X_train: pd.DataFrame, X_test: pd.DataFrame, y_train, pipeline_ctx: dict,
     meta, domain_leakage_report: dict, raw_test: "pd.DataFrame | None" = None,
 ) -> tuple:
-    """POST-split zinciri (``PIPELINE[7:]``) TEK ``builder``da devret; pre-split orders 0-6
+    """POST-split zinciri (``PIPELINE[8:]``) TEK ``builder``da devret; pre-split orders 0-7
     (missing-indicator + impute + **drop_columns** (T4a) + **zscore + normalize** (T4b))
     ``build_features``'ta ZATEN fit edildi → tek order uzayı.
 
@@ -2209,11 +2296,12 @@ def _run_orchestrated_chain(
                 mid[key] = X
         return _obs
 
-    # POST-split faz: PIPELINE[7:] (ratio_construct..select) X_train'de; builder order 6'dan devam eder
-    # (0-6 pre-split: missing_indicator, impute, **date_features**, drop_columns (T4a), zscore+normalize (T4b), plan_derived).
+    # POST-split faz: PIPELINE[8:] (ratio_construct..select) X_train'de; builder order 7'den devam eder
+    # (0-7 pre-split: missing_indicator, impute, **date_features**, drop_columns (T4a),
+    # zscore+normalize (T4b), plan_derived, **domain_features** (domain pack portu)).
     # Post-split adımlar T2'deki ile BİREBİR (X_train fully-built).
     X_train_out = X_train.copy()
-    for spec in PIPELINE[7:]:
+    for spec in PIPELINE[8:]:
         X_train_out = builder.fit_step(spec, X_train_out, y_train, ctx_fit, on_step=_catch("train"))
     artifact = builder.finalize(X_train_out.columns)
     # T5-(2): SERVING YOLU ARTIK ASIL YOL — `raw_test` verilmişse X_test HAM satırlardan
@@ -2629,16 +2717,66 @@ def build_features(state: dict) -> dict:
     #   (a) Ajan-karar yolu: expert ajanının propose_feature ile seçtiği FeatureSpec'ler,
     #       gerçek şemaya + leakage denylist'e karşı doğrulanıp deterministik uygulanır.
     #   (b) Statik fallback: ajan bir şey üretmediyse, convention-bazlı recipe'ler devreye girer.
+    # KAPSAM PORTU: (b) yolunun spec BEYAN EDEN recipe'leri orkestratöre devredilir (yazma
+    # order 7'de); (a) ajan yolu ve spec'siz recipe'ler PORTSUZ → `unported_domain_features`
+    # kapsam olgusunu doldurur ve aşağıdaki ön-uçuş koşuyu legacy zincire alır.
     domain_feature_cols: list[str] = []
+    domain_specs: list[dict] = []
+    domain_unported: list[str] = []
     try:
         agent_cols = _apply_feature_specs(df, state, disallowed)
         domain_feature_cols.extend(agent_cols)
+        domain_unported.extend(agent_cols)     # ajan FeatureSpec'leri henüz portlanmadı
         if not agent_cols:
-            domain_feature_cols.extend(_apply_domain_recipes(df, state, meta))
+            _rec_cols, domain_specs, _rec_unported = _apply_domain_recipes(
+                df, state, meta, defer_to_orchestrator=(_orch_mode and SERVING_RAW_REPLAY))
+            domain_feature_cols.extend(_rec_cols)
+            domain_unported.extend(_rec_unported)
         if domain_feature_cols:
             logger.info(f"[feature_eng] Domain feature'lari: {domain_feature_cols}")
     except Exception as e:
         logger.error(f"[feature_eng] Domain feature hatasi ({e}); atlaniyor.")
+
+    # ── KAPSAM ÖN-UÇUŞU — kapı burada, ratio/zero-flag SAHİPLİK ayrımından ÖNCE ──
+    # Kapsam kapısı (`ArtifactBuilder.check_scope`) `_run_orchestrated_chain`'de DURUYOR ve
+    # fail-closed KALIYOR (son savunma). Ama orada patlamak koşuyu komple öldürüyordu: istisna
+    # feature_engineering_node'a kadar çıkar, kullanıcı raporunu da alamaz. Kapının anlamı ise
+    # "bu koşu DEPLOY EDİLEMEZ" — "bu koşu ÇALIŞAMAZ" değil. Bu yüzden ihlal, olguların hepsinin
+    # BİLİNDİĞİ ilk noktada (domain feature'ları yeni hesaplandı; ts-lag/modality/rename zaten
+    # biliniyordu) SAPTANIR ve orkestratör modu KAPATILIR → legacy zincire temiz dönüş.
+    # NEDEN TAM BURASI: bir sonraki satırdan itibaren `_orch_mode` sahiplik ayrımı yapıyor
+    # (`write=not (_orch_mode and SERVING_RAW_REPLAY)`) — ratio/zero-flag kolonları ya inline
+    # yazılır ya orkestratör adımına bırakılır. Karar bu çatallanmadan SONRA değişseydi çerçeve
+    # yarı-yazılmış kalırdı (legacy `_finalize_ratio_features_tt` olmayan kolonu arardı).
+    # Artifact SONUCU DEĞİŞMEZ: ihlalde eskiden de artifact kurulmuyordu, şimdi de kurulmuyor
+    # (deployable=False + gerekçe raporda). Değişen tek şey: eğitim/rapor artık HAYATTA KALIYOR.
+    _scope_block: list = []
+    if _orch_mode:
+        from src.services.inference.orchestrator import check_pipeline_scope as _check_scope
+        _preflight = _check_scope(assemble_scope_facts(
+            modality=modality, aggregated=aggregated, timeseries_lag=ts_lag_info,
+            unported_domain_features=domain_unported, column_renames=column_renames,
+            feature_plan=feature_plan))
+        if _preflight["violations"]:
+            _scope_block = _preflight["violations"]
+            _orch_mode = False
+            _ihlal = "; ".join(f"{v['fact']}={v['value']!r} → {v['reason']}" for v in _scope_block)
+            logger.warning(
+                f"[feature_eng] KAPSAM DIŞI ({len(_scope_block)} koşul) → Katman 1 artifact "
+                f"KURULMAYACAK (deploy edilemez), koşu LEGACY zincirle SÜRÜYOR: {_ihlal}")
+
+    # order 7 — DomainFeaturesStep: devredilen domain kolonlarının YAZILDIĞI yer. Konum
+    # bilinçli: ratio/zero-flag SEÇİMİNDEN önce (onların "bu ad zaten var mı" kapısı bu
+    # kolonlara bakar) → eski yolun gördüğü çerçevenin AYNISI.
+    if domain_specs:
+        if _orch_mode:
+            df = _builder.fit_step(_ORCH_PIPELINE[7], df, ctx={"domain_specs": domain_specs})
+        else:
+            # KAPSAM BAŞKA bir olgudan reddedildi (ör. modality) → devir geçersiz; kolonları
+            # AYNI adım sınıfıyla burada yaz (kod tek, replay ile bit-birebir; ikinci bir
+            # inline uygulama yazmak sapma kaynağı olurdu).
+            from src.services.inference.steps import DomainFeaturesStep as _DomainStep
+            df = _DomainStep(config={"specs": domain_specs}).transform(df)
 
     # ── DOKUNUS 2: deterministik sifir/oran motorlari (SPLIT ONCESI, row-wise) ──
     # is_zero = orijinal sayisal kolonlar (row-wise, deterministik → leakage-safe).
@@ -2686,6 +2824,7 @@ def build_features(state: dict) -> dict:
         feature_plan=feature_plan, encode_exclude=(disallowed | leakage_exclude),
         outlier_cols=meta.get_outlier_cols(), timeseries_lag=ts_lag_info,
         domain_feature_cols=domain_feature_cols, date_feature_cols=date_feature_cols,
+        domain_specs=domain_specs, unported_domain_features=domain_unported,
         date_source_cols=date_source_cols, column_renames=column_renames,
         # T4 (3): eski op'un ÇEVRESİNDEKİ leakage denylist'i beyan yüzeyine taşınır — op
         # emekli olunca kaybolmasın (bkz. assemble_pipeline_ctx içindeki gerekçe).
@@ -2795,11 +2934,17 @@ def build_features(state: dict) -> dict:
         _shadow_x_train = (X_train.copy() if _mode == "shadow" else None)
 
         # Katman 1 wiring — varsayılan (legacy/shadow): artifact YOK. orchestrator branch üzerine yazar.
+        # KAPSAM GERİ DÜŞÜŞÜ: `_scope_block` doluysa mod orchestrator olsa da legacy zincir koştu →
+        # gerekçe MOD DEĞİL İHLAL olarak yazılır (rapor "neden deploy edilemiyor"u göstersin).
         _artifact_id = None
         _artifact_block = {"artifact_id": None, "deployable": False, "phase": None,
-                           "reason": "feature_pipeline_mode!=orchestrator"}
+                           "reason": ("unsupported_scope: " + "; ".join(
+                               f"{v['fact']}={v['value']!r}" for v in _scope_block))
+                           if _scope_block else "feature_pipeline_mode!=orchestrator"}
+        if _scope_block:
+            _artifact_block["scope_violations"] = _scope_block
 
-        if _mode == "orchestrator":
+        if _orch_mode:
             # ── YAPISAL DEVİR — pre-split (builder orders 0-1) + post-split (PIPELINE[2:]) ──
             # `ImputeStep` pre-split (T3a-1 sahiplik devri) + train-fit (T3b-fit, #4 deploy) → artık
             # metrik-NÖTR DEĞİL; sapma beyan edilen yüzeyle sınırlı. zscore/normalize hâlâ eski leaky

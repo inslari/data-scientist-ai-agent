@@ -43,7 +43,7 @@ from src.services.inference.pickle_io import (
 )
 from src.services.inference.protocol import DefaultFitTransform
 from src.services.inference.steps import (
-    PlanDerivedStep,
+    PlanDerivedStep, DomainFeaturesStep,
     CountEncodeStep, GroupbyDeviationStep, ImputeStep, InfImputeStep, NormalizeStep,
     DateFeaturesStep, DropColumnsStep, MissingIndicatorStep, ZeroFlagStep, ZScoreStep,
     OneHotStep, RatioConstructStep, RatioFinalizeStep, RobustScaleStep, SelectDropStep,
@@ -1228,7 +1228,7 @@ def test_scope_gate_rejects_every_declared_unsupported_path():
     fx, y, ctx = _orchestrator_fixture()
     tetikleyici = {
         "modality": "timeseries", "aggregated": True, "timeseries_lag": {"lag_columns": ["x"]},
-        "domain_features": ["dom_x"],
+        "unported_domain_features": ["dom_x"],
         # date_features KALDIRILDI — artık kapsam olgusu değil (DateFeaturesStep'e portlandı, §2.19)
         "column_renames": [{"a": "b"}],
         "chained_derived_features": [{"name": "z2", "chained_inputs": ["z1"]}],
@@ -1257,12 +1257,52 @@ def test_scope_gate_fully_declared_clean_is_deployable():
     """Tüm olgular beyan edilmiş ve hiçbiri ihlal değilse → deployable=True."""
     fx, y, ctx = _orchestrator_fixture()
     temiz = {"modality": "tabular", "aggregated": False, "timeseries_lag": None,
-             "domain_features": [], "date_features": [], "column_renames": [],
+             "unported_domain_features": [], "date_features": [], "column_renames": [],
              "deduplicated": True, "currency_normalized": True,
              "chained_derived_features": []}
     _, artifact = fit_pipeline(fx, y, {**ctx, **temiz})
     assert artifact.supported_scope["deployable"] is True
     assert artifact.supported_scope["undeclared"] == []
+
+
+def test_scope_facts_cover_all_rules():
+    """ÖN-UÇUŞ KİLİDİ: ``assemble_scope_facts`` ``_SCOPE_RULES``'un TÜM olgularını üretmeli.
+
+    Ön-uçuş (``build_features``, ratio/zero-flag sahiplik ayrımından ÖNCE) kapsam ihlalini erken
+    saptayıp orkestratör modunu kapatır → koşu legacy zincirle SÜRER, artifact kurulmaz. Bir olgu
+    burada eksik kalırsa ön-uçuş onu GÖREMEZ ve ihlal yine geç (``check_scope``) patlar — yani
+    kullanıcı raporunu götüren eski davranış sessizce geri gelir. Bu test o sapmayı kilitler."""
+    from src.services.feature_builder import assemble_scope_facts
+
+    facts = assemble_scope_facts(
+        modality="tabular", aggregated=False, timeseries_lag=None,
+        unported_domain_features=[], column_renames=[], feature_plan={})
+    eksik = {f for f, _, _ in _SCOPE_RULES} - set(facts)
+    assert not eksik, f"ön-uçuş bu kapsam olgularını beyan etmiyor: {sorted(eksik)}"
+    # Temiz değerlerle ihlal ÜRETMEMELİ ve olgular "beyansız" sayılmamalı.
+    kapsam = check_pipeline_scope(facts)
+    assert kapsam["violations"] == [] and kapsam["undeclared"] == []
+
+
+def test_scope_preflight_matches_full_ctx_decision():
+    """Ön-uçuş ile asıl kapı AYNI kararı vermeli (aynı olgu kümesi, aynı kaynak).
+
+    Kopyala-yapıştır sapması olsaydı ön-uçuş temiz der, ``check_scope`` reddederdi → koşu yine
+    ölürdü. ``assemble_pipeline_ctx``'in kapsam alt-kümesi ``assemble_scope_facts``'ten GELİR."""
+    from src.services.feature_builder import assemble_pipeline_ctx, assemble_scope_facts
+
+    ortak = {"modality": "tabular", "aggregated": False, "timeseries_lag": None,
+             "unported_domain_features": ["ajan_feature"], "column_renames": [],
+             "feature_plan": {}}
+    onucus = assemble_scope_facts(**ortak)
+    tam = assemble_pipeline_ctx(
+        intent="classification", target_name="y", drop_columns=[], ratio_feature_meta={},
+        missing_indicator_meta={}, derived_flag_meta={}, encode_exclude=set(), outlier_cols=[],
+        date_feature_cols=[], domain_feature_cols=["ajan_feature"], **ortak)
+    for fact, _, _ in _SCOPE_RULES:
+        assert tam[fact] == onucus[fact], f"'{fact}' ön-uçuş ile tam ctx arasında SAPIYOR"
+    assert check_pipeline_scope(onucus)["violations"] == \
+           check_pipeline_scope(tam)["violations"] != []
 
 
 def test_scope_gate_runs_before_any_step():
@@ -1510,9 +1550,11 @@ def test_pre_split_prefix_is_contiguous_and_matches_chain_slice():
         f"pre_split adımları BİTİŞİK ön-ek olmalı, bulunan indeksler: {pre}"
     assert [PIPELINE[i].step_cls for i in pre] == [
         MissingIndicatorStep, ImputeStep, DateFeaturesStep, DropColumnsStep,
-        ZScoreStep, NormalizeStep, PlanDerivedStep], \
+        ZScoreStep, NormalizeStep, PlanDerivedStep, DomainFeaturesStep], \
         ("pre-split ön-eki legacy KAYNAK sırasını izlemeli: missing_indicator → impute → "
-         "date_features (§2.19 kapsam portu, impute SONRASI/drop ÖNCESİ) → drop_columns → zscore/normalize")
+         "date_features (§2.19 kapsam portu, impute SONRASI/drop ÖNCESİ) → drop_columns → "
+         "zscore/normalize → plan_derived → domain_features (domain pack portu; ratio/zero-flag "
+         "SEÇİMİ bu kolonların varlığına baktığı için onlardan ÖNCE)")
 
     src = _inspect.getsource(_fb._run_orchestrated_chain)
     assert f"PIPELINE[{len(pre)}:]" in src, \
@@ -1563,6 +1605,30 @@ def test_t4b_serving_replay_produces_derived_column():
     transform_pipeline(fx.head(1), artifact, on_step=lambda sid, X: ara.__setitem__(sid, list(X.columns)))
     assert "z_probe" in (ara.get("zscore_feature") or []), \
         "serving replay'i türev kolonu ÜRETMELİ (artifact'in taşıdığı spec'ten) — T4'ün gerekçesi"
+
+
+def test_domain_recipe_serving_replay_produces_column():
+    """DOMAIN PACK PORTU'nun gerekçesinin DOĞRUDAN KANITI — kapsam kuralı bu yüzden daraldı.
+
+    Recipe'nin kolon SEÇİMİ batch istatistiğine bağlıdır (sıfır oranı eşik aralığında mı) →
+    serving'de tek satırda YENİDEN TÜRETİLEMEZ. Donmuş spec'le artık türetilmesi de gerekmiyor:
+    tek satırlık ham girdi replay'inde kolon ÜRETİLİYOR ve değeri per-row testin sonucudur."""
+    fx, y, ctx = _orchestrator_fixture()
+    src = fx.select_dtypes(include="number").columns[0]
+    ctx = {**ctx, "domain_specs": [{"name": "is_zero_probe", "op": "eq_const",
+                                    "input": src, "params": [0.0]}]}
+    _, artifact = fit_pipeline(fx, y, ctx)
+    entry = next(e for e in artifact.manifest if e["id"] == "domain_features")
+    assert entry["frozen_choice"]["kind"] == "domain_recipes"
+    assert entry["delta"]["added"] == ["is_zero_probe"]
+
+    ara = {}
+    transform_pipeline(fx.head(1), artifact,
+                       on_step=lambda sid, X: ara.__setitem__(sid, X.copy()))
+    cikti = ara.get("domain_features")
+    assert cikti is not None and "is_zero_probe" in cikti.columns, \
+        "serving replay'i domain kolonunu ÜRETMELİ (donmuş spec'ten) — portun gerekçesi"
+    assert float(cikti["is_zero_probe"].iloc[0]) == float(fx[src].iloc[0] == 0)
 
 
 def test_control_gate_order_is_locked():
@@ -1675,7 +1741,8 @@ def test_no_step_is_exempt_from_guard():
     # pre_split bayrağı manifest'te BİLGİ olarak durur; hangi adımlar olduğu hâlâ dar kapı
     pre_ids = {e["id"] for e in artifact.manifest if e.get("pre_split")}
     assert pre_ids <= {"missing_indicator", "impute_missing", "date_features", "drop_columns",
-                       "zscore_feature", "normalize_feature", "plan_derived"}, \
+                       "zscore_feature", "normalize_feature", "plan_derived",
+                       "domain_features"}, \
         f"beklenmeyen adım pre_split beyan ediyor: {pre_ids}"
 
 
@@ -1914,7 +1981,7 @@ def _shadow_ctx() -> dict:
     return {"ratio_pairs": [], "encode_exclude": [], "outlier_cols": [], "intent": "classification",
             "drop_columns": [], "missing_indicator_cols": [], "zero_flag_cols": [],
             "modality": "tabular", "aggregated": False, "timeseries_lag": None,
-            "domain_features": [], "date_features": [], "column_renames": [],
+            "unported_domain_features": [], "date_features": [], "column_renames": [],
             "deduplicated": True, "currency_normalized": True,
             "chained_derived_features": [], "target_col": None}
 

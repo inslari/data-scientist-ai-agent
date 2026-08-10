@@ -111,9 +111,29 @@ class FeatureRecipe:
 
     * :meth:`applies` — cheap guard: do the required input columns exist?
     * :meth:`build`   — return ``{new_column_name: pandas.Series}`` to add.
+    * :meth:`specs`   — optional: the same output as a *frozen, serializable*
+      declaration, so Layer 1 can replay it at serving time (see below).
 
     Both must be pure and must never raise on the happy path; the builder also
     wraps every recipe in try/except so a bad recipe can't break the pipeline.
+
+    **Why :meth:`specs` exists (KATMAN 1 / serving).** ``build`` is free to look at
+    the whole training frame, and most recipes do: they pick their input columns
+    from batch statistics (share of zeros, "does this column span 1 and ≥2", skew).
+    That is fine at fit time and *wrong* at serving time — scoring a single row
+    would re-derive a different selection, silently. So a recipe that wants to be
+    replayable declares, at fit time, the frozen per-row transform it just decided
+    on; the inference orchestrator stores it and replays only that.
+
+    Shape: ``[{"name": str, "op": str, "input": str, "params": [float, ...]}, ...]``
+    where ``op`` is one of the orchestrator's domain ops (``eq_const``, ``ge_const``,
+    ``log10_shift`` — ``src/services/inference/steps.py``). Return ``None`` (the
+    default) when the recipe cannot be expressed that way: it then still runs at
+    training time, but the run is declared **out of Layer 1 scope** and no
+    deployable artifact is built. Honest rejection over a silent serving skew.
+
+    Whatever ``specs`` declares MUST reproduce ``build`` exactly — locked by
+    ``tests/test_domain_feature_recipes.py::test_specs_replay_matches_build``.
     """
 
     name: str = "recipe"
@@ -125,6 +145,10 @@ class FeatureRecipe:
 
     def build(self, df, meta=None) -> dict:  # noqa: ANN001
         return {}
+
+    def specs(self, df, meta=None) -> "list | None":  # noqa: ANN001
+        """Frozen per-row declaration of :meth:`build`; ``None`` = not replayable."""
+        return None
 
 
 class DomainPack(ABC):

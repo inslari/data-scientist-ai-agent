@@ -32,8 +32,8 @@ import pandas as pd
 from src.core.logging_config import get_logger
 from src.services.inference.protocol import Artifact
 from src.services.inference.steps import (
-    CountEncodeStep, DateFeaturesStep, DropColumnsStep, GroupbyDeviationStep, ImputeStep,
-    InfImputeStep, MissingIndicatorStep,
+    CountEncodeStep, DateFeaturesStep, DomainFeaturesStep, DropColumnsStep,
+    GroupbyDeviationStep, ImputeStep, InfImputeStep, MissingIndicatorStep,
     NormalizeStep, OneHotStep, PlanDerivedStep, RatioConstructStep, RatioFinalizeStep,
     RobustScaleStep,
     SelectDropStep, StandardScaleStep, TargetEncodeStep, ZeroFlagStep, ZScoreStep,
@@ -208,8 +208,16 @@ _SCOPE_RULES: list = [
      "aggregation yolu (_aggregate_if_needed) portlanmadı — satır grameri değişiyor"),
     ("timeseries_lag", lambda v: bool(v),
      "time-series lag/rolling feature'ları portlanmadı"),
-    ("domain_features", lambda v: bool(v),
-     "domain pack feature'ları (_apply_feature_specs/_apply_domain_recipes) portlanmadı"),
+    # ("domain_features", ...) DERECELENDİRİLDİ — KAPSAM PORT'U: recipe'ler artık dondurulmuş
+    # per-row spec BEYAN EDEBİLİYOR (``FeatureRecipe.specs``) ve onları ``DomainFeaturesStep``
+    # üretiyor → beyan eden recipe kapsam İÇİNDE. Kural, kaldırılmak yerine DARALTILDI: hâlâ
+    # beyan etmeyen yollar (ajan ``_apply_feature_specs`` FeatureSpec'leri + spec'siz recipe'ler)
+    # reddedilmeye devam ediyor. "Port et → guard 0 → kuralı kaldır" disiplininin kısmi hâli:
+    # ölçtüğümüz kadarını destekliyoruz, gerisini SESSİZCE değil AÇIKÇA reddediyoruz.
+    ("unported_domain_features", lambda v: bool(v),
+     "dondurulmuş spec BEYAN ETMEYEN domain feature'ları var (ajan FeatureSpec'i veya "
+     "`specs()` yazmayan recipe) — seçimleri batch istatistiğine bağlı, serving'de yeniden "
+     "türetilemez"),
     # ("date_features", ...) KALDIRILDI — §2.19 KAPSAM PORT'U: timestamp türevleri (_year/_month/
     # _dayofweek) artık DateFeaturesStep (rowwise, durumsuz) ile üretiliyor. Port et → guard 0 →
     # kuralı kaldır (6-op portundaki `unported_ops` kaldırımıyla aynı disiplin). Ham timestamp
@@ -539,6 +547,14 @@ PIPELINE: list = [
     StepSpec(PlanDerivedStep, "_apply_plan_derived_features",
              config_from=lambda c: {"specs": c.get("derived_specs", [])},
              pre_split=True),
+    # DOMAIN PACK PORTU: recipe'lerin donmuş per-row op'ları (eq_const/ge_const/log10_shift).
+    # Kaynak sırası: _apply_domain_recipes, _apply_plan_derived_features SONRASI /
+    # _build_ratio_features ÖNCESİ — konum önemli: ratio + zero-flag motorlarının SEÇİMİ
+    # "bu ad zaten var mı"ya bakar (`is_zero_<col>` çakışması), yani domain kolonları onlardan
+    # ÖNCE çerçevede olmalı; aksi halde eski yolda üretilmeyen bir flag üretilirdi.
+    StepSpec(DomainFeaturesStep, "_apply_domain_recipes",
+             config_from=lambda c: {"specs": c.get("domain_specs", [])},
+             pre_split=True),
     StepSpec(RatioConstructStep, "_build_ratio_features",
              config_from=lambda c: {"pairs": c.get("ratio_pairs", [])}),
     # is_zero: kaynakta _build_zero_missing_flags@2291 — _build_ratio_features@2289 SONRASI
@@ -571,7 +587,7 @@ PIPELINE: list = [
 STEP_REGISTRY: dict = {
     cls.id: cls for cls in (
         MissingIndicatorStep, ImputeStep, DateFeaturesStep, DropColumnsStep, ZScoreStep,
-        NormalizeStep, PlanDerivedStep, RatioConstructStep,
+        NormalizeStep, PlanDerivedStep, DomainFeaturesStep, RatioConstructStep,
         ZeroFlagStep, RatioFinalizeStep, CountEncodeStep, GroupbyDeviationStep, OneHotStep,
         TargetEncodeStep, InfImputeStep, RobustScaleStep, StandardScaleStep, SelectDropStep,
     )

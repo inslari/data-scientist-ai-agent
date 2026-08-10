@@ -241,6 +241,68 @@ class PlanDerivedStep(DefaultFitTransform):
         return X
 
 
+# Domain pack recipe'lerinin DONMUŞ per-row op'ları (tek girdi + sabit param).
+# `_PLAN_ROWWISE_OPS`'tan AYRI tutuluyor: o palet plan/LLM'in seçebildiği op'lar
+# (`schemas.FEATURE_OP_SPEC` ile doğrulanır); bu palet pack KODUNUN beyan ettiği eşik
+# testleridir ve LLM'e asla açılmaz. Karıştırmak, plan validasyonunun kapsamını sessizce
+# genişletirdi.
+_DOMAIN_ROWWISE_OPS = {
+    "eq_const":    lambda s, p: (s == p[0]).astype(float),
+    "ge_const":    lambda s, p: (s >= p[0]).astype(float),
+    "log10_shift": lambda s, p: np.log10(s.clip(lower=0.0) + p[0]),
+}
+
+
+class DomainFeaturesStep(DefaultFitTransform):
+    """Domain pack FeatureRecipe'lerinin PORTU — rowwise / donmuş seçim.
+
+    Recipe'ler eğitimde ``build(df)`` ile çalışır ve girdi kolonlarını BATCH istatistiğinden
+    seçer (sıfır oranı ``_zero_balance_cols``, "hem 1 hem ≥2 görüyor mu" ``_holding_count_cols``,
+    çarpıklık/ad kalıbı ``_money_cols``). Bu seçim serving'de YENİDEN TÜRETİLEMEZ — tek satırlık
+    bir istekte sıfır oranı 0 ya da 1'dir, yani kolon seçimi SESSİZCE başka çıkardı. Kapsam
+    kapısının ``domain_features``'ı reddetme sebebi tam olarak buydu.
+
+    Port bu yüzden ikiye ayırır (ratio/zero-flag'deki İKİZ BORÇ deseninin aynısı): **SEÇİM
+    fit-anında donar** (``FeatureRecipe.specs`` beyan eder, manifest'e ``frozen_choice`` olarak
+    yazılır), **YAZMA bu adımdadır** ve serving'de yalnız donmuş spec replay edilir. Kalan
+    dönüşüm saf per-row eşik testi → fitted-state YOK → sızıntı yüzeyi YOK.
+
+    ``pd.to_numeric(errors="coerce")`` kullanılır (recipe'lerin ``astype(float)``'u yerine):
+    sayısal kolonda değerler BİREBİR aynı, ama serving'de string gelen bir hücre istisna yerine
+    NaN olur — adım skorlamayı patlatmaz (imza kontrolü zaten girişte uyarır).
+
+    Config: ``{"specs": [{"name","op","input","params"}, ...]}`` (sıra korunur).
+    """
+
+    id = "domain_features"
+    type = "rowwise"
+    param_kind = None
+
+    def __init__(self, config: StepConfig | None = None):
+        self.config: StepConfig = config or {}
+
+    def fit(self, X_train: pd.DataFrame, y_train: "pd.Series | None" = None) -> None:
+        return None            # rowwise: train'den öğrenilen state YOK
+
+    def frozen_selection(self, params=None) -> dict:
+        specs = self.config.get("specs") or []
+        return {"kind": "domain_recipes", "source": "DomainPack.feature_recipes → FeatureRecipe.specs",
+                "selection": [{"output": s["name"], "op": s["op"], "input": s["input"],
+                               "params": s.get("params") or []} for s in specs]} if specs else {}
+
+    def transform(self, X: pd.DataFrame, params: "dict | None" = None) -> pd.DataFrame:
+        X = X.copy()
+        for spec in (self.config.get("specs") or []):
+            name, op, src = spec.get("name"), spec.get("op"), spec.get("input")
+            if op not in _DOMAIN_ROWWISE_OPS or not name or name in X.columns:
+                continue           # bilinmeyen op → atla; ad zaten var → idempotans
+            if src not in X.columns:
+                continue
+            X[name] = _DOMAIN_ROWWISE_OPS[op](pd.to_numeric(X[src], errors="coerce"),
+                                              spec.get("params") or [])
+        return X
+
+
 class DateFeaturesStep(DefaultFitTransform):
     """Timestamp kolonlarından DURUMSUZ rowwise türevler: ``_year`` · ``_month`` · ``_dayofweek``.
 

@@ -315,20 +315,79 @@ class IntegrationTest(unittest.TestCase):
             ).to_dict(),
             "db_intelligence": {},
         }
-        added = _apply_domain_recipes(df, state, meta=None)
+        added, specs, unported = _apply_domain_recipes(df, state, meta=None)
         self.assertIn("cv_amount", added)
         self.assertIn("peak_ratio_amount", added)
         self.assertIn("cv_amount", df.columns)
         self.assertIn("peak_ratio_amount", df.columns)
+        self.assertEqual(specs, [], "devir istenmedi → donmuş spec yok, kolonlar inline yazıldı")
+        # Devir yok → yazılan HER kolon portsuz sayılır (artifact'te onları üretecek adım yok).
+        self.assertEqual(sorted(unported), sorted(added))
 
     def test_apply_domain_recipes_noop_when_pack_none(self):
         from src.services.feature_builder import _apply_domain_recipes
 
         df = _agg_df()
         before = set(df.columns)
-        added = _apply_domain_recipes(df, {"domain_pack": "none"}, meta=None)
-        self.assertEqual(added, [])
+        added, specs, unported = _apply_domain_recipes(df, {"domain_pack": "none"}, meta=None)
+        self.assertEqual((added, specs, unported), ([], [], []))
         self.assertEqual(set(df.columns), before)
+
+    def test_deferred_recipes_do_not_write_and_declare_specs(self):
+        """PORT: churn recipe'leri devredildiğinde kolonu YAZMAZ, donmuş spec BEYAN EDER.
+
+        Devir "ya hepsi ya hiçbiri": customer expert'in üç recipe'si de ``specs()`` yazdığı için
+        devir gerçekleşir; çerçeve DEĞİŞMEZ ve yazma orkestratörün adımına kalır."""
+        from src.services.feature_builder import _apply_domain_recipes
+
+        df = pd.DataFrame({
+            "balance": [0.0, 100.0, 0.0, 250.0, 0.0, 90.0],
+            "products_number": [1, 2, 1, 3, 1, 2],
+        })
+        state = {
+            "domain_pack": "financial",
+            "merchant_context": MerchantContext(
+                pack_name="financial", primary_expert="customer", council=["customer"]
+            ).to_dict(),
+            "db_intelligence": {},
+        }
+        before = list(df.columns)
+        added, specs, unported = _apply_domain_recipes(
+            df, state, meta=None, defer_to_orchestrator=True)
+        self.assertEqual(list(df.columns), before, "devirde çerçeveye YAZILMAMALI")
+        self.assertEqual(unported, [])
+        self.assertEqual(sorted(added), sorted(s["name"] for s in specs))
+        self.assertIn("is_zero_balance", added)
+        self.assertIn("products_number_is_single", added)
+        for s in specs:
+            self.assertEqual(sorted(s), ["input", "name", "op", "params"])
+
+    def test_specs_replay_matches_build(self):
+        """KİLİT: ``specs()`` replay'i ``build()`` çıktısıyla BİREBİR aynı olmalı.
+
+        Spec beyanı build'in İKİNCİ bir uygulamasıdır — sapması, eğitimde bir değer serving'de
+        başka bir değer demektir (kapsam portunun tüm iddiası bu eşitlik üzerine kurulu)."""
+        from src.domains.financial.feature_recipes import (
+            HoldingCountBandRecipe, LogAmountRecipe, ZeroBalanceFlagRecipe)
+        from src.services.inference.steps import DomainFeaturesStep
+
+        df = pd.DataFrame({
+            "balance": [0.0, 100.0, 0.0, 250.0, 0.0, 90.0],
+            "products_number": [1, 2, 1, 3, 1, 2],
+            "estimated_salary": [10.0, 0.0, 5000.0, 42.5, 900.0, 3.0],
+        })
+        for recipe in (ZeroBalanceFlagRecipe(), HoldingCountBandRecipe(), LogAmountRecipe()):
+            if not recipe.applies(df):
+                self.fail(f"fixture '{recipe.name}' recipe'sini tetiklemiyor (test boş geçerdi)")
+            beklenen = recipe.build(df)
+            specs = recipe.specs(df)
+            self.assertEqual(sorted(beklenen), sorted(s["name"] for s in specs),
+                             f"{recipe.name}: spec ile build AYNI kolonları üretmeli")
+            replay = DomainFeaturesStep(config={"specs": specs}).transform(df)
+            for name, seri in beklenen.items():
+                pd.testing.assert_series_equal(
+                    replay[name], seri.astype(float), check_names=False,
+                    obj=f"{recipe.name}:{name}")
 
 
 if __name__ == "__main__":

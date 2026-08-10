@@ -25,6 +25,9 @@ from src.domains.base import FeatureRecipe
 # Recipes below derive new columns from existing ones. Each is gated to the
 # expert(s) where its signal is meaningful via ``_EXPERT_RECIPES`` (see bottom).
 _EPS = 1e-9
+# log10 shift — the notebook's `log10(Amount + eps)`. Named because it is also
+# frozen into the artifact as a step param (LogAmountRecipe.specs).
+_LOG_SHIFT = 1e-3
 
 # Column-name patterns that mark a numeric column as a *monetary* magnitude.
 # Used by LogAmountRecipe: financial amounts are almost always right-skewed, so a
@@ -202,8 +205,16 @@ class LogAmountRecipe(FeatureRecipe):
             name = f"log_{c}"
             if name in df.columns:
                 continue
-            out[name] = np.log10(df[c].astype(float).clip(lower=0.0) + 1e-3)
+            out[name] = np.log10(df[c].astype(float).clip(lower=0.0) + _LOG_SHIFT)
         return out
+
+    def specs(self, df, meta=None) -> List[Dict]:  # noqa: ANN001
+        # Column CHOICE is a fit-time decision (name pattern + skew over the batch);
+        # the transform itself is per-row → freeze the pair. `_LOG_SHIFT` is the same
+        # epsilon `build` adds, passed as a param so the artifact carries no constant
+        # the step could drift from.
+        return [{"name": f"log_{c}", "op": "log10_shift", "input": c, "params": [_LOG_SHIFT]}
+                for c in _money_cols(df) if f"log_{c}" not in df.columns]
 
 
 def _time_cols(df) -> List[str]:  # noqa: ANN001
@@ -468,6 +479,13 @@ class ZeroBalanceFlagRecipe(FeatureRecipe):
             out[name] = (df[c].astype(float) == 0).astype(float)
         return out
 
+    def specs(self, df, meta=None) -> List[Dict]:  # noqa: ANN001
+        # `_zero_balance_cols` is a BATCH decision (zero share must sit between the two
+        # thresholds) — meaningless on a single scoring row, so it is frozen here and
+        # never re-derived. The surviving transform is a pure per-row `== 0`.
+        return [{"name": f"is_zero_{c}", "op": "eq_const", "input": c, "params": [0.0]}
+                for c in _zero_balance_cols(df) if f"is_zero_{c}" not in df.columns]
+
 
 def _holding_count_cols(df) -> List[str]:  # noqa: ANN001
     """Small non-negative integer columns that count products/accounts held.
@@ -525,6 +543,18 @@ class HoldingCountBandRecipe(FeatureRecipe):
                 out[single] = (df[c].astype(float) == 1).astype(float)
             if multi not in df.columns:
                 out[multi] = (df[c].astype(float) >= 2).astype(float)
+        return out
+
+    def specs(self, df, meta=None) -> List[Dict]:  # noqa: ANN001
+        # Both the column choice AND the 1 / ≥2 cut are fit-time facts (the column has
+        # to actually span single and multi holders); the cut is then a per-row test.
+        out: List[Dict] = []
+        for c in _holding_count_cols(df):
+            base = re.sub(r"\W+", "_", str(c)).strip("_").lower()
+            for name, op, const in ((f"{base}_is_single", "eq_const", 1.0),
+                                    (f"{base}_is_multi", "ge_const", 2.0)):
+                if name not in df.columns:
+                    out.append({"name": name, "op": op, "input": c, "params": [const]})
         return out
 
 
